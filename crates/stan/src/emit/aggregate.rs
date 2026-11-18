@@ -68,6 +68,31 @@ impl<'m> Emitter<'m> {
         {
             return self.place(base, id, Ok(e));
         }
+        // `sum` over one axis of a matrix: one product with a ones vector.
+        if fname == "sum"
+            && let ([out], [red]) = (outs.as_slice(), reduced.as_slice())
+            && let [site] = sites.as_slice()
+            && self.indexes_axis(self.resolve(body))
+            && self
+                .decls
+                .get(&site.base)
+                .is_some_and(|t| t.base == "matrix" && t.array.is_empty())
+        {
+            let b = &site.base;
+            let e = match site.axes.as_slice() {
+                [Some(a), Some(r)] if (a, r) == (out, red) => Some(Ex {
+                    s: format!("{b} * rep_vector(1, cols({b}))"),
+                    prec: P_MUL,
+                }),
+                [Some(r), Some(a)] if (a, r) == (out, red) => {
+                    Some(Ex::atom(format!("(rep_row_vector(1, rows({b})) * {b})'")))
+                }
+                _ => None,
+            };
+            if let Some(e) = e {
+                return self.place(base, id, Ok(e));
+            }
+        }
         if reduced.is_empty()
             && outs.len() <= 2
             && let Ok(l) = self.lift(body, &outs, &HashMap::new(), &ext)
@@ -81,6 +106,13 @@ impl<'m> Emitter<'m> {
             return self.place(base, id, Ok(e));
         }
 
+        // A rank-3 result has no whole-array form, and element loops are no answer.
+        if self.shape(id).is_some_and(|s| s.rank == 3) {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "an aggregate with a rank-3 result",
+            ));
+        }
         let stan = self.fresh(base);
         let t = self.declare(id, None, false, &stan, &[])?;
         let extents: Vec<String> = t.array.iter().chain(&t.dims).cloned().collect();
@@ -586,14 +618,23 @@ impl<'m> Emitter<'m> {
             });
         }
         let narray = decl.array.len();
-        let array = narray > 0;
-        if array && kept_pos.iter().any(|&p| p >= narray) {
-            return Err(Refusal::not_yet(Some(id), "a slice of an array of vectors"));
-        }
-        // A matrix row slice is a row_vector; the frame keeps column vectors.
-        let row_slice =
-            !array && ((decl.base == "matrix" && kept_pos == [1]) || decl.base == "row_vector");
-        let mut ex = if row_slice { format!("{text}'") } else { text };
+        let (mut ex, array) = if narray == 1 && decl.base == "matrix" && sels.len() == 3 {
+            // A real rank-3 value, an array of matrices: the index arm's rule.
+            let k: Vec<bool> = (0..3).map(|p| kept_pos.contains(&p)).collect();
+            let e = super::matrices_slice(&k, text).ok_or_else(|| {
+                Refusal::not_yet(Some(id), "`x[:, :, k]` of a rank-3 array of matrices")
+            })?;
+            (e, false)
+        } else {
+            let array = narray > 0;
+            if array && kept_pos.iter().any(|&p| p >= narray) {
+                return Err(Refusal::not_yet(Some(id), "a slice of an array of vectors"));
+            }
+            // A matrix row slice is a row_vector; the frame keeps column vectors.
+            let row_slice =
+                !array && ((decl.base == "matrix" && kept_pos == [1]) || decl.base == "row_vector");
+            (if row_slice { format!("{text}'") } else { text }, array)
+        };
         let in_order: Vec<Symbol> = frame.iter().filter(|a| kept.contains(a)).copied().collect();
         if kept.len() == 2 && kept != in_order {
             if array {

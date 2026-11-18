@@ -1,0 +1,9 @@
+# emit: target=L
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+alpha = elementof(cartpow(reals, 3))
+lo = [0.9, 0.95, 1.0]
+hi = [1.3, 1.2, 1.5]
+f = hep.interp_poly6_exp.(lo, 1.1, hi, alpha)
+g = hep.interp_poly6_lin.(lo, 1.1, hi, alpha)
+L = likelihoodof(functionof(Normal.(20.0 .* f .+ g, 1.0)), [21.0, 22.0, 23.0])

@@ -1093,6 +1093,18 @@ impl<'m> Emitter<'m> {
             // (`array[2, 3] int`) by `to_array_1d`, which a discrete law takes
             // as it is and a continuous one as a vector.
             _ if lhs_rank >= 2 && !law.multivariate => {
+                // Stan flattens a matrix or a rank-2 array, not a rank-3
+                // value or an array of vectors.
+                let t = self.decls.get(lhs);
+                if lhs_rank >= 3 {
+                    return Err(Refusal::not_yet(Some(m), "a law over a rank-3 variate"));
+                }
+                if t.is_some_and(|t| t.array.len() == 1 && t.dims.len() == 1) {
+                    return Err(Refusal::not_yet(
+                        Some(m),
+                        "a law over an array of vectors as one statement",
+                    ));
+                }
                 let array = self.decls.get(lhs).is_some_and(|t| t.array.len() >= 2);
                 let target = match (array, law.discrete) {
                     (true, true) => format!("to_array_1d({lhs})"),
@@ -2629,9 +2641,7 @@ impl<'m> Emitter<'m> {
                 ));
             }
             // A user-defined `_lpdf`: its text goes into `functions` once.
-            "custom_lpdf" if !self.functions.contains(&row.functions) => {
-                self.functions.push(row.functions.clone());
-            }
+            "custom_lpdf" => self.add_functions(&row.functions),
             _ => {}
         }
         if row.status.starts_with("unverified") {

@@ -126,7 +126,32 @@ pub(crate) fn bounds_of(vs: &ValueSet) -> Bounds {
 
 /// The declaration of a value of inferred type `ty` and value set `vs`.
 /// `bounded` adds `<lower, upper>` (data and parameters); locals omit them.
+/// A real rank-3 value is `array[S] matrix[K, B]` (data, parameters, function
+/// arguments and computed values alike): the helpers take arrays of
+/// matrices, and the JSON layout is that of `array[S, K, B] real`.
 pub(crate) fn declare(
+    ty: &Type,
+    vs: Option<&ValueSet>,
+    bounded: bool,
+    size: SizeName<'_>,
+    node: NodeId,
+) -> Result<StanType> {
+    let t = declare_layout(ty, vs, bounded, size, node)?;
+    Ok(
+        if t.base == "real" && t.array.len() == 3 && t.dims.is_empty() {
+            StanType {
+                array: vec![t.array[0].clone()],
+                base: "matrix",
+                dims: vec![t.array[1].clone(), t.array[2].clone()],
+                bounds: t.bounds,
+            }
+        } else {
+            t
+        },
+    )
+}
+
+fn declare_layout(
     ty: &Type,
     vs: Option<&ValueSet>,
     bounded: bool,
@@ -222,7 +247,7 @@ pub(crate) fn declare(
                         _ => None,
                     };
                     // `array[n, m] int` indexes as `x[i][j]` and `x[i, j]` alike.
-                    let mut t = declare(inner, inner_vs, bounded, size, node)?;
+                    let mut t = declare_layout(inner, inner_vs, bounded, size, node)?;
                     let mut array = dims;
                     array.extend(t.array);
                     t.array = array;

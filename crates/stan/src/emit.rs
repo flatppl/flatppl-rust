@@ -56,6 +56,41 @@ impl Ex {
             format!("({})", self.s)
         }
     }
+    /// The transpose: an atom `x'` or a literal `[a, b]'` gives back `x` or
+    /// `[a, b]`, not `x''`.
+    fn transposed(&self) -> String {
+        match self.s.strip_suffix('\'') {
+            Some(x) if self.prec == P_ATOM || row_literal(x).is_some() => x.to_string(),
+            _ => format!("{}'", self.at(P_ATOM)),
+        }
+    }
+}
+
+/// The slice `s` of an array of matrices (`array[S] matrix[K, B]`) as a
+/// FlatPPL vector or matrix, by which of its three positions are kept:
+/// `x[i, j, :]` is a row_vector, `x[:, j, k]` an array of reals, `x[:, j, :]`
+/// an array of row_vectors. `None` for `x[:, :, k]`, an array of vectors,
+/// which Stan cannot make a matrix of.
+pub(super) fn matrices_slice(kept: &[bool], s: String) -> Option<String> {
+    match kept {
+        [false, false, true] => Some(format!("{s}'")),
+        [true, false, false] => Some(format!("to_vector({s})")),
+        [true, false, true] => Some(format!("to_matrix({s})")),
+        [true, true, false] => None,
+        _ => Some(s),
+    }
+}
+
+/// The elements of a row literal `[a, b]`: the text inside one bracket pair
+/// that spans all of `x`.
+fn row_literal(x: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    let whole = x.starts_with('[')
+        && x.char_indices().all(|(i, c)| {
+            depth += i32::from(c == '[') - i32::from(c == ']');
+            depth > 0 || i == x.len() - 1
+        });
+    whole.then(|| &x[1..x.len() - 1])
 }
 
 /// Rank and integer-ness of a value, read from its inferred type.
@@ -880,6 +915,21 @@ impl<'m> Emitter<'m> {
     /// to elementwise loops.
     fn place(&mut self, base: &str, rhs: NodeId, attempt: Result<Ex>) -> Result<String> {
         let fixed = self.m.phase_of(rhs) == Some(Phase::Fixed);
+        // A rank-3 value is built by `array` or `fill`, or names one. Stan has
+        // no arithmetic on arrays, and element loops are no answer: refuse.
+        if self.shape(rhs).is_some_and(|s| s.rank == 3)
+            && !matches!(self.head(rhs), Some("array" | "fill"))
+            && !attempt
+                .as_ref()
+                .is_ok_and(|e| self.decls.contains_key(&e.s))
+        {
+            return Err(Refusal::not_yet(Some(rhs), "arithmetic on a rank-3 value"));
+        }
+        if self.shape(rhs).is_some_and(|s| s.rank == 3)
+            && let Err(r) = attempt
+        {
+            return Err(r);
+        }
         let lines = match attempt {
             Ok(e) => {
                 let stan = self.fresh(base);
@@ -1029,6 +1079,14 @@ impl<'m> Emitter<'m> {
         match self.shape(id) {
             Some(Shape { rank: 1, int: true }) => Ok(Ex::atom(format!("to_vector({})", e.s))),
             Some(Shape { rank: 2, int: true }) => Ok(Ex::atom(format!("to_matrix({})", e.s))),
+            // An integer rank-3 value is `array[S, K, B] int`; §09 promotes its
+            // entries where a helper takes real matrices.
+            Some(Shape { rank: 3, int: true }) => {
+                if let Some(core) = tables::core("matrices") {
+                    self.add_functions(&core.functions);
+                }
+                Ok(Ex::atom(format!("flatppl_matrices({})", e.s)))
+            }
             _ => Ok(e),
         }
     }
@@ -1216,6 +1274,7 @@ impl<'m> Emitter<'m> {
                 let v = self.expr(*x)?;
                 self.filled(id, &v.at(P_ATOM), *n)
             }
+            ("array", [v, size, order]) => self.rank3_array(id, *v, *size, *order),
             // A real vector as one matrix column (`addaxes(u, 0, 1)`) or row
             // (`addaxes(v, 1, 0)`). An integer vector has no Stan integer
             // matrix: it is filled elementwise (or read through `real`).
@@ -1264,8 +1323,11 @@ impl<'m> Emitter<'m> {
             // functions.ron `transpose`: the operator `'`.
             ("transpose", [a]) => {
                 let e = self.real(*a)?;
-                Ok(Ex::atom(format!("{}'", e.at(P_ATOM))))
+                Ok(Ex::atom(e.transposed()))
             }
+            // `cat(x)` is x; of one scalar, a vector of length 1 (spec §07).
+            ("cat", [x]) if self.shape(*x).is_some_and(|s| s.rank == 0) => self.vector(id, &[*x]),
+            ("cat", [x]) => self.expr(*x),
             // `cat(1, 2, 3)` of scalars is `vector(1, 2, 3)` (spec §07).
             ("cat", elems)
                 if elems.len() >= 2
@@ -1285,6 +1347,33 @@ impl<'m> Emitter<'m> {
                 for a in rest {
                     let r = self.expr(*a)?;
                     out = format!("append_array({out}, {})", r.s);
+                }
+                Ok(Ex::atom(out))
+            }
+            // `cat` of real vectors: one `append_row` chain, adjacent vector
+            // literals joined (`[h]', [t]'` is `[h, t]'`). Scalars beside
+            // vectors are a static error (§06); all scalars are `vector` above.
+            ("cat", [_, rest @ ..])
+                if !rest.is_empty()
+                    && matches!(self.ty(id), Some(Type::Array { shape, elem })
+                        if shape.len() == 1 && matches!(*elem, Type::Scalar(ScalarType::Real))) =>
+            {
+                let mut parts: Vec<String> = Vec::new();
+                for &a in &args {
+                    let p = self.real(a)?.s;
+                    let lit = |t: &str| {
+                        t.strip_suffix('\'')
+                            .and_then(row_literal)
+                            .map(str::to_string)
+                    };
+                    match (parts.last().and_then(|l| lit(l)), lit(&p)) {
+                        (Some(l), Some(r)) => *parts.last_mut().unwrap() = format!("[{l}, {r}]'"),
+                        _ => parts.push(p),
+                    }
+                }
+                let mut out = parts[0].clone();
+                for p in &parts[1..] {
+                    out = format!("append_row({out}, {p})");
                 }
                 Ok(Ex::atom(out))
             }
@@ -1373,8 +1462,13 @@ impl<'m> Emitter<'m> {
         {
             return Ok(Ex::atom(format!("{name}({}, {})", parts[0].s, parts[1].s)));
         }
-        if row.kind == "helper" && !self.functions.contains(&row.functions) {
-            self.functions.push(row.functions.clone());
+        if row.kind == "helper" {
+            for u in &row.uses {
+                if let Some(core) = tables::core(u) {
+                    self.add_functions(&core.functions);
+                }
+            }
+            self.add_functions(&row.functions);
         }
         let binds = row
             .args
@@ -1385,6 +1479,75 @@ impl<'m> Emitter<'m> {
         let s = self.fill(&row.stan, &binds, &|_| false, None)?;
         let prec = if is_call(&s) { P_ATOM } else { P_TERNARY };
         Ok(Ex { s, prec })
+    }
+
+    /// A row's `functions` text, one top-level definition at a time: a
+    /// program defines each once.
+    pub(super) fn add_functions(&mut self, text: &str) {
+        for d in tables::definitions(text) {
+            if !self.functions.contains(&d) {
+                self.functions.push(d);
+            }
+        }
+    }
+
+    /// `array(v, [S, K, B], [1, 2, 3])`: `S` matrices filled row-major from
+    /// consecutive segments of `v`, as `array[S] matrix[K, B]`.
+    fn rank3_array(&mut self, id: NodeId, v: NodeId, size: NodeId, order: NodeId) -> Result<Ex> {
+        let ints = |me: &Self, n: NodeId| -> Option<Vec<i64>> {
+            let r = me.resolve(n);
+            if me.head(r) != Some("vector") {
+                return None;
+            }
+            me.call(r)?
+                .args
+                .iter()
+                .map(|&a| match me.m.node(me.resolve(a)) {
+                    Node::Lit(Scalar::Int(k)) => Some(*k),
+                    _ => None,
+                })
+                .collect()
+        };
+        let Some(dims) = ints(self, size) else {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "`array` with a non-literal size",
+            ));
+        };
+        if dims.len() != 3 {
+            return Err(Refusal::not_yet(
+                Some(id),
+                format!("`array` of rank {}", dims.len()),
+            ));
+        }
+        if ints(self, order).as_deref() != Some(&[1, 2, 3][..]) {
+            return Err(Refusal::not_yet(Some(id), "`array` with another dimorder"));
+        }
+        if self.shape(v).is_none_or(|s| s.rank != 1 || s.int) {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "`array` of a value that is not a real vector",
+            ));
+        }
+        let (s, k, b) = (dims[0], dims[1], dims[2]);
+        let ve = self.real(v)?;
+        // One sample reads the vector whole; more read segments of one name.
+        let name = if s == 1 || structure::is_identifier(&ve.s) {
+            ve.s.clone()
+        } else {
+            self.place("flat", v, Ok(ve.clone()))?
+        };
+        let mats: Vec<String> = (0..s)
+            .map(|i| {
+                let seg = if s == 1 {
+                    name.clone()
+                } else {
+                    format!("segment({name}, {}, {})", i * k * b + 1, k * b)
+                };
+                format!("to_matrix({seg}, {k}, {b}, 0)")
+            })
+            .collect();
+        Ok(Ex::atom(format!("{{{}}}", mats.join(", "))))
     }
 
     /// The matrix A of `splitblocks(A, [1, n])` when n is A's whole row,
@@ -1529,11 +1692,18 @@ impl<'m> Emitter<'m> {
         } else {
             vec![self.expr(n)?.s]
         };
-        let value = if sh.int || value.contains('.') || value.contains('(') {
-            value.to_string()
-        } else {
+        // An integer literal under a real result reads as a real literal.
+        let value = if !sh.int && value.parse::<i64>().is_ok() {
             format!("{value}.0")
+        } else {
+            value.to_string()
         };
+        // Rank 3 is `array[S] matrix[K, B]`, as `array(v, [S, K, B])` is.
+        if let (3, false, [s, k, b]) = (sh.rank, sh.int, extents.as_slice()) {
+            return Ok(Ex::atom(format!(
+                "rep_array(rep_matrix({value}, {k}, {b}), {s})"
+            )));
+        }
         let f = match (sh.rank, sh.int) {
             (1, false) => "rep_vector",
             (2, false) => "rep_matrix",
@@ -1589,18 +1759,11 @@ impl<'m> Emitter<'m> {
         let mut parts = Vec::new();
         for item in items {
             let e = self.real(item)?;
-            parts.push(if transpose {
-                format!("{}'", e.at(P_ATOM))
-            } else {
-                e.s
-            });
+            parts.push(if transpose { e.transposed() } else { e.s });
         }
+        // One row or column is still a matrix (`[1, n]`, `[n, 1]`).
         let mut acc = if parts.len() == 1 {
-            if transpose {
-                parts[0].clone()
-            } else {
-                format!("to_matrix({})", parts[0])
-            }
+            format!("to_matrix({})", parts[0])
         } else {
             parts[0].clone()
         };
@@ -1722,6 +1885,9 @@ impl<'m> Emitter<'m> {
             }
         }
         let s = format!("{}[{}]", base.at(P_ATOM), idx.join(", "));
+        if sel.len() == 3 && self.shape(x).is_some_and(|sh| sh.rank == 3) {
+            return self.rank3_index(id, x, sel, s);
+        }
         // A matrix row is a Stan row_vector; a FlatPPL vector is a Stan vector.
         let matrix = matches!(self.ty(x), Some(Type::Array { shape, elem })
             if shape.len() == 2 && matches!(elem.as_ref(), Type::Scalar(ScalarType::Real)));
@@ -1734,6 +1900,38 @@ impl<'m> Emitter<'m> {
         Ok(Ex::atom(s))
     }
 
+    /// `x[i, j, k]` of a rank-3 `x` as the Stan type FlatPPL means: a kept
+    /// axis gives a vector or a matrix. A real `x` (`array[S] matrix[K, B]`)
+    /// yields a row_vector for `x[i, j, :]` and arrays across its array axis;
+    /// an integer `x` (`array[S, K, B] int`) yields integer arrays, as
+    /// FlatPPL integer arrays print.
+    fn rank3_index(&mut self, id: NodeId, x: NodeId, sel: &[NodeId], s: String) -> Result<Ex> {
+        let kept: Vec<bool> = sel
+            .iter()
+            .map(|&k| {
+                matches!(self.m.node(k), Node::Const(c) if self.name(*c) == "all")
+                    || self.shape(k).is_some_and(|sh| sh.rank >= 1)
+            })
+            .collect();
+        // A real rank-3 value is an array of matrices, an integer one an array.
+        let int = self.shape(x).is_some_and(|sh| sh.int);
+        let matrices = !int;
+        let n = kept.iter().filter(|&&k| k).count();
+        let text = if n == 0 || n == 3 || !matrices {
+            // An integer slice is an integer array, as FlatPPL integer arrays print.
+            Some(s)
+        } else {
+            matrices_slice(&kept, s)
+        };
+        let Some(text) = text else {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "`x[:, :, k]` of a rank-3 array of matrices",
+            ));
+        };
+        Ok(Ex::atom(text))
+    }
+
     /// `f.(args…)` as one Stan expression over the whole arrays, per the
     /// `functions.ron` row: a `vectorized` row takes the arrays themselves,
     /// a `broadcast` template (`.*`, `./`, `.^`) gives the elementwise
@@ -1744,26 +1942,84 @@ impl<'m> Emitter<'m> {
         if let (Node::Ref(r), Some(module)) = (self.m.node(f), self.standard_module(f)) {
             let fname = self.name(r.name).to_string();
             let row = self.fn_row(id, &fname, Some(&module))?;
-            let kinds: Vec<&str> = row.overload.split(", ").filter(|k| !k.is_empty()).collect();
-            let fits = kinds.len() == args.len()
-                && args.iter().zip(&kinds).all(|(&a, k)| {
-                    let rank = self.shape(a).map(|s| s.rank);
-                    matches!((*k, rank), ("vector", Some(1)) | ("real", Some(0)))
+            // `overload` lists the array signatures, `;`-separated. A `column`
+            // is `addaxes(u, 0, 1)`, passed to Stan as the vector `u`.
+            let column = |me: &Self, a: NodeId| -> Option<NodeId> {
+                let r = me.resolve(a);
+                let c = me.call(r).filter(|_| me.head(r) == Some("addaxes"))?;
+                matches!(
+                    (me.m.node(c.args[1]), me.m.node(c.args[2])),
+                    (Node::Lit(Scalar::Int(0)), Node::Lit(Scalar::Int(1)))
+                )
+                .then_some(c.args[0])
+                .filter(|&u| me.shape(u).is_some_and(|s| s.rank == 1))
+            };
+            // An exact signature first. Then a scalar may fill a `vector` slot
+            // as `rep_vector`, when the result length has a Stan size.
+            let len = self
+                .ty(id)
+                .and_then(|t| elementwise::dims_of(&t).first().copied().flatten());
+            let can_promote = self.shape(id).is_some_and(|s| s.rank == 1)
+                && (len.is_some() || self.sym_extent(id, 0, 0).is_some());
+            let fit = [false, true]
+                .into_iter()
+                .filter(|&p| !p || can_promote)
+                .find_map(|promote| {
+                    row.overload
+                        .split("; ")
+                        .filter(|o| !o.is_empty())
+                        .find_map(|o| {
+                            let kinds: Vec<&str> = o.split(", ").collect();
+                            let ok = kinds.len() == args.len()
+                                && args.iter().zip(&kinds).all(|(&a, k)| {
+                                    let rank = self.shape(a).map(|s| s.rank);
+                                    match (*k, rank) {
+                                        ("column", _) => column(self, a).is_some(),
+                                        ("vector", Some(0)) => promote,
+                                        _ => matches!(
+                                            (*k, rank),
+                                            ("vector", Some(1))
+                                                | ("real", Some(0))
+                                                | ("matrix", Some(2))
+                                        ),
+                                    }
+                                });
+                            ok.then_some(kinds)
+                        })
                 });
-            if !fits {
-                let form = if kinds.is_empty() {
+            let Some(kinds) = fit else {
+                let form = if row.overload.is_empty() {
                     "no vector form".to_string()
                 } else {
-                    format!("a vector form for ({})", row.overload)
+                    format!("vector forms ({})", row.overload)
                 };
                 return Err(Refusal::not_yet(
                     Some(id),
                     format!("`{fname}.(…)` with these argument shapes ({form})"),
                 ));
-            }
+            };
             let mut parts = Vec::new();
-            for &a in args {
-                parts.push(self.real(a)?);
+            for (&a, k) in args.iter().zip(&kinds) {
+                let a = if *k == "column" {
+                    column(self, a).unwrap()
+                } else {
+                    a
+                };
+                let e = self.real(a)?;
+                if *k == "vector" && self.shape(a).is_some_and(|s| s.rank == 0) {
+                    let n = self.size_text(id, 0, len.unwrap_or(0));
+                    if len.is_none() && n == "0" {
+                        return Err(Refusal::not_yet(
+                            Some(id),
+                            format!(
+                                "`{fname}.(…)` with a scalar where its length has no Stan size"
+                            ),
+                        ));
+                    }
+                    parts.push(Ex::atom(format!("rep_vector({}, {n})", e.s)));
+                } else {
+                    parts.push(e);
+                }
             }
             return self.table_fn(id, &fname, Some(&module), parts);
         }
@@ -1966,7 +2222,7 @@ impl<'m> Emitter<'m> {
             match side {
                 Side::Column if vector => outer[0] = Some(e.clone()),
                 Side::Column => outer[0] = Some(Ex::atom(format!("to_vector({})", e.s))),
-                Side::Row if vector => outer[1] = Some(Ex::atom(format!("{}'", e.at(P_ATOM)))),
+                Side::Row if vector => outer[1] = Some(Ex::atom(e.transposed())),
                 Side::Row => outer[1] = Some(Ex::atom(format!("to_row_vector({})", e.s))),
                 _ => {}
             }

@@ -11,7 +11,7 @@ const P_OR: u8 = 1;
 const P_AND: u8 = 2;
 
 /// Static extents of a value, outermost first; `None` for a dynamic one.
-fn dims_of(ty: &Type) -> Vec<Option<u32>> {
+pub(super) fn dims_of(ty: &Type) -> Vec<Option<u32>> {
     let d = |d: &Dim| match d {
         Dim::Static(n) => Some(*n),
         Dim::Dynamic => None,

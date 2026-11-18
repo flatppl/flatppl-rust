@@ -1,0 +1,18 @@
+{
+  "N": 2,
+  "N_c_a_nominal": 2,
+  "N_c_b_nominal": 2,
+  "c_a_nominal": [
+    20.0,
+    10.0
+  ],
+  "c_b_nominal": [
+    50.0,
+    60.0
+  ],
+  "c_observed": [
+    72.0,
+    68.0
+  ],
+  "y": 0.0
+}
