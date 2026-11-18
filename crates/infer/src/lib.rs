@@ -22,7 +22,6 @@
 
 mod axes;
 mod boundary;
-pub mod boxes;
 pub mod builtins;
 mod callable;
 mod catalogue;
@@ -39,7 +38,6 @@ use crate::modules::InferSession;
 use flatppl_core::{Module, NodeId, Type};
 use std::collections::HashMap;
 
-pub use boxes::{BOX_INPUT, box_input_names};
 pub use catalogue::{Catalogue, ParamSet, parse_catalogue};
 pub use modules::{ModuleBundle, module_source, reintern_type};
 

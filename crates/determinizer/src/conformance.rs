@@ -117,10 +117,7 @@ fn check_node(
             reason: "stochastic-phase node (a `draw` survives)".into(),
         });
     }
-    // A box member in a primitive's tag slot is the box's own measure or kernel.
-    let box_tag = (kernel_allowed || tags.contains(&id)) && crate::boxes::is_box_ref(m, id);
     match m.type_of(id) {
-        _ if box_tag => {}
         Some(Type::Measure { .. }) => bad.push(NonConformance {
             node: id,
             kind: NonConformKind::MeasureTyped,
@@ -215,8 +212,6 @@ fn check_node(
         // primitives"), and the surface printer spells a user call `f(x)` exactly like a
         // builtin one, so nothing downstream can tell them apart.
         let retained = match c.head {
-            // A box function application is a primitive query of the box.
-            CallHead::User(callee) if crate::boxes::is_box_ref(m, callee) => true,
             // FlatPDL may call a §09 function member with no base-op form, and each
             // engine lowers or refuses it. A member `crate::stdfn` expands survives
             // only with a call shape it cannot read, unless the backend retains it.
