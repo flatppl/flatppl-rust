@@ -41,5 +41,5 @@ model {
   q ~ beta(1, 3);
   lam ~ exponential(1);
   target += counts_n_atom * log_mix(w, 0, J * log_mix(q, 0, poisson_lpmf(0 | lam)));
-  target += (3 - counts_n_atom) * log(1 - w) + counts_rest_n_atom * log_mix(q, 0, poisson_lpmf(0 | lam)) + counts_n_other * log(1 - q) + poisson_lpmf(counts_other | lam);
+  target += (3 - counts_n_atom) * log1m(w) + counts_rest_n_atom * log_mix(q, 0, poisson_lpmf(0 | lam)) + counts_n_other * log1m(q) + poisson_lpmf(counts_other | lam);
 }

@@ -391,9 +391,8 @@ impl<'m> Emitter<'m> {
             &rest,
             Render::Rest(&reps),
         );
-        out.push(format!(
-            "target += ({n} - {count}) * log({wlx}) + {lp_rest};"
-        ));
+        let log_l = self.log_weight(wl.unwrap())?;
+        out.push(format!("target += ({n} - {count}) * {log_l} + {lp_rest};"));
         Ok(out)
     }
 
@@ -518,6 +517,22 @@ impl<'m> Emitter<'m> {
         Ok(out)
     }
 
+    /// `log(w)` of a mixture weight, `log1m(x)` when `w` is `1 - x`: the
+    /// complement keeps its precision near 0.
+    pub(super) fn log_weight(&mut self, w: NodeId) -> Result<String> {
+        let r = self.resolve(w);
+        if self.head(r) == Some("sub") {
+            let c = self.call(r).unwrap();
+            let (a, b) = (self.resolve(c.args[0]), c.args[1]);
+            let one = matches!(self.m.node(a), Node::Lit(flatppl_core::Scalar::Int(1)))
+                || matches!(self.m.node(a), Node::Lit(flatppl_core::Scalar::Real(x)) if *x == 1.0);
+            if one {
+                return Ok(format!("log1m({})", self.real(b)?.s));
+            }
+        }
+        Ok(format!("log({})", self.real(w)?.s))
+    }
+
     /// `weighted(w, A), weighted(1 - w, B)`: the second weight is `1 - w`.
     fn complement(&self, a: Option<NodeId>, b: Option<NodeId>) -> bool {
         let (Some(a), Some(b)) = (a, b) else {
@@ -543,11 +558,33 @@ impl<'m> Emitter<'m> {
         let parts = self.parts(mix)?;
         let mut lps = Vec::new();
         let mut weights = Vec::new();
+        // The log mass of each unnormalized truncated component: it enters
+        // the normalizer `Σ w_i M_i(S_i)` (§06 "Normalization and mass").
+        let mut masses: Vec<Option<String>> = Vec::new();
         for p in &parts {
             match *p {
                 Part::Law(w, law) => {
-                    lps.push(self.component_lp(law, y, None)?);
+                    if norm {
+                        self.truncated_component_has_mass(law)?;
+                    }
+                    let mut l = self.law_any(law)?;
+                    let support = l.support.take();
+                    let mut lp = self.law_lp(law, &l, y, None)?;
+                    let mut mass = None;
+                    if let Some((lo, hi)) = support {
+                        if let Some(out) = Self::outside_test(
+                            y,
+                            false,
+                            l.within(lo.as_deref(), hi.as_deref()).0.as_deref(),
+                            l.within(lo.as_deref(), hi.as_deref()).1.as_deref(),
+                        ) {
+                            lp = format!("({out} ? negative_infinity() : {lp})");
+                        }
+                        mass = Some(self.interval_lmass(&l, lo.as_deref(), hi.as_deref()));
+                    }
+                    lps.push(lp);
                     weights.push(w);
+                    masses.push(mass);
                 }
                 Part::Dirac(..) => {
                     return Err(Refusal::not_yet(
@@ -559,6 +596,7 @@ impl<'m> Emitter<'m> {
         }
         if let [a, b] = weights[..]
             && self.complement(a, b)
+            && masses.iter().all(Option::is_none)
         {
             let w = self.real(a.unwrap())?;
             return Ok((vec![], format!("log_mix({}, {}, {})", w.s, lps[0], lps[1])));
@@ -568,7 +606,7 @@ impl<'m> Emitter<'m> {
             .zip(&lps)
             .map(|(w, lp)| -> Result<String> {
                 Ok(match w {
-                    Some(w) => format!("log({}) + {lp}", self.real(*w)?.s),
+                    Some(w) => format!("{} + {lp}", self.log_weight(*w)?),
                     None => lp.clone(),
                 })
             })
@@ -576,7 +614,25 @@ impl<'m> Emitter<'m> {
         let mut lp = format!("log_sum_exp([{}]')", terms.join(", "));
         // An unweighted part has mass 1, so `normalize` divides by the
         // weight sum even when no part is weighted.
-        if norm && weights.iter().all(Option::is_none) {
+        if norm && masses.iter().any(Option::is_some) {
+            let zs: Vec<String> = weights
+                .iter()
+                .zip(&masses)
+                .map(|(w, m)| -> Result<String> {
+                    let lw = match w {
+                        Some(w) => Some(self.log_weight(*w)?),
+                        None => None,
+                    };
+                    Ok(match (lw, m) {
+                        (Some(lw), Some(m)) => format!("{lw} + {m}"),
+                        (Some(lw), None) => lw,
+                        (None, Some(m)) => m.clone(),
+                        (None, None) => "0".to_string(),
+                    })
+                })
+                .collect::<Result<_>>()?;
+            lp = format!("{lp} - log_sum_exp([{}]')", zs.join(", "));
+        } else if norm && weights.iter().all(Option::is_none) {
             lp = format!("{lp} - log({})", weights.len());
         } else if norm {
             let ws: Vec<String> = weights
@@ -751,10 +807,23 @@ impl<'m> Emitter<'m> {
         out
     }
 
-    /// The log density of `y` under one component law.
-    fn component_lp(&mut self, law: NodeId, y: &str, index: Option<&str>) -> Result<String> {
-        let l = self.law_any(law)?;
-        self.law_lp(law, &l, y, index)
+    /// A normalized mixture needs each unnormalized truncated component's
+    /// mass, which the emitter takes from the law's Stan CDF. The laws without
+    /// one that reach here (`Poisson(exp(a))`, `Categorical`) still have a
+    /// closed-form mass, so this is not yet, not never.
+    fn truncated_component_has_mass(&mut self, law: NodeId) -> Result<()> {
+        let r = self.resolve(law);
+        if self.head(r) != Some("truncate") {
+            return Ok(());
+        }
+        let inner = self.call(r).unwrap().args[0];
+        if self.law_any(inner)?.lcdf {
+            return Ok(());
+        }
+        Err(Refusal::not_yet(
+            Some(law),
+            "an unnormalized truncated mixture component of a law with no Stan CDF",
+        ))
     }
 
     /// The law's log density at a Dirac atom `c` beside it, or `None` when
@@ -769,9 +838,16 @@ impl<'m> Emitter<'m> {
         l: &Law,
         c: &str,
     ) -> Result<Option<String>> {
-        let lp = self.law_lp(law, l, c, None)?;
         let num = |s: &str| s.trim().parse::<f64>().ok();
         let cv = num(c);
+        if let (Some(x), Some((lo, hi))) = (cv, &l.trunc) {
+            let below = lo.as_deref().and_then(num).is_some_and(|b| x < b);
+            let above = hi.as_deref().and_then(num).is_some_and(|b| x > b);
+            if below || above {
+                return Ok(None);
+            }
+        }
+        let lp = self.law_lp(law, l, c, None)?;
         let (lo, hi) = (l.bounds.0.as_deref(), l.bounds.1.as_deref());
         let mut tests = Vec::new();
         for (bound, below) in [(lo, true), (hi, false)] {
@@ -805,20 +881,28 @@ impl<'m> Emitter<'m> {
     }
 
     /// `D_lpdf(y | args)` of a component, with its support guard. A
-    /// component must be a probability measure: an unnormalized truncation
-    /// has no closed-form share of the mixture.
+    /// normalized truncation divides by its mass on `[lo, hi]` and is zero
+    /// outside it (§06 "Normalization and mass"). An unnormalized one is
+    /// taken apart by `mixture_lp`, which knows the mixture's normalizer.
     fn law_lp(&mut self, at: NodeId, law: &Law, y: &str, index: Option<&str>) -> Result<String> {
         if law.support.is_some() {
-            return Err(Refusal::new(
-                RefusalKind::NumericNormalizer,
+            return Err(Refusal::not_yet(
                 Some(at),
-                "a mixture component",
-                "a mixture component that is not normalized (a `truncate` without `normalize`) has \
-                 no closed-form weight in the mixture",
+                "an unnormalized truncated mixture component in this form",
             ));
         }
-        if law.trunc.is_some() || !law.extra.is_empty() {
-            return Err(Refusal::not_yet(Some(at), "a truncated mixture component"));
+        if !law.extra.is_empty() {
+            return Err(Refusal::not_yet(
+                Some(at),
+                "a mixture component with extra terms",
+            ));
+        }
+        let array = self.decls.get(y).is_some_and(|d| d.rank() > 0);
+        if law.trunc.is_some() && array {
+            return Err(Refusal::not_yet(
+                Some(at),
+                "a truncated mixture component over an array variate",
+            ));
         }
         if law.declared {
             return Err(Refusal::not_yet(
@@ -843,6 +927,25 @@ impl<'m> Emitter<'m> {
                 };
                 t.replace("{y}", &yy)
             });
+        let lp = match &law.trunc {
+            Some((lo, hi)) => {
+                let mass = self.interval_lmass(law, lo.as_deref(), hi.as_deref());
+                let mass = match index {
+                    Some(i) => mass.replace(super::structure::LOOP, i),
+                    None => mass,
+                };
+                match Self::outside_test(
+                    y,
+                    false,
+                    law.within(lo.as_deref(), hi.as_deref()).0.as_deref(),
+                    law.within(lo.as_deref(), hi.as_deref()).1.as_deref(),
+                ) {
+                    Some(out) => format!("({out} ? negative_infinity() : {lp} - {mass})"),
+                    None => lp,
+                }
+            }
+            None => lp,
+        };
         Ok(match guard {
             Some(g) => {
                 let g = match index {
@@ -892,13 +995,29 @@ impl<'m> Emitter<'m> {
                 "an ordered restriction as a mixture component",
             ));
         }
-        if !l.discrete {
+        if l.support.is_some() {
+            return Err(Refusal::not_yet(
+                Some(mix),
+                "a `Dirac` atom beside an unnormalized truncated law",
+            ));
+        }
+        // Beside a continuous law the mixture has a density with respect to
+        // `Dirac(c) + Lebesgue` (Ruling 2): only observed data, whose values
+        // at the atom are known, can be scored. A parameter would need a
+        // density with respect to Lebesgue measure alone, and it has none.
+        if !l.discrete && !self.is_data(lhs) {
             return Err(Refusal::new(
                 RefusalKind::MixedReference,
                 Some(mix),
                 "superpose",
-                "a `Dirac` atom beside a continuous law mixes two reference measures (§06)",
+                "a `Dirac` atom beside a continuous law has no density with respect to Lebesgue \
+                 measure, so it cannot be the law of a parameter (§06)",
             ));
+        }
+        if !l.discrete {
+            return self
+                .hurdle_split(lhs, mix, norm, (wd, atom), (wl, law), &l)
+                .map(Some);
         }
         if self.shape(atom).is_some_and(|s| s.rank == 1) || self.row_fill(atom) {
             return self
@@ -956,7 +1075,7 @@ impl<'m> Emitter<'m> {
         let loop_ = super::structure::LOOP;
         let wlx = self.real(wl.unwrap())?.s;
         let mix_at = match self.atom_lp(mix, law, &l, &c.s)? {
-            None => format!("log({})", self.real(wd.unwrap())?.s),
+            None => self.log_weight(wd.unwrap())?,
             Some(lp_atom) if dirac_first => {
                 format!("log_mix({}, 0, {lp_atom})", self.real(wd.unwrap())?.s)
             }
@@ -974,16 +1093,187 @@ impl<'m> Emitter<'m> {
         } else {
             out.push(format!("target += {count} * {mix_at};"));
         }
-        let lp_rest = self
-            .law_density(law, &l, &format!("{lhs}[{rest}]"), None)?
-            .replace(loop_, &rest);
-        let log_w = if wlx.contains(loop_) {
-            format!("sum(log({}))", wlx.replace(loop_, &rest))
+        let lp_rest = self.rest_lp(mix, law, &l, lhs, &rest, &n, &count)?;
+        let log_l = self.log_weight(wl.unwrap())?;
+        let log_w = if log_l.contains(loop_) {
+            format!("sum({})", log_l.replace(loop_, &rest))
         } else {
-            format!("({n} - {count}) * log({wlx})")
+            format!("({n} - {count}) * {log_l}")
         };
         out.push(format!("target += {log_w} + {lp_rest};"));
         Ok(Some(out))
+    }
+
+    /// The vectorized log density of `lhs[rest]` under `l`. A normalized
+    /// truncation subtracts each element's log mass (one `_lccdf` or `_lcdf`
+    /// call sums them when the arguments vary per element) and is `-inf`
+    /// when an element lies outside `[lo, hi]`.
+    #[allow(clippy::too_many_arguments)]
+    fn rest_lp(
+        &mut self,
+        mix: NodeId,
+        law: NodeId,
+        l: &Law,
+        lhs: &str,
+        rest: &str,
+        n: &str,
+        count: &str,
+    ) -> Result<String> {
+        let loop_ = super::structure::LOOP;
+        let y = format!("{lhs}[{rest}]");
+        let lp = self.law_density(law, l, &y, None)?.replace(loop_, rest);
+        let Some((lo, hi)) = &l.trunc else {
+            return Ok(lp);
+        };
+        let mass = self.interval_lmass(l, lo.as_deref(), hi.as_deref());
+        let mass = if !mass.contains(loop_) {
+            format!("({n} - {count}) * {mass}")
+        } else if lo.is_some() && hi.is_some() {
+            // `log_diff_exp` of two summed `_lcdf` calls is not the sum of
+            // the per-element masses.
+            return Err(Refusal::not_yet(
+                Some(mix),
+                "a two-sided truncation beside a `Dirac` atom with per-element arguments",
+            ));
+        } else {
+            mass.replace(loop_, rest)
+        };
+        // `min` of an empty integer array raises: no rest, nothing outside.
+        Ok(
+            match Self::outside_test(
+                &y,
+                true,
+                l.within(lo.as_deref(), hi.as_deref()).0.as_deref(),
+                l.within(lo.as_deref(), hi.as_deref()).1.as_deref(),
+            ) {
+                Some(out) => {
+                    format!("({n} - {count} > 0 && ({out}) ? negative_infinity() : {lp} - {mass})")
+                }
+                None => format!("{lp} - {mass}"),
+            },
+        )
+    }
+
+    /// A `Dirac(c)` atom beside a continuous law over observed data (the
+    /// hurdle form, Ruling 2): with respect to `Dirac(c) + Lebesgue`, the
+    /// density is `w` at `c` and `(1 - w)·m(y)` elsewhere, since the law
+    /// gives the single point `c` no mass. The positions at `c` are counted
+    /// once in `transformed data`.
+    fn hurdle_split(
+        &mut self,
+        lhs: &str,
+        mix: NodeId,
+        norm: bool,
+        (wd, atom): (Option<NodeId>, NodeId),
+        (wl, law): (Option<NodeId>, NodeId),
+        l: &Law,
+    ) -> Result<Vec<String>> {
+        if self.shape(atom).is_none_or(|s| s.rank != 0)
+            || self
+                .decls
+                .get(lhs)
+                .is_none_or(|t| t.is_int() || t.rank() != 1)
+        {
+            return Err(Refusal::not_yet(
+                Some(mix),
+                "a `Dirac` atom beside a continuous law over this variate",
+            ));
+        }
+        if !(norm && (self.complement(wl, wd) || self.complement(wd, wl))) {
+            return Err(Refusal::not_yet(
+                Some(mix),
+                "a `Dirac` mixture with these weights",
+            ));
+        }
+        if !self.fixed_value(atom) {
+            return Err(Refusal::not_yet(
+                Some(mix),
+                "a `Dirac` atom whose value is not data",
+            ));
+        }
+        let c = self.at_module(|me| me.expr(atom))?.s;
+        let n = self.extent_text(lhs);
+        let count = self.fresh(&format!("{lhs}_n_atom"));
+        let rest = self.fresh(&format!("{lhs}_rest"));
+        let i = self.fresh_loop();
+        let b = self.fresh_local("b");
+        self.tdata.push(format!(
+            "int {count} = 0;\nfor ({i} in 1:{n}) {{\n  {count} += {lhs}[{i}] == {c};\n}}"
+        ));
+        self.tdata.push(format!("array[{n} - {count}] int {rest};"));
+        self.tdata.push(format!(
+            "{{\n  int {b} = 1;\n  for ({i} in 1:{n}) {{\n    if ({lhs}[{i}] != {c}) {{\n      {rest}[{b}] = {i};\n      {b} += 1;\n    }}\n  }}\n}}"
+        ));
+        for v in [&i, &b] {
+            self.used.remove(v);
+        }
+        let loop_ = super::structure::LOOP;
+        let log_d = self.log_weight(wd.unwrap())?;
+        let log_l = self.log_weight(wl.unwrap())?;
+        let mut out = Vec::new();
+        if log_d.contains(loop_) {
+            // A weight per element: the atom positions are needed by index.
+            let at_idx = self.fresh(&format!("{lhs}_atom"));
+            let (i, a) = (self.fresh_loop(), self.fresh_local("a"));
+            self.tdata.push(format!("array[{count}] int {at_idx};"));
+            self.tdata.push(format!(
+                "{{\n  int {a} = 1;\n  for ({i} in 1:{n}) {{\n    if ({lhs}[{i}] == {c}) {{\n      {at_idx}[{a}] = {i};\n      {a} += 1;\n    }}\n  }}\n}}"
+            ));
+            for v in [&i, &a] {
+                self.used.remove(v);
+            }
+            out.push(format!("target += sum({});", log_d.replace(loop_, &at_idx)));
+        } else {
+            out.push(format!("target += {count} * {log_d};"));
+        }
+        let lp_rest = self.rest_lp(mix, law, l, lhs, &rest, &n, &count)?;
+        let log_w = if log_l.contains(loop_) {
+            format!("sum({})", log_l.replace(loop_, &rest))
+        } else {
+            format!("({n} - {count}) * {log_l}")
+        };
+        let statement = format!("target += {log_w} + {lp_rest};");
+        // Off the atom, data outside the law's support scores -inf (spec);
+        // Stan's `_lpdf` would raise there.
+        let (lo, hi) = self.support_ends(mix, l)?;
+        let y = format!("{lhs}[{rest}]");
+        match Self::outside_test(&y, true, lo.as_deref(), hi.as_deref()) {
+            Some(test) => {
+                let body: String = statement.lines().map(|x| format!("  {x}\n")).collect();
+                out.push(format!(
+                    "if ({n} - {count} > 0 && ({test})) {{\n  target += negative_infinity();\n}} else {{\n{body}}}"
+                ));
+            }
+            None => out.push(statement),
+        }
+        Ok(out)
+    }
+
+    /// The literal ends of a law's support: its variate bounds, or the
+    /// argument its row names as `floor`.
+    fn support_ends(&self, mix: NodeId, l: &Law) -> Result<(Option<String>, Option<String>)> {
+        let num = |b: &Option<String>| b.clone().filter(|x| x.parse::<f64>().is_ok());
+        let lo = match l.floor_arg {
+            Some(k) => {
+                let open = l.call.find('(').unwrap_or(l.call.len());
+                let args = l.call[open..]
+                    .strip_prefix('(')
+                    .and_then(|x| x.strip_suffix(')'))
+                    .map(split_args)
+                    .unwrap_or_default();
+                match args.get(k) {
+                    Some(a) if !a.contains(super::structure::LOOP) => Some(a.clone()),
+                    _ => {
+                        return Err(Refusal::not_yet(
+                            Some(mix),
+                            "a `Dirac` atom beside a law whose support varies per element",
+                        ));
+                    }
+                }
+            }
+            None => num(&l.bounds.0),
+        };
+        Ok((lo, num(&l.bounds.1)))
     }
 }
 

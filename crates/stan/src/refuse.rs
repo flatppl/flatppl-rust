@@ -28,6 +28,9 @@ pub enum RefusalKind {
     /// A mixture of components with different reference measures (a `Dirac`
     /// atom beside a continuous law).
     MixedReference,
+    /// `normalize` of a measure with total mass 0 (a continuous law
+    /// restricted to a set of integers): the normalized measure is undefined.
+    ZeroMass,
     /// A container whose length depends on parameters (`filter` with a
     /// parameter predicate): Stan sizes are data.
     ParameterDependentExtent,

@@ -1,0 +1,8 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+k = 2
+m = normalize(superpose(
+  weighted(0.3, truncate(Poisson(3.0), interval(1, 4))),
+  weighted(0.7, truncate(Poisson(1.5), interval(0, 2)))))
+inputs = (k)
+outputs = logdensityof(m, k)

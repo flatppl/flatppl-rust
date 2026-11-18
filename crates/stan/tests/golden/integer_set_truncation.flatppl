@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+k_obs = [1, 3, 2, 6]
+lam ~ Gamma(2, 1)
+k ~ iid(normalize(truncate(Poisson(lam), posintegers)), 4)
+prior = lawof(record(lam = lam))
+L = likelihoodof(kernelof(record(k = k), lam = lam), record(k = k_obs))
+post = bayesupdate(L, prior)

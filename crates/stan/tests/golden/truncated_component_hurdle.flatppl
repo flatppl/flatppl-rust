@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+y_obs = [0, 2, 0, 1, 5]
+hu ~ Beta(2, 2)
+mu ~ Gamma(2, 1)
+m = normalize(superpose(weighted(hu, Dirac(0)), weighted(1 - hu, normalize(truncate(Poisson(mu), interval(1, inf))))))
+y ~ iid(m, 5)
+prior = lawof(record(hu = hu, mu = mu))
+L = likelihoodof(kernelof(record(y = y), hu = hu, mu = mu), record(y = y_obs))
+post = bayesupdate(L, prior)

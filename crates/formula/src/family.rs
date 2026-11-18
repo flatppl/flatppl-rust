@@ -441,7 +441,8 @@ impl Family {
                 };
                 let mut base = base.observation(b, observation, true);
                 if matches!(self, Self::HurdlePoisson | Self::HurdleNegbinomial) {
-                    let one = b.lit_real(1.0);
+                    // A count's support has integer ends.
+                    let one = b.lit_int(1);
                     let infinity = b.call_head("inf");
                     let support = b.call("interval", &[one, infinity]);
                     let truncated = b.call("truncate", &[base, support]);

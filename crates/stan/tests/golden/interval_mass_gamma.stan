@@ -17,7 +17,7 @@ data {
   real hi;
 }
 model {
-  if (point < lo || point > hi) {
+  if (point < fmax(lo, 0) || point > hi) {
     target += negative_infinity();
   } else {
     point ~ gamma(2.0, rate);

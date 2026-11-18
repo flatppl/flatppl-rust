@@ -29,6 +29,6 @@ parameters {
 model {
   w ~ beta(2, 2);
   lam ~ exponential(1);
-  target += y_n_atom * log(1 - w);
+  target += y_n_atom * log1m(w);
   target += (5 - y_n_atom) * log(w) + poisson_lpmf(y[y_rest] | lam);
 }

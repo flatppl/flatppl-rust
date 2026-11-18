@@ -30,7 +30,7 @@ pub(super) struct Law {
     pub vectorized: bool,
     pub multivariate: bool,
     /// Stan defines `_lcdf` and `_lccdf`, so `T[L, U]` is well formed.
-    lcdf: bool,
+    pub lcdf: bool,
     /// An integer variate.
     pub discrete: bool,
     /// The support an unnormalized `truncate` restricts its variate to.
@@ -66,11 +66,66 @@ impl Law {
         if let Some((lo, hi)) = &self.trunc {
             s.push_str(&format!(
                 " T[{}, {}]",
-                lo.as_deref().unwrap_or(""),
-                hi.as_deref().unwrap_or("")
+                lo.as_deref().map(|x| self.clamp(x)).unwrap_or_default(),
+                hi.as_deref().map(|x| self.clamp(x)).unwrap_or_default()
             ));
         }
         s
+    }
+
+    /// The literal ends of the law's support: its variate bounds, or the
+    /// argument its row names as `floor`.
+    fn support_ends(&self) -> (Option<String>, Option<String>) {
+        let num = |b: &Option<String>| b.clone().filter(|v| v.parse::<f64>().is_ok());
+        let floor = match self.floor_arg {
+            Some(k) => {
+                let open = self.call.find('(').unwrap_or(self.call.len());
+                self.call[open..]
+                    .strip_prefix('(')
+                    .and_then(|v| v.strip_suffix(')'))
+                    .map(super::mixture::split_args)
+                    .and_then(|a| a.get(k).cloned())
+            }
+            None => num(&self.bounds.0),
+        };
+        (floor, num(&self.bounds.1))
+    }
+
+    fn pick(&self, x: &str, b: &str, larger: bool) -> String {
+        pick(x, b, larger, self.discrete)
+    }
+
+    /// A truncation end clamped into the law's support, for a CDF argument:
+    /// Stan's CDFs raise outside it.
+    pub(super) fn clamp(&self, x: &str) -> String {
+        let (floor, ceil) = self.support_ends();
+        let mut x = x.to_string();
+        if let Some(f) = &floor {
+            x = self.pick(&x, f, true);
+        }
+        if let Some(c) = &ceil {
+            x = self.pick(&x, c, false);
+        }
+        x
+    }
+
+    /// `[lo, hi]` intersected with the law's support, for an outside test:
+    /// the lower end raised to the support's, the upper one lowered.
+    pub(super) fn within(
+        &self,
+        lo: Option<&str>,
+        hi: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        let (floor, ceil) = self.support_ends();
+        let lo = lo.map(|x| match &floor {
+            Some(f) => self.pick(x, f, true),
+            None => x.to_string(),
+        });
+        let hi = hi.map(|x| match &ceil {
+            Some(c) => self.pick(x, c, false),
+            None => x.to_string(),
+        });
+        (lo, hi)
     }
 
     /// The variate side for `y`.
@@ -768,7 +823,10 @@ impl<'m> Emitter<'m> {
         if self.head(r) != Some("truncate") {
             return Ok(None);
         }
-        Ok(self.law(r, false)?.support)
+        let l = self.law(r, false)?;
+        Ok(l.support
+            .as_ref()
+            .map(|(lo, hi)| l.within(lo.as_deref(), hi.as_deref())))
     }
 
     /// `body` for data inside [lo, hi], `target += negative_infinity();`
@@ -979,8 +1037,8 @@ impl<'m> Emitter<'m> {
             );
             self.used.remove(&i);
             let mut out = vec![stmt];
-            out.extend(law.extra);
-            return Ok(out);
+            out.extend(law.extra.iter().cloned());
+            return Ok(self.support_guarded(lhs, &law, out));
         }
         let (target, rhs) = match (flat, &law.flat_call) {
             (Some(Flat::Row), Some(call)) if !law.multivariate => {
@@ -993,8 +1051,24 @@ impl<'m> Emitter<'m> {
             _ => (lhs.to_string(), law.rhs(None)),
         };
         let mut out = vec![format!("{} ~ {rhs};", law.lhs(&target))];
-        out.extend(law.extra);
-        Ok(out)
+        out.extend(law.extra.iter().cloned());
+        Ok(self.support_guarded(lhs, &law, out))
+    }
+
+    /// `T[lo, hi]` on data reaching outside the law's support: Stan's `_lpdf`
+    /// raises on such data before `T` tests it, where the density is zero.
+    fn support_guarded(&mut self, lhs: &str, law: &Law, lines: Vec<String>) -> Vec<String> {
+        let Some((lo, hi)) = &law.trunc else {
+            return lines;
+        };
+        let (wl, wh) = law.within(lo.as_deref(), hi.as_deref());
+        if (&wl, &wh) == (lo, hi) || !self.is_data(lhs) {
+            return lines;
+        }
+        match self.guarded(lhs, wl.as_deref(), wh.as_deref(), lines.clone()) {
+            Some(g) => vec![g],
+            None => lines,
+        }
     }
 
     /// `iid(iid(D, m), k)`, D^⊗(k·m) (spec §06 "Independent composition"),
@@ -1122,11 +1196,16 @@ impl<'m> Emitter<'m> {
     }
 
     pub(super) fn density_call(&mut self, id: NodeId, m: NodeId, x: NodeId) -> Result<String> {
-        let law = self.law(m, false)?;
-        if law.trunc.is_some() || law.support.is_some() {
+        let mut law = self.law(m, false)?;
+        let restricted = law
+            .trunc
+            .take()
+            .map(|t| (t, true))
+            .or(law.support.take().map(|t| (t, false)));
+        if restricted.is_some() && self.shape(x).is_none_or(|s| s.rank != 0) {
             return Err(Refusal::not_yet(
                 Some(id),
-                "logdensityof of a truncated law",
+                "logdensityof of a truncated law over an array",
             ));
         }
         if law.declared {
@@ -1155,7 +1234,30 @@ impl<'m> Emitter<'m> {
         } else {
             x.at(P_ATOM)
         };
-        self.law_density(id, &law, &y, None)
+        let lp = self.law_density(id, &law, &y, None)?;
+        // A truncation is zero outside `[lo, hi]`; a normalized one divides
+        // by its mass there (§06 "Normalization and mass").
+        let Some(((lo, hi), normalized)) = restricted else {
+            return Ok(lp);
+        };
+        let lp = if normalized {
+            let mass = self.interval_lmass(&law, lo.as_deref(), hi.as_deref());
+            format!("{lp} - {mass}")
+        } else {
+            lp
+        };
+        let point = x.at(P_ATOM);
+        Ok(
+            match Self::outside_test(
+                &point,
+                false,
+                law.within(lo.as_deref(), hi.as_deref()).0.as_deref(),
+                law.within(lo.as_deref(), hi.as_deref()).1.as_deref(),
+            ) {
+                Some(out) => format!("({out} ? negative_infinity() : {lp})"),
+                None => lp,
+            },
+        )
     }
 
     /// A parameter declared by the sets a record-level `truncate` gives it:
@@ -1290,7 +1392,18 @@ impl<'m> Emitter<'m> {
                          closed-form normalizer",
                     ));
                 }
-                let set = c.args[1];
+                let (base, set) = (c.args[0], c.args[1]);
+                let integers = matches!(self.m.node(self.resolve(set)), Node::Const(k)
+                    if matches!(self.name(*k), "posintegers" | "nonnegintegers"));
+                if integers && !self.law_any(base)?.discrete {
+                    return Err(Refusal::new(
+                        RefusalKind::ZeroMass,
+                        Some(inner),
+                        "normalize",
+                        "`normalize` of a continuous law restricted to a set of integers: the \
+                         restriction has total mass 0, so the normalized measure is undefined",
+                    ));
+                }
                 let law = self.truncated(inner)?;
                 // Stan's `T[L, U]` of a discrete law takes integer ends only.
                 if law.discrete && !self.integer_ends(set) {
@@ -1537,9 +1650,45 @@ impl<'m> Emitter<'m> {
             // A declared set is the declaration's own (see `declare_from_sets`).
             Some("truncate") if !self.law_sets(m).is_empty() => Ok(None),
             Some("iid" | "normalize") => self.support(self.call(m).unwrap().args[0]),
+            // The interval intersected with the base law's support: a bound
+            // outside it would admit values with zero density.
             Some("truncate") => {
-                let set = self.resolve(self.call(m).unwrap().args[1]);
-                self.interval(set).map(Some)
+                let (base, set) = {
+                    let c = self.call(m).unwrap();
+                    (c.args[0], self.resolve(c.args[1]))
+                };
+                let (mut lo, mut hi) = self.interval(set)?;
+                // The base law's literal support from its table rows, where
+                // they all agree: rendering the law here would declare its
+                // data early.
+                let rows = self
+                    .head(self.resolve(base))
+                    .map(|h| tables::law_rows_by_head(h, None))
+                    .unwrap_or_default();
+                let ends: Vec<_> = rows
+                    .iter()
+                    .map(|r| {
+                        (
+                            variate_bounds(&r.variate),
+                            r.variate.starts_with("int"),
+                            r.floor.is_empty(),
+                        )
+                    })
+                    .collect();
+                if let Some(first) = ends.first()
+                    && first.2
+                    && ends.iter().all(|e| e == first)
+                {
+                    let ((floor, ceil), discrete, _) = first;
+                    let num = |b: &Option<String>| b.clone().filter(|v| v.parse::<f64>().is_ok());
+                    if let (Some(x), Some(f)) = (&lo, num(floor)) {
+                        lo = Some(pick(x, &f, true, *discrete));
+                    }
+                    if let (Some(x), Some(c)) = (&hi, num(ceil)) {
+                        hi = Some(pick(x, &c, false, *discrete));
+                    }
+                }
+                Ok(Some((lo, hi)))
             }
             Some("Uniform") => {
                 let s = self.resolve(self.law_args("Uniform", m)?[0]);
@@ -1752,7 +1901,24 @@ impl<'m> Emitter<'m> {
                 "truncate of a law with no Stan CDF",
             ));
         }
-        let (mut lo, hi) = self.interval(set)?;
+        let (mut lo, hi) = match self.m.node(set) {
+            // A set of integers: integer ends, the upper one open.
+            Node::Const(c) if matches!(self.name(*c), "posintegers" | "nonnegintegers") => {
+                if !law.discrete {
+                    return Err(Refusal::not_yet(
+                        Some(t),
+                        "a continuous law restricted to a set of integers (the zero measure)",
+                    ));
+                }
+                let lo = if self.name(*c) == "posintegers" {
+                    "1"
+                } else {
+                    "0"
+                };
+                (Some(lo.to_string()), None)
+            }
+            _ => self.interval(set)?,
+        };
         // `posreals` excludes 0: an integer variate starts at 1. Stan's
         // discrete `T[L, U]` keeps `L`.
         if law.discrete && matches!(self.m.node(set), Node::Const(c) if self.name(*c) == "posreals")
@@ -2383,6 +2549,23 @@ pub(super) fn is_identifier(s: &str) -> bool {
 
 /// `lower` and `upper` of a `distributions.ron` variate type
 /// (`int<lower=0, upper=1>`).
+/// The larger (or smaller) of two ends, folded when both are literals.
+fn pick(x: &str, b: &str, larger: bool, discrete: bool) -> String {
+    match (x.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(xv), Ok(bv)) if (xv >= bv) == larger => x.to_string(),
+        (Ok(_), Ok(_)) => b.to_string(),
+        _ => {
+            let f = match (discrete, larger) {
+                (true, true) => "max",
+                (true, false) => "min",
+                (false, true) => "fmax",
+                (false, false) => "fmin",
+            };
+            format!("{f}({x}, {b})")
+        }
+    }
+}
+
 fn variate_bounds(variate: &str) -> (Option<String>, Option<String>) {
     let inner = variate
         .split_once('<')

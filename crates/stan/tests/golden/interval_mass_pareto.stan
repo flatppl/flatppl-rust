@@ -17,7 +17,7 @@ data {
   real hi;
 }
 model {
-  if (point < lo || point > hi) {
+  if (point < fmax(lo, ym) || point > hi) {
     target += negative_infinity();
   } else {
     point ~ pareto(ym, 3.0);

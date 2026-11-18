@@ -1,0 +1,5 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+x = 0.5
+outputs = logdensityof(normalize(truncate(Exponential(2.0), interval(-1.0, inf))), x)
+inputs = (x)

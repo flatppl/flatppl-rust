@@ -1,0 +1,7 @@
+# emit: target=post
+flatppl_compat = "0.1"
+v = 1.2
+a ~ Normal(0, 1)
+prior = lawof(record(a = a))
+lw(p) = logdensityof(normalize(truncate(Normal(p.a, 1), interval(0.0, inf))), v)
+post = logweighted(lw, prior)
