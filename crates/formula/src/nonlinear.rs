@@ -15,7 +15,7 @@ pub(crate) fn parse(spec: &Spec, family: Family) -> Result<(Formula, Option<Nonl
     if spec.nlpars.is_empty() {
         return Ok((crate::parse_formula(&spec.formula)?, None));
     }
-    if matches!(family, Family::Cumulative | Family::Categorical) {
+    if family == Family::Categorical {
         return Err(Error(format!(
             "nonlinear predictors do not support family `{}`",
             spec.family
@@ -25,9 +25,9 @@ pub(crate) fn parse(spec: &Spec, family: Family) -> Result<(Formula, Option<Nonl
         .formula
         .split_once('~')
         .ok_or_else(|| Error("nonlinear formula must contain `response ~ expression`".into()))?;
-    // The response may still use ordinary response additions. Its predictor
-    // comes solely from the expression and the separate parameter formulas.
-    let formula = crate::parse_formula(&format!("{lhs} ~ 0"))?;
+    // Ordinal threshold intercepts remain part of the response model.
+    let intercept = u8::from(family == Family::Cumulative);
+    let formula = crate::parse_formula(&format!("{lhs} ~ {intercept}"))?;
     let expression = crate::formula::parse_numeric_expression(rhs)?;
     let mut names = Vec::new();
     expression.columns(&mut names);
