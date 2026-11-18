@@ -406,6 +406,7 @@ impl<'m> Emitter<'m> {
                 self.env.insert(b, stan.clone());
             }
             self.fields.insert(f.field, stan.clone());
+            self.manifest_bindings.push(f.binding);
             self.manifest.push(ManifestParam {
                 stan,
                 field: self.name(f.field).to_string(),
@@ -489,6 +490,7 @@ impl<'m> Emitter<'m> {
             self.record_decl(&stan, t);
             self.env.insert(sym, stan.clone());
             self.fields.insert(name, stan.clone());
+            self.manifest_bindings.push(Some(sym));
             self.manifest.push(ManifestParam {
                 stan,
                 field: self.name(name).to_string(),
@@ -582,6 +584,7 @@ impl<'m> Emitter<'m> {
             self.env.insert(sym, stan.clone());
             // A free input is a scoring input, as a kernel input is.
             self.fields.insert(sym, stan.clone());
+            self.manifest_bindings.push(Some(sym));
             self.manifest.push(ManifestParam {
                 stan,
                 field: self.name(sym).to_string(),
@@ -2150,6 +2153,39 @@ impl<'m> Emitter<'m> {
             .map(|&a| int(self, a))
             .collect();
         Some((input, crate::ManifestIndex::Slice(ks?)))
+    }
+
+    /// A parameter whose own binding is a module input (`inputs = (…)`,
+    /// matched by alias end) is bound by that ABI name. A query point that
+    /// binds the same field to another input is a contradiction: refuse.
+    pub(crate) fn abi_parameters(&mut self) -> Result<()> {
+        let abi: Vec<(Symbol, Symbol)> = self
+            .abi_inputs()
+            .into_iter()
+            .map(|a| (a, *self.m.alias_chain(a).last().unwrap()))
+            .collect();
+        for (p, b) in self.manifest.iter_mut().zip(&self.manifest_bindings) {
+            let Some(b) = b else { continue };
+            let end = *self.m.alias_chain(*b).last().unwrap();
+            let Some((written, _)) = abi.iter().find(|(_, e)| *e == end) else {
+                continue;
+            };
+            let name = self.m.resolve(*written).to_string();
+            match &p.input {
+                None => p.input = Some(name),
+                Some(other) if *other != name || p.index.is_some() => {
+                    return Err(Refusal::not_yet(
+                        None,
+                        format!(
+                            "a query point that binds `{}` to `{other}` while it is the input `{name}`",
+                            p.field
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
     }
 
     /// The names written in the module's `inputs = (…)`, the ABI names.

@@ -795,3 +795,15 @@ fn locscale_scale_of_unknown_sign_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("scale of unknown sign"), "{r}");
 }
+
+#[test]
+fn query_point_binding_another_input_is_not_yet() {
+    let r = refuse_with(
+        "mu = elementof(reals)\nnu = elementof(reals)\n\
+         L = likelihoodof(functionof(Normal(mu, 1), mu = mu), 0.4)\n\
+         inputs = (mu, nu)\noutputs = logdensityof(L, record(mu = nu))\n",
+        Some("L"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("while it is the input"), "{r}");
+}
