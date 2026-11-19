@@ -1,0 +1,15 @@
+flatppl_compat = "0.1"
+a ~ Normal(0, 1)
+b ~ Normal(0, 1)
+wave(x, y) = complex(x, y)
+z = wave(a, b)
+v = [z, 2 + im]
+row = transpose(v)
+conjugated = adjoint(v)
+A = rowstack([v, v])
+blocks = [A, A]
+location = real(row * v) + 2 * real(conjugated * v) + imag(blocks[2, 1, 2]) + imag(conj(z)) + abs2(z)
+y ~ Normal(location, 1)
+prior = lawof(record(a = a, b = b))
+L = likelihoodof(kernelof(record(y = y), a, b), record(y = 1.5))
+post = bayesupdate(L, prior)

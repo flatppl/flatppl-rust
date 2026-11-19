@@ -118,6 +118,14 @@ fn shape_of(ty: &Type) -> Option<Shape> {
     }
 }
 
+fn is_complex(ty: &Type) -> bool {
+    match ty {
+        Type::Scalar(ScalarType::Complex) => true,
+        Type::Array { elem, .. } | Type::TVector { elem, .. } => is_complex(elem),
+        _ => false,
+    }
+}
+
 /// How a rank-2 variate and its rank-2 law arguments flatten for one
 /// vectorized statement: both orders must agree element by element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -915,10 +923,10 @@ impl<'m> Emitter<'m> {
     /// to elementwise loops.
     fn place(&mut self, base: &str, rhs: NodeId, attempt: Result<Ex>) -> Result<String> {
         let fixed = self.m.phase_of(rhs) == Some(Phase::Fixed);
-        // A rank-3 value is built by `array` or `fill`, or names one. Stan has
-        // no arithmetic on arrays, and element loops are no answer: refuse.
+        // Arrays of matrices can be constructed or copied. Stan has no
+        // arithmetic on these arrays.
         if self.shape(rhs).is_some_and(|s| s.rank == 3)
-            && !matches!(self.head(rhs), Some("array" | "fill"))
+            && !matches!(self.head(rhs), Some("array" | "fill" | "vector"))
             && !attempt
                 .as_ref()
                 .is_ok_and(|e| self.decls.contains_key(&e.s))
@@ -1055,7 +1063,7 @@ impl<'m> Emitter<'m> {
         self.ty(id).as_ref().and_then(shape_of)
     }
 
-    /// An expression used in real arithmetic: integer arrays become vectors.
+    /// An arithmetic expression, promoting integer arrays to vectors or matrices.
     fn real(&mut self, id: NodeId) -> Result<Ex> {
         // An integer vector as one column or row of a real matrix.
         let r = self.resolve(id);
@@ -1144,6 +1152,7 @@ impl<'m> Emitter<'m> {
             Node::Const(c) => match self.name(*c) {
                 "inf" => Ok(Ex::atom("positive_infinity()")),
                 "pi" => Ok(Ex::atom("pi()")),
+                "im" => Ok(Ex::atom("1i")),
                 other => Err(Refusal::not_yet(
                     Some(id),
                     format!("the constant `{other}`"),
@@ -1196,6 +1205,24 @@ impl<'m> Emitter<'m> {
             }
             ("add", [a, b]) => bin(self, "+", P_ADD, *a, *b),
             ("sub", [a, b]) => bin(self, "-", P_ADD, *a, *b),
+            ("mul", [a, b])
+                if matches!(self.ty(*a), Some(Type::TVector { .. }))
+                    && matches!(self.ty(*b), Some(Type::Array { shape, elem })
+                        if shape.len() == 1 && matches!(*elem, Type::Scalar(_)))
+                    && [*a, *b]
+                        .iter()
+                        .any(|&n| self.ty(n).as_ref().is_some_and(is_complex)) =>
+            {
+                // Stan's row-times-column overload conjugates its left input.
+                // FlatPPL multiplies bilinearly, even when the row is complex.
+                let row = self.real(*a)?;
+                let col = self.real(*b)?;
+                Ok(Ex::atom(format!(
+                    "(to_matrix({}) * {})[1]",
+                    row.s,
+                    col.at(P_MUL + 1),
+                )))
+            }
             ("mul", [a, b]) => bin(self, "*", P_MUL, *a, *b),
             ("divide", [a, b]) => {
                 let ints =
@@ -1320,10 +1347,13 @@ impl<'m> Emitter<'m> {
                 self.log_density(id, m, x)
             }
             ("indicesof", [_]) if let Some(r) = self.range(id) => Ok(Ex::atom(r.array())),
-            // functions.ron `transpose`: the operator `'`.
-            ("transpose", [a]) => {
+            ("transpose" | "adjoint", [a]) => {
                 let e = self.real(*a)?;
-                Ok(Ex::atom(e.transposed()))
+                let transposed = e.transposed();
+                if head == "adjoint" && self.ty(*a).as_ref().is_some_and(is_complex) {
+                    return Ok(Ex::atom(format!("conj({transposed})")));
+                }
+                Ok(Ex::atom(transposed))
             }
             // `cat(x)` is x; of one scalar, a vector of length 1 (spec §07).
             ("cat", [x]) if self.shape(*x).is_some_and(|s| s.rank == 0) => self.vector(id, &[*x]),
@@ -1454,6 +1484,37 @@ impl<'m> Emitter<'m> {
                 Some(id),
                 format!("{name} with this arity"),
             ));
+        }
+        if module.is_none()
+            && matches!(name, "real" | "conj" | "abs2")
+            && let [arg] = parts.as_slice()
+            && let Some(input) = self.call(id).and_then(|call| {
+                call.args
+                    .get(usize::from(self.head(id) == Some("broadcast")))
+            })
+            && let Some(ty) = self.ty(*input)
+        {
+            if is_complex(&ty) {
+                if name == "abs2" {
+                    // The scalar-only Stan norm overload is not vectorized.
+                    return Ok(if matches!(ty, Type::Scalar(_)) {
+                        Ex::atom(format!("norm({})", arg.s))
+                    } else {
+                        Ex {
+                            s: format!("square(get_real({0})) + square(get_imag({0}))", arg.s),
+                            prec: P_ADD,
+                        }
+                    });
+                }
+            } else if name != "abs2" {
+                return Ok(
+                    if matches!(ty, Type::Scalar(ScalarType::Integer | ScalarType::Boolean)) {
+                        Ex::atom(format!("get_real({})", arg.s))
+                    } else {
+                        arg.clone()
+                    },
+                );
+            }
         }
         // `fmax`/`fmin` return real; `max`/`min` of two integers is an integer.
         if matches!(name, "max" | "min")
@@ -1729,7 +1790,9 @@ impl<'m> Emitter<'m> {
             // A declared `array[K] vector[M]`: one row (column) per step.
             if let Ok(e) = self.expr(original)
                 && let Some(t) = self.decls.get(&e.s).cloned()
-                && (t.array.len(), t.base, t.dims.len()) == (1, "vector", 1)
+                && t.array.len() == 1
+                && matches!(t.base, "vector" | "complex_vector")
+                && t.dims.len() == 1
             {
                 let fixed = self.m.phase_of(id) == Some(Phase::Fixed);
                 let stan = self.fresh(&base);
@@ -1890,7 +1953,7 @@ impl<'m> Emitter<'m> {
         }
         // A matrix row is a Stan row_vector; a FlatPPL vector is a Stan vector.
         let matrix = matches!(self.ty(x), Some(Type::Array { shape, elem })
-            if shape.len() == 2 && matches!(elem.as_ref(), Type::Scalar(ScalarType::Real)));
+            if shape.len() == 2 && matches!(elem.as_ref(), Type::Scalar(ScalarType::Real | ScalarType::Complex)));
         let row = sel.len() == 2
             && self.shape(sel[0]).is_some_and(|s| s.rank == 0)
             && self.shape(id).is_some_and(|s| s.rank == 1);

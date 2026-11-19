@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+z = elementof(complexes)
+log_prior(point) = -0.5 * abs2(point.z)
+prior = logweighted(log_prior, Lebesgue(cartprod(z = complexes)))
+y ~ Normal(real(z) + 3 * imag(z), 1)
+L = likelihoodof(kernelof(record(y = y), z), record(y = 1.5))
+post = bayesupdate(L, prior)

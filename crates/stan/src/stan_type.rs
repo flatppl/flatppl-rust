@@ -136,19 +136,16 @@ pub(crate) fn declare(
     size: SizeName<'_>,
     node: NodeId,
 ) -> Result<StanType> {
-    let t = declare_layout(ty, vs, bounded, size, node)?;
-    Ok(
-        if t.base == "real" && t.array.len() == 3 && t.dims.is_empty() {
-            StanType {
-                array: vec![t.array[0].clone()],
-                base: "matrix",
-                dims: vec![t.array[1].clone(), t.array[2].clone()],
-                bounds: t.bounds,
-            }
-        } else {
-            t
-        },
-    )
+    let mut t = declare_layout(ty, vs, bounded, size, node)?;
+    if t.array.len() == 3 && t.dims.is_empty() {
+        match t.base {
+            "real" => t.base = "matrix",
+            "complex" => t.base = "complex_matrix",
+            _ => return Ok(t),
+        }
+        t.dims = t.array.split_off(1);
+    }
+    Ok(t)
 }
 
 fn declare_layout(
@@ -165,24 +162,26 @@ fn declare_layout(
     } else {
         Bounds::default()
     };
-    let scalar = |s: &ScalarType| -> Result<&'static str> {
-        match s {
-            ScalarType::Real => Ok("real"),
-            ScalarType::Integer | ScalarType::Boolean => Ok("int"),
-            ScalarType::Complex => Err(Refusal::not_yet(Some(node), "a complex value")),
-        }
+    let scalar = |s: &ScalarType| match s {
+        ScalarType::Real => "real",
+        ScalarType::Integer | ScalarType::Boolean => "int",
+        ScalarType::Complex => "complex",
     };
     match ty {
         Type::Scalar(s) => Ok(StanType {
             array: vec![],
-            base: scalar(s)?,
+            base: scalar(s),
             dims: vec![],
             bounds,
         }),
         Type::TVector { len, elem } => match elem.as_ref() {
-            Type::Scalar(ScalarType::Real) => Ok(StanType {
+            Type::Scalar(s @ (ScalarType::Real | ScalarType::Complex)) => Ok(StanType {
                 array: vec![],
-                base: "row_vector",
+                base: if *s == ScalarType::Complex {
+                    "complex_row_vector"
+                } else {
+                    "row_vector"
+                },
                 dims: vec![extent(len, size, node)?],
                 bounds,
             }),
@@ -235,9 +234,19 @@ fn declare_layout(
                         }),
                     }
                 }
+                Type::Scalar(ScalarType::Complex) if matches!(dims.len(), 1 | 2) => Ok(StanType {
+                    array: vec![],
+                    base: if dims.len() == 1 {
+                        "complex_vector"
+                    } else {
+                        "complex_matrix"
+                    },
+                    dims,
+                    bounds,
+                }),
                 Type::Scalar(s) => Ok(StanType {
                     array: dims,
-                    base: scalar(s)?,
+                    base: scalar(s),
                     dims: vec![],
                     bounds,
                 }),
@@ -290,6 +299,14 @@ mod tests {
         // (row key, type, value set, {lo}, {hi}, {bounds})
         let cases: Vec<(&str, Type, ValueSet, &str, &str, &str)> = vec![
             ("reals", real(), ValueSet::Reals, "", "", ""),
+            (
+                "complexes",
+                Type::Scalar(ScalarType::Complex),
+                ValueSet::Complexes,
+                "",
+                "",
+                "",
+            ),
             (
                 "interval(-inf, inf)",
                 real(),
@@ -398,12 +415,10 @@ mod tests {
                 "",
             ),
         ];
-        // Rows the emitter builds elsewhere or refuses: records flatten to
-        // one declaration per field, complex values and the `none` rows refuse.
+        // Records flatten to one declaration per field. The `none` rows refuse.
         let elsewhere = [
             "cartprod(S1, ..., Sk)",
             "cartprod(a = S1, ...)",
-            "complexes",
             "anything",
             "rngstates",
         ];
