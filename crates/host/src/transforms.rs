@@ -209,6 +209,15 @@ fn correlation_chart(domain: &Domain, point: &str) -> Result<Chart, String> {
 }
 
 impl Domain {
+    fn has_complex_elements(&self) -> bool {
+        match self {
+            Self::Complexes => true,
+            Self::CartPow { of, .. } => of.has_complex_elements(),
+            Self::CartProd { of } => of.iter().any(Self::has_complex_elements),
+            _ => false,
+        }
+    }
+
     pub(crate) fn chart_with_correlation_factors(
         &self,
         point: &str,
@@ -242,6 +251,16 @@ impl Domain {
                 point.into(),
                 "0.0".into(),
             )),
+            Self::Complexes => Ok(Chart {
+                domain: "complexes".into(),
+                free: "cartpow(reals, 2)".into(),
+                constrain: format!("complex({point}[1], {point}[2])"),
+                unconstrain: format!("[real({point}), imag({point})]"),
+                log_det: "0.0".into(),
+                size: 1,
+                free_size: 2,
+                scalar: true,
+            }),
             Self::PosReals | Self::NonNegReals => Ok(scalar(
                 if matches!(self, Self::PosReals) {
                     "posreals"
@@ -298,12 +317,6 @@ impl Domain {
                     .copied()
                     .collect::<Option<Vec<_>>>()
                     .ok_or("bind domain sizes before building coordinate transforms")?;
-                let cell = of.chart("_")?;
-                if !cell.scalar {
-                    return Err(
-                        "Cartesian powers of non-scalar domains need a structured chart".into(),
-                    );
-                }
                 let size = shape
                     .iter()
                     .try_fold(1u32, |a, &b| a.checked_mul(b))
@@ -314,6 +327,29 @@ impl Domain {
                     .map(u32::to_string)
                     .collect::<Vec<_>>()
                     .join(", ");
+                if matches!(of.as_ref(), Self::Complexes) {
+                    let rank = shape.len();
+                    let axes = ":, ".repeat(rank);
+                    // Each element contributes one last-axis block [real, imag].
+                    return Ok(Chart {
+                        domain: format!("cartpow(complexes, [{dims}])"),
+                        free: format!("cartpow(reals, [{dims}, 2])"),
+                        constrain: format!("complex.({point}[{axes}1], {point}[{axes}2])"),
+                        unconstrain: format!(
+                            "joinblocks(broadcast(z -> addaxes([real(z), imag(z)], {rank}, 0), addaxes({point}, 0, 1)))"
+                        ),
+                        log_det: "0.0".into(),
+                        size,
+                        free_size: size.checked_mul(2).ok_or("coordinate size overflows")?,
+                        scalar: false,
+                    });
+                }
+                let cell = of.chart("_")?;
+                if !cell.scalar {
+                    return Err(
+                        "Cartesian powers of non-scalar domains need a structured chart".into(),
+                    );
+                }
                 let lift = |expression: &str| {
                     if expression == "_" {
                         point.into()
@@ -425,6 +461,7 @@ impl Domain {
                 let mut start = 1u32;
                 let mut free_start = 1u32;
                 let mut parts = Vec::new();
+                let complex = of.iter().any(Self::has_complex_elements);
                 for domain in of {
                     if matches!(domain, Self::CartPow { shape, .. } if shape.len() != 1) {
                         return Err("coordinate products currently require scalar or flat-vector components".into());
@@ -436,15 +473,37 @@ impl Domain {
                     let free_end = free_start
                         .checked_add(base.free_size)
                         .ok_or("coordinate size overflows")?;
-                    let access = |start: u32, size: u32| {
-                        if base.scalar {
+                    let access = |start: u32, size: u32, scalar: bool| {
+                        if scalar {
                             format!("{point}[{start}]")
                         } else {
                             vector_range(point, start, start + size - 1)
                         }
                     };
-                    let forward = domain.chart(&access(free_start, base.free_size))?;
-                    let inverse = domain.chart(&access(start, base.size))?;
+                    let mut u = access(
+                        free_start,
+                        base.free_size,
+                        base.scalar && base.free_size == 1,
+                    );
+                    let mut x = access(start, base.size, base.scalar);
+                    // A positional product promotes real components into the complex vector.
+                    if complex && !domain.has_complex_elements() {
+                        x = if base.scalar {
+                            format!("real({x})")
+                        } else {
+                            format!("real.({x})")
+                        };
+                    }
+                    let complex_vector = matches!(domain, Self::CartPow { of, .. } if matches!(of.as_ref(), Self::Complexes));
+                    if complex_vector {
+                        u = format!("array({u}, [{}, 2], [1, 2])", base.size);
+                    }
+                    let forward = domain.chart(&u)?;
+                    let mut inverse = domain.chart(&x)?;
+                    if complex_vector {
+                        inverse.unconstrain =
+                            format!("joinblocks(broadcast(z -> [real(z), imag(z)], {x}))");
+                    }
                     start = end;
                     free_start = free_end;
                     parts.push((base, forward, inverse));
@@ -456,7 +515,11 @@ impl Domain {
                     |s: &str, scalar: bool| if scalar { format!("[{s}]") } else { s.into() };
                 Ok(Chart {
                     domain: format!("cartprod({})", join(|p| p.0.domain.clone())),
-                    free: format!("cartprod({})", join(|p| p.0.free.clone())),
+                    free: if complex {
+                        format!("cartpow(reals, {})", free_start - 1)
+                    } else {
+                        format!("cartprod({})", join(|p| p.0.free.clone()))
+                    },
                     constrain: format!(
                         "cat({})",
                         parts
@@ -469,7 +532,7 @@ impl Domain {
                         "cat({})",
                         parts
                             .iter()
-                            .map(|p| array(&p.2.unconstrain, p.0.scalar))
+                            .map(|p| array(&p.2.unconstrain, p.0.scalar && p.0.free_size == 1))
                             .collect::<Vec<_>>()
                             .join(", ")
                     ),
