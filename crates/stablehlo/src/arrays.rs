@@ -6,8 +6,7 @@
 //! StableHLO shapes are static, so every size these heads read must be written
 //! as a literal or be a static operand extent. An array of arrays (§03 "Vectors
 //! of vectors are not interpreted as matrices") lowers to the same tensor as a
-//! matrix, so its nesting is read from the inferred type. None of these heads is in the host-batching set,
-//! so their operands arrive unbatched; a batched one is refused.
+//! matrix, so its nesting is read from the inferred type.
 
 use flatppl_core::{CallHead, Node, NodeId, Scalar, Type};
 
@@ -29,7 +28,11 @@ fn unbatched(e: &Emitter, id: NodeId, v: &Value, head: &str) -> Result<(), EmitE
 /// Static cell dimensions of an unbatched value.
 fn dims(e: &Emitter, id: NodeId, v: &Value, head: &str) -> Result<Vec<u64>, EmitError> {
     unbatched(e, id, v, head)?;
-    match e.cell_ty(v) {
+    static_dims(id, e.cell_ty(v), head)
+}
+
+fn static_dims(id: NodeId, ty: MlirTy, head: &str) -> Result<Vec<u64>, EmitError> {
+    match ty {
         MlirTy::Scalar => Ok(vec![]),
         MlirTy::Ranked(d) => d.into_iter().collect::<Option<Vec<_>>>().ok_or_else(|| {
             EmitError::at(id, format!("`{head}` needs a statically shaped operand"))
@@ -213,7 +216,7 @@ pub(crate) fn lower_joinblocks(
 ) -> Result<Value, EmitError> {
     let [a] = args_exact(id, args)?;
     let v = e.lower_node(a)?;
-    let d = dims(e, id, &v, "joinblocks")?;
+    let d = static_dims(id, e.cell_ty(&v), "joinblocks")?;
     // The type knows the nesting; a `splitblocks` result the type leaves open
     // carries it in its axes.
     let nesting = nest_ranks(e, a)
@@ -234,11 +237,27 @@ pub(crate) fn lower_joinblocks(
             "joinblocks: the outer and inner arrays must have the same number of dimensions (spec §07)",
         ));
     }
-    let r = outer as u64;
-    let perm: Vec<u64> = (0..r).flat_map(|k| [k, r + k]).collect();
+    if d.len() != outer + inner {
+        return Err(EmitError::at(
+            id,
+            "joinblocks: shape does not match the block structure",
+        ));
+    }
+    let batch = e.batch_rank(&v);
+    let perm = (0..batch)
+        .chain((0..outer).flat_map(|k| [batch + k, batch + outer + k]))
+        .map(|dim| dim as u64)
+        .collect::<Vec<_>>();
     let t = e.transpose(&v, &perm);
+    let t = e.axes_view(
+        &t,
+        Axes {
+            batch,
+            layers: vec![outer + inner],
+        },
+    );
     let out: Vec<u64> = (0..outer).map(|k| d[k] * d[outer + k]).collect();
-    Ok(e.reshape(&t, tensor(&out)))
+    Ok(e.reshape_cell(&t, tensor(&out)))
 }
 
 /// `partition(xs, spec)` into equal groups, an array of arrays. Unequal groups

@@ -61,6 +61,10 @@ fn shapes_follow_the_written_sizes() {
     returns("splitblocks([1.0, 2.0, 3.0, z0], 2)", "tensor<2x2xf32>");
     returns("splitblocks(A, [1, 2])", "tensor<2x2x1x2xf32>");
     returns("joinblocks([v, w])", "tensor<6xf32>");
+    returns(
+        "broadcast(x -> joinblocks([x, x]), [v, w])",
+        "tensor<2x6xf32>",
+    );
     returns("joinblocks(splitblocks(A, [1, 2]))", "tensor<2x4xf32>");
     returns(
         "partition([1.0, 2.0, 3.0, 4.0, 5.0, z0], 3)",
