@@ -133,10 +133,12 @@ The same updates supply normalized scores, evidence and seeded draws. For live
 IID observations, prepare the query once per dataset to reuse its summaries.
 Binomial evidence with changing trial counts still needs the row allocations.
 
-This optional Rust capability covers one named parameter with Beta–Bernoulli,
+This optional Rust capability covers named parameters with Beta–Bernoulli,
 Beta–Binomial, Gamma–Poisson, Normal–Normal (mean), InverseGamma–Normal
 (variance), or Dirichlet–Categorical, Categorical0 or Multinomial updates.
-Each likelihood factor must match. “No matching rule” leaves conjugacy
+For a named joint prior, each likelihood factor must use one prior field and
+each field must have a matching update. Analysis reports the fields in prior order.
+“No matching rule” leaves conjugacy
 undetermined. Runtime data can determine the posterior parameters and its
 validity. Other FlatPPL engines choose their own sampling methods.
 

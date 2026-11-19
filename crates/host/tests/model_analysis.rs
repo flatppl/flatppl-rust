@@ -1,6 +1,61 @@
 use flatppl_host::{Context, EmitOptions, ModelAnalysis};
 
 #[test]
+fn independent_conjugate_fields_report_exact_draws_in_prior_order() {
+    use flatppl_host::PosteriorSampling::ExactIid;
+    let source = "
+        p=elementof(unitinterval)
+        r=elementof(posreals)
+        K=functionof(joint(h=Bernoulli(p), n=Poisson(r)), p=p, r=r)
+        L=likelihoodof(K,record(n=3,h=true))
+        P=bayesupdate(L,joint(p=Beta(1,1),r=Gamma(1,1)))
+        s=elementof(nonnegintegers)
+        inputs=s
+        outputs=rand(normalize(P),rnginit(s))
+    ";
+    let mut ctx = Context::default();
+    let separate = source.replace(
+        "L=likelihoodof(K,record(n=3,h=true))",
+        "L=joint_likelihood(likelihoodof(functionof(Poisson(r),r=r),3),\n\
+                            likelihoodof(functionof(Bernoulli(p),p=p),true))",
+    );
+    for source in [source, &separate] {
+        let query = ctx.parse(source, None, None).unwrap();
+        let fields = query.posterior_updates().unwrap();
+        assert_eq!(fields.len(), 2, "{fields:?}");
+        for (field, (name, family, likelihood, parameters)) in fields.iter().zip([
+            ("p", "Beta", "Bernoulli", [2.0, 1.0]),
+            ("r", "Gamma", "Poisson", [4.0, 2.0]),
+        ]) {
+            assert_eq!(field.field.as_deref(), Some(name));
+            assert_eq!(field.family.as_deref(), Some(family));
+            assert_eq!(field.likelihoods, [likelihood]);
+            assert_eq!(field.parameters.as_deref(), Some(parameters.as_slice()));
+            assert_eq!(field.sampling, ExactIid);
+        }
+    }
+}
+
+#[test]
+fn a_cross_field_likelihood_cannot_use_independent_updates() {
+    let source = "
+        a=elementof(reals)
+        b=elementof(posreals)
+        K=functionof(joint(y=Normal(a,sqrt(b)),z=Normal(0,sqrt(b))), a=a, b=b)
+        P=bayesupdate(likelihoodof(K,record(y=1.,z=2.)),
+                      joint(a=Normal(0,1),b=InverseGamma(2,3)))
+        s=elementof(nonnegintegers)
+        inputs=s
+        outputs=rand(normalize(P),rnginit(s))
+    ";
+    let mut ctx = Context::default();
+    let query = ctx.parse(source, None, None).unwrap();
+    let err = ctx.analyze_query(&query, &[], false, true).err().unwrap();
+    assert_eq!(err.posterior_updates.len(), 1);
+    assert_eq!(err.posterior_updates[0].family, None);
+}
+
+#[test]
 fn posterior_reports_distinguish_the_update_from_the_retained_sampler() {
     use flatppl_host::PosteriorSampling::{ExactIid, LoweringRefused, NotUsed};
     let mut context = Context::default();

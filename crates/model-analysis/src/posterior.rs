@@ -1,11 +1,14 @@
-//! Exact normalized posterior laws for one latent parameter (§06 posterior construction).
+//! Exact posterior laws for independent conjugate fields (§06 posterior construction).
+
+use std::collections::HashMap;
 
 use flatppl_core::calling::reified_inputs;
 use flatppl_core::graph::{
     build_call as op, declared_binding, draw_argument, expect_builtin_call, resolve_ref,
 };
 use flatppl_core::{
-    CallHead, Dim, Module, NamedKind, Node, NodeId, RefNs, Scalar, ScalarType, Symbol, Type,
+    CallHead, Dim, Module, NamedArg, NamedKind, Node, NodeId, RefNs, Scalar, ScalarType, Symbol,
+    Type,
 };
 use flatppl_infer::constructors::{find_parameter, split_kernel_constructor};
 
@@ -38,6 +41,45 @@ pub fn normalized_conjugate_posterior(
     conjugate_update(m, *posterior, None)
 }
 
+pub struct ConjugateProduct {
+    pub update: NodeId,
+    /// Each field and its native law, in prior order.
+    pub fields: Vec<ConjugateField>,
+    pub valid: NodeId,
+}
+
+pub struct ConjugateField {
+    pub field: Symbol,
+    pub distribution: NodeId,
+    pub valid: NodeId,
+    pub likelihoods: Vec<Symbol>,
+}
+
+pub fn normalized_conjugate_product(m: &mut Module, measure: NodeId) -> Option<ConjugateProduct> {
+    let [posterior] = operands(m, measure, "normalize")? else {
+        return None;
+    };
+    conjugate_product(m, *posterior)
+}
+
+/// Match the whole posterior before producing independent native laws.
+pub fn conjugate_product(m: &mut Module, posterior: NodeId) -> Option<ConjugateProduct> {
+    let (update, matched) = match_updates(m, posterior)?;
+    let mut fields = Vec::with_capacity(matched.len());
+    for matched in matched {
+        fields.push(apply_field(m, matched)?);
+    }
+    let valid = fields
+        .iter()
+        .map(|field| field.valid)
+        .reduce(|valid, next| op(m, "land", &[valid, next]))?;
+    Some(ConjugateProduct {
+        update,
+        fields,
+        valid,
+    })
+}
+
 /// Inspect the same update that sampling lowers. A failed match leaves the
 /// mathematical question open. Factor names are collected only for inspection.
 pub fn conjugate_update(
@@ -45,26 +87,35 @@ pub fn conjugate_update(
     posterior: NodeId,
     likelihoods: Option<&mut Vec<Symbol>>,
 ) -> Option<ConjugatePosterior> {
-    let matched = match_update(m, posterior)?;
-    let applied = evidence::apply(m, &matched, false)?;
+    let (update, matched) = match_single_update(m, posterior)?;
+    let result = apply_field(m, matched)?;
     if let Some(names) = likelihoods {
-        names.extend(matched.factors.iter().map(|factor| factor.family));
+        names.extend(result.likelihoods);
     }
+    Some(ConjugatePosterior {
+        update,
+        field: result.field,
+        distribution: result.distribution,
+        valid: result.valid,
+    })
+}
+
+fn apply_field(m: &mut Module, matched: MatchedUpdate) -> Option<ConjugateField> {
+    let applied = evidence::apply(m, &matched, false)?;
     let law = applied.law;
     let valid = op(m, "land", &[matched.model_valid, applied.supported]);
     let updated = law.valid(m);
     let valid = op(m, "land", &[valid, updated]);
     let distribution = law.distribution(m, valid, matched.model_valid);
-    Some(ConjugatePosterior {
-        update: matched.update,
+    Some(ConjugateField {
         field: matched.field,
         distribution,
         valid,
+        likelihoods: matched.factors.iter().map(|factor| factor.family).collect(),
     })
 }
 
 struct MatchedUpdate {
-    update: NodeId,
     field: Symbol,
     prior: UpdatedLaw,
     model_valid: NodeId,
@@ -77,35 +128,68 @@ struct MatchedFactor {
     data: Data,
 }
 
+fn match_single_update(m: &mut Module, posterior: NodeId) -> Option<(NodeId, MatchedUpdate)> {
+    let (update, matched) = match_updates(m, posterior)?;
+    let [matched]: [MatchedUpdate; 1] = matched.try_into().ok()?;
+    Some((update, matched))
+}
+
 /// Check the complete update before a consumer constructs any summaries.
-fn match_update(m: &mut Module, posterior: NodeId) -> Option<MatchedUpdate> {
+fn match_updates(m: &mut Module, posterior: NodeId) -> Option<(NodeId, Vec<MatchedUpdate>)> {
     let update = resolve_ref(m, posterior).0;
     let [likelihood, prior] = operands(m, update, "bayesupdate")? else {
         return None;
     };
     let (likelihood, prior) = (*likelihood, *prior);
-    let (field, prior) = if let Some([value]) = operands(m, prior, "lawof") {
+    let priors = if let Some([value]) = operands(m, prior, "lawof") {
         let (field, value) = single_field(m, *value, "record")?;
-        (field, draw_argument(m, declared_binding(m, value).0)?)
+        vec![(field, draw_argument(m, declared_binding(m, value).0)?)]
     } else {
-        single_field(m, prior, "joint")?
+        named_fields(m, prior, "joint")?
+            .iter()
+            .map(|f| (f.name, f.value))
+            .collect()
     };
+    let mut factors = Vec::new();
+    likelihood_factors(m, likelihood, &mut Vec::new(), &mut factors)?;
+    let multi = priors.len() > 1;
+    let mut observations: HashMap<Symbol, Vec<Observation>> = HashMap::new();
+    for (kernel, data) in factors {
+        if multi {
+            product_observations(m, kernel, data, &priors, &mut observations)?;
+        } else {
+            let field = priors.first()?.0;
+            let observed = observation(m, kernel, data, field)?;
+            observations.entry(field).or_default().push(observed);
+        }
+    }
+    let mut matched = Vec::with_capacity(priors.len());
+    for (field, prior) in priors {
+        matched.push(match_field(m, field, prior, observations.remove(&field)?)?);
+    }
+    observations.is_empty().then_some((update, matched))
+}
+
+fn match_field(
+    m: &mut Module,
+    field: Symbol,
+    prior: NodeId,
+    observations: Vec<Observation>,
+) -> Option<MatchedUpdate> {
     if !measure_stochastic_ancestors(m, prior, &[]).is_empty() {
         return None;
     }
     let (family, args) = split_kernel_constructor(m, resolve_ref(m, prior).0)?;
     let law = UpdatedLaw::from_prior(m, family, &args)?;
     let mut model_valid = law.valid(m);
-    let mut factors = Vec::new();
-    likelihood_factors(m, likelihood, &mut Vec::new(), &mut factors)?;
-    let mut matched = Vec::with_capacity(factors.len());
-    for (kernel, observed) in factors {
+    let mut matched = Vec::with_capacity(observations.len());
+    for observation in observations {
         let Observation {
             latent,
             body,
             data,
             batch,
-        } = observation(m, kernel, observed, field)?;
+        } = observation;
         let (observations, options) = split_kernel_constructor(m, resolve_ref(m, body).0)?;
         let row = if matches!(law, UpdatedLaw::Dirichlet(_)) {
             let (_, dimensions, component) =
@@ -158,7 +242,6 @@ fn match_update(m: &mut Module, posterior: NodeId) -> Option<MatchedUpdate> {
         });
     }
     Some(MatchedUpdate {
-        update,
         field,
         prior: law,
         model_valid,
@@ -171,6 +254,60 @@ struct Observation {
     body: NodeId,
     data: NodeId,
     batch: Option<(u32, NodeId)>,
+}
+
+/// Split a named joint likelihood only when each component reads precisely one
+/// kernel input. External values shared by components are conditioned inputs.
+fn product_observations(
+    m: &mut Module,
+    kernel: NodeId,
+    data: NodeId,
+    priors: &[(Symbol, NodeId)],
+    out: &mut HashMap<Symbol, Vec<Observation>>,
+) -> Option<()> {
+    let kernel = resolve_ref(m, kernel).0;
+    let Node::Call(call) = m.node(kernel) else {
+        return None;
+    };
+    let inputs = reified_inputs(m, kernel, call.inputs.as_ref()?)?;
+    if let [(field, _)] = inputs {
+        if !priors.iter().any(|(name, _)| name == field) {
+            return None;
+        }
+        let field = *field;
+        let observed = observation(m, kernel, data, field)?;
+        out.entry(field).or_default().push(observed);
+        return Some(());
+    }
+    if inputs.is_empty()
+        || inputs.iter().any(|(field, target)| {
+            target.ns != RefNs::SelfMod || !priors.iter().any(|(name, _)| name == field)
+        })
+    {
+        return None;
+    }
+    let inputs = inputs.to_vec();
+    let call = expect_builtin_call(m, kernel, "functionof")?;
+    let [body] = *call.args else { return None };
+    let factors = named_fields(m, declared_binding(m, body).0, "joint")?.to_vec();
+    let labels = flatppl_core::calling::splat_fields(m, data)?;
+    if labels.len() != factors.len() || factors.iter().any(|f| !labels.contains(&f.name)) {
+        return None;
+    }
+    for factor in factors {
+        let mut owners = inputs
+            .iter()
+            .filter(|(_, target)| references_latent(m, factor.value, target.name, &[]));
+        let &(field, target) = owners.next()?;
+        if owners.next().is_some() {
+            return None;
+        }
+        let value = flatppl_core::calling::project_field(m, data, factor.name);
+        let body = declared_binding(m, factor.value).0;
+        let observed = batched_observation(m, body, value, target.name)?;
+        out.entry(field).or_default().push(observed);
+    }
+    Some(())
 }
 
 /// Open a kernel at its declared boundary and pair its event with the data.
@@ -212,6 +349,15 @@ fn observation(
         }
         body = draw_argument(m, body)?;
     }
+    batched_observation(m, body, data, latent)
+}
+
+fn batched_observation(
+    m: &mut Module,
+    body: NodeId,
+    data: NodeId,
+    latent: Symbol,
+) -> Option<Observation> {
     let (body, batch) = if let Some([base, size]) = operands(m, body, "iid") {
         let (base, size) = (*base, *size);
         if references_latent(m, size, latent, &[]) {
@@ -241,9 +387,21 @@ fn operands<'a>(m: &'a Module, node: NodeId, name: &str) -> Option<&'a [NodeId]>
 }
 
 fn single_field(m: &Module, id: NodeId, head: &str) -> Option<(Symbol, NodeId)> {
+    let [field] = named_fields(m, id, head)? else {
+        return None;
+    };
+    Some((field.name, field.value))
+}
+
+fn named_fields<'m>(m: &'m Module, id: NodeId, head: &str) -> Option<&'m [NamedArg]> {
     let call = expect_builtin_call(m, resolve_ref(m, id).0, head)?;
-    let [field] = *call.named else { return None };
-    (field.kind == NamedKind::Field && call.args.is_empty()).then_some((field.name, field.value))
+    (call.args.is_empty()
+        && !call.named.is_empty()
+        && call
+            .named
+            .iter()
+            .all(|field| field.kind == NamedKind::Field))
+    .then_some(&call.named)
 }
 
 fn likelihood_factors(

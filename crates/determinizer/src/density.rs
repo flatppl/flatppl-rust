@@ -3707,18 +3707,33 @@ fn lower_normalize(
     atoms: &[f64],
 ) -> Result<NodeId, RefuseError> {
     if let Some(posterior) =
-        flatppl_model_analysis::posterior::normalized_conjugate_posterior(m, node)
+        flatppl_model_analysis::posterior::normalized_conjugate_product(m, node)
     {
-        if flatppl_core::calling::splat_fields(m, v).as_deref() != Some(&[posterior.field]) {
+        let matching_fields = flatppl_core::calling::splat_fields(m, v).is_some_and(|labels| {
+            labels.len() == posterior.fields.len()
+                && posterior
+                    .fields
+                    .iter()
+                    .all(|field| labels.contains(&field.field))
+        });
+        if !matching_fields {
             return Err(refuse(
                 v,
                 m,
-                "a conjugate posterior point must have the prior's field",
+                "a conjugate posterior point must have the prior's fields",
             ));
         }
-        let point = flatppl_core::calling::project_field(m, v, posterior.field);
-        let score =
-            lower_measure_density_at(m, posterior.distribution, point, VariateOrigin::Other)?;
+        let mut scores = Vec::with_capacity(posterior.fields.len());
+        for field in posterior.fields {
+            let point = flatppl_core::calling::project_field(m, v, field.field);
+            scores.push(lower_measure_density_at(
+                m,
+                field.distribution,
+                point,
+                VariateOrigin::Other,
+            )?);
+        }
+        let score = flatppl_core::graph::fold_add(m, &scores);
         return Ok(exponential_tilt::guard(m, score, posterior.valid));
     }
     if let Some(law) = exponential_tilt::recognize(m, node) {
