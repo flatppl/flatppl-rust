@@ -4558,7 +4558,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// [`Emitter::bind_column`] for a field that may itself be a record.
-    pub(crate) fn bind_field(&mut self, container: NodeId, name: String, value: Lowered) {
+    pub fn bind_field(&mut self, container: NodeId, name: String, value: Lowered) {
         let container = self.column_container(container);
         self.columns.insert((container, name), value);
     }

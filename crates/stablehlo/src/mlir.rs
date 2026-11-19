@@ -49,10 +49,10 @@ pub struct Value {
 
 /// One lowered FlatPDL value: a tensor, or a record of lowered fields in
 /// declared field order (spec §03 "Records"). A table is the record of its
-/// columns, each column carrying the row axis first. A function boundary never
-/// sees a record: [`Lowered::leaves`] flattens it to positional tensors.
+/// columns, each column carrying the row axis first. At a function boundary its
+/// leaves become positional tensors.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Lowered {
+pub enum Lowered {
     Tensor(Value),
     Record(Vec<(String, Lowered)>),
 }

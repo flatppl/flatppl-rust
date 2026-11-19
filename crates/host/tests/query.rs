@@ -175,6 +175,29 @@ fn batch_axes_preserve_cell_shapes_in_the_host_abi() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn nested_table_inputs_bind_whole_rows_and_leaf_projections()
+-> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "p = elementof(cartpow(cartprod(noise = cartprod(\
+         scale = reals, x = cartpow(reals, 2))), 3))\ninputs = p\n\
+         outputs = (p, broadcast(row -> sum(row.noise.x) + row.noise.scale, p))",
+        None,
+        None,
+    )?;
+    let batch = BatchSpec {
+        shape: vec![2],
+        input_axes: vec![vec![Some(0)], vec![Some(0)]],
+    };
+    let exported = query.compile_batched(&EmitOptions::default(), &batch)?;
+    let schema = serde_json::to_value(&exported)?;
+    assert_eq!(schema["output"]["items"][0], schema["inputs"][0]["value"]);
+    assert_eq!(schema["output"]["items"][1]["shape"], json!([2, 3]));
+    assert!(!exported.stablehlo.contains("stablehlo.while"));
+    assert!(exported.stablehlo.contains("across dimensions = [2]"));
+    Ok(())
+}
+
+#[test]
 fn batched_gathers_do_not_loop_over_rows() -> Result<(), Box<dyn std::error::Error>> {
     for selection in ["[1, 3, 5]", "indices"] {
         let query = Context::default().parse(

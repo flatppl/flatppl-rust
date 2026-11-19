@@ -6,8 +6,8 @@ use flatppl_core::{
     Call, CallHead, Dim, Idx, Module, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
 };
 use flatppl_stablehlo::{
-    BatchSpec, Dtype, ElemKind, EmitError, EmitOptions, Emitter, MlirTy, Value, check_query_inputs,
-    mlir_type_of,
+    BatchSpec, Dtype, ElemKind, EmitError, EmitOptions, Emitter, Lowered, MlirTy, Value,
+    check_query_inputs, mlir_type_of,
 };
 use serde::Serialize;
 
@@ -141,10 +141,13 @@ pub fn emit_query(
     let roots = input_roots(&module, &names);
     let mut arguments = Vec::new();
     let mut inputs = Vec::new();
-    for (name, node) in declared {
-        let ty = inferred(&module, node)?;
-        let value = layout(&mut module, node, ty, &roots, true, dtype, &mut arguments)?;
-        inputs.push(Field { name, value });
+    for (name, node) in &declared {
+        let ty = inferred(&module, *node)?;
+        let value = layout(&mut module, *node, ty, &roots, true, dtype, &mut arguments)?;
+        inputs.push(Field {
+            name: name.clone(),
+            value,
+        });
     }
     // Canonicalization may inline output bindings. Describe their authored names.
     let declared_output = binding(source, "outputs")
@@ -197,7 +200,15 @@ pub fn emit_query(
     if batch.is_some_and(|batch| !batch.shape.is_empty()) {
         emitter.lower_for_host_batch();
     }
-    bind_inputs(&mut emitter, &module, &roots, &mut paths, &values);
+    bind_inputs(
+        &mut emitter,
+        &module,
+        &roots,
+        &mut paths,
+        &values,
+        &declared,
+        &inputs,
+    );
     let tensorize = emitter
         .can_tensorize_call(&results.iter().map(|leaf| leaf.node).collect::<Vec<_>>())
         && arguments.iter().all(|leaf| !matches!(leaf.ty, MlirTy::Key));
@@ -242,7 +253,9 @@ pub fn emit_query(
                 physical.push((input.ssa, input.ty, input.elem));
                 bound.insert(path, internal);
             }
-            bind_inputs(&mut e, &module, &roots, &mut paths, &bound);
+            bind_inputs(
+                &mut e, &module, &roots, &mut paths, &bound, &declared, &inputs,
+            );
             results
                 .iter()
                 .map(|leaf| {
@@ -299,6 +312,8 @@ fn bind_inputs(
     roots: &Roots,
     paths: &mut HashMap<NodeId, Option<InputPath>>,
     values: &HashMap<InputPath, Value>,
+    declared: &[(String, NodeId)],
+    inputs: &[Field],
 ) {
     // A declared aggregate has no tensor value. Bind its leaf projections,
     // including aliases and the output projections created by layout().
@@ -316,6 +331,40 @@ fn bind_inputs(
                 emitter.bind_column(*container, field.to_string(), value.clone());
             }
         }
+    }
+    // A callable consumes a whole record or table, not only its projections.
+    // Rebuild that structure from the declared schema once, retaining the
+    // projection bindings above for callers that read individual leaves.
+    for ((_, node), field) in declared.iter().zip(inputs) {
+        if matches!(field.value, Schema::Record { .. } | Schema::Table { .. }) {
+            let path = input_path(module, *node, roots, paths).expect("declared input path");
+            let Lowered::Record(fields) = input_value(&field.value, &path, values) else {
+                unreachable!("record and table schemas lower to records")
+            };
+            for (name, value) in fields {
+                emitter.bind_field(*node, name, value);
+            }
+        }
+    }
+}
+
+fn input_value(schema: &Schema, path: &InputPath, values: &HashMap<InputPath, Value>) -> Lowered {
+    match schema {
+        Schema::Tensor { .. } => Lowered::Tensor(values[path].clone()),
+        Schema::Record { fields } | Schema::Table { fields, .. } => Lowered::Record(
+            fields
+                .iter()
+                .map(|field| {
+                    let mut child = path.clone();
+                    child.1.push(Selector::Field(field.name.clone()));
+                    (
+                        field.name.clone(),
+                        input_value(&field.value, &child, values),
+                    )
+                })
+                .collect(),
+        ),
+        Schema::Tuple { .. } => unreachable!("tuples cannot be record fields or table columns"),
     }
 }
 

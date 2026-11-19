@@ -230,7 +230,7 @@ mod types;
 
 pub use call_batch::BatchSpec;
 pub use emitter::Emitter;
-pub use mlir::{ElemKind, MlirTy, Value};
+pub use mlir::{ElemKind, Lowered, MlirTy, Value};
 pub use modes::check_query_inputs;
 pub use refuse::EmitError;
 pub use types::mlir_type_of;
