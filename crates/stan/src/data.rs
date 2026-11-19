@@ -56,13 +56,30 @@ fn real(x: f64) -> Value {
 /// The JSON value of a literal scalar, array or `array(...)` constructor;
 /// `None` for anything computed.
 pub(crate) fn const_json(m: &Module, id: NodeId) -> Option<Value> {
+    literal_json(m, id, false)
+}
+
+fn literal_json(m: &Module, id: NodeId, loaded: bool) -> Option<Value> {
     let id = resolve(m, id);
+    let read = |id| literal_json(m, id, loaded);
     match m.node(id) {
         Node::Lit(Scalar::Int(n)) => Some(Value::from(*n)),
         Node::Lit(Scalar::Real(x)) => Some(real(*x)),
         Node::Lit(Scalar::Bool(b)) => Some(Value::from(i64::from(*b))),
         Node::Call(c) => match head(m, id)? {
-            "neg" if c.args.len() == 1 => match const_json(m, c.args[0])? {
+            // The host installs typed complex cells as `complex(re, im)`.
+            // Stan's JSON format puts each component pair at the last axis.
+            "complex" if loaded => {
+                let [re, im] = c.args[..] else {
+                    return None;
+                };
+                let component = |id| match m.node(resolve(m, id)) {
+                    Node::Lit(Scalar::Real(x)) => Some(real(*x)),
+                    _ => None,
+                };
+                Some(Value::Array(vec![component(re)?, component(im)?]))
+            }
+            "neg" if c.args.len() == 1 => match read(c.args[0])? {
                 Value::Number(n) => n
                     .as_i64()
                     .map(|i| Value::from(-i))
@@ -72,12 +89,12 @@ pub(crate) fn const_json(m: &Module, id: NodeId) -> Option<Value> {
             "vector" => c
                 .args
                 .iter()
-                .map(|&a| const_json(m, a))
+                .map(|&a| read(a))
                 .collect::<Option<Vec<_>>>()
                 .map(Value::Array),
             // Stan JSON nests a matrix row by row.
             "rowstack" | "colstack" if c.args.len() == 1 => {
-                let Value::Array(lines) = const_json(m, c.args[0])? else {
+                let Value::Array(lines) = read(c.args[0])? else {
                     return None;
                 };
                 let lines: Vec<Vec<Value>> = lines
@@ -101,7 +118,7 @@ pub(crate) fn const_json(m: &Module, id: NodeId) -> Option<Value> {
                 ))
             }
             "array" if c.args.len() == 3 => {
-                let flat = match const_json(m, c.args[0])? {
+                let flat = match read(c.args[0])? {
                     Value::Array(v) => v,
                     _ => return None,
                 };
@@ -113,8 +130,8 @@ pub(crate) fn const_json(m: &Module, id: NodeId) -> Option<Value> {
                         _ => None,
                     }
                 };
-                let size = ints(const_json(m, c.args[1])?)?;
-                let order = ints(const_json(m, c.args[2])?)?;
+                let size = ints(read(c.args[1])?)?;
+                let order = ints(read(c.args[2])?)?;
                 reshape(&flat, &size, &order)
             }
             _ => None,
@@ -162,6 +179,10 @@ pub(crate) fn const_json_record(m: &Module, id: NodeId) -> bool {
 
 /// The JSON value of one field of a literal record or table.
 pub(crate) fn field_json(m: &Module, record: NodeId, field: &str) -> Option<Value> {
+    field_literal(m, record, field, false)
+}
+
+fn field_literal(m: &Module, record: NodeId, field: &str, loaded: bool) -> Option<Value> {
     let record = resolve(m, record);
     let Node::Call(c) = m.node(record) else {
         return None;
@@ -170,7 +191,7 @@ pub(crate) fn field_json(m: &Module, record: NodeId, field: &str) -> Option<Valu
         return None;
     }
     let na = c.named.iter().find(|na| m.resolve(na.name) == field)?;
-    const_json(m, na.value)
+    literal_json(m, na.value, loaded)
 }
 
 /// Read every deferred data value from `loaded`, a module whose `load_data`
@@ -187,8 +208,8 @@ pub(crate) fn complete(
             .map(|(_, b)| b.rhs)
             .ok_or_else(|| Refusal::not_yet(None, format!("the data binding `{}`", d.binding)))?;
         let value = match d.path.as_slice() {
-            [] => const_json(loaded, sym),
-            [field] => field_json(loaded, sym, field),
+            [] => literal_json(loaded, sym, true),
+            [field] => field_literal(loaded, sym, field, true),
             _ => None,
         }
         .ok_or_else(|| {

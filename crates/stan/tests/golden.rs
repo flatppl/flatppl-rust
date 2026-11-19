@@ -90,3 +90,36 @@ fn extent_names_follow_their_source() {
     assert_eq!(a.code, b.code);
     assert_ne!(a.data, b.data);
 }
+
+#[test]
+fn deferred_complex_data_places_component_pairs_at_the_last_axis() {
+    let mut program = emit(
+        r#"
+flatppl_compat = "0.1"
+z = load_data("z.json", complexes)
+calibration = load_data("matrix.json", cartprod(B = cartpow(complexes, [2, 2])))
+fixed = complex(2.5, 3.5)
+a ~ Normal(0, 1)
+y ~ Normal(a + real(z) + imag(calibration.B[1, 2]) + imag(fixed), 1)
+prior = lawof(record(a = a))
+L = likelihoodof(kernelof(record(y = y), a), record(y = 1.5))
+post = bayesupdate(L, prior)
+"#,
+    );
+    let loaded = flatppl_syntax::parse(
+        r#"
+flatppl_compat = "0.1"
+z = complex(1.25, 0.0)
+calibration = record(B = array([complex(1.0, 0.0), complex(2.0, 0.0), complex(3.0, 0.0), complex(4.0, 0.0)], [2, 2], [1, 2]))
+"#,
+    )
+    .expect("parse loaded literals");
+    flatppl_stan::complete_data(&mut program, &loaded).expect("serialize loaded complex data");
+    assert_eq!(program.data["z"], serde_json::json!([1.25, 0.0]));
+    assert_eq!(
+        program.data["B"],
+        serde_json::json!([[[1.0, 0.0], [2.0, 0.0]], [[3.0, 0.0], [4.0, 0.0]]]),
+    );
+    assert!(!program.data.contains_key("fixed"));
+    assert!(program.code.contains("transformed data {\n  complex fixed"));
+}
