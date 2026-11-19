@@ -303,8 +303,17 @@ pub(crate) fn model_rows(
     extra_columns: &[String],
     table: &Table,
     mode: DataMode,
+    paired_response: Option<&str>,
 ) -> Result<Vec<usize>> {
-    observation_rows(formula, predictors, extra_columns, table, mode, false)
+    observation_rows(
+        formula,
+        predictors,
+        extra_columns,
+        table,
+        mode,
+        false,
+        paired_response,
+    )
 }
 
 fn observation_rows(
@@ -314,8 +323,16 @@ fn observation_rows(
     table: &Table,
     mode: DataMode,
     history: bool,
+    paired_response: Option<&str>,
 ) -> Result<Vec<usize>> {
     table.validate()?;
+    let paired = if mode == DataMode::Training {
+        paired_response
+            .map(|second| Ok::<_, Error>((table.column(&formula.response)?, table.column(second)?)))
+            .transpose()?
+    } else {
+        None
+    };
     if predictors
         .iter()
         .any(|formula| formula.uses_intercept_column())
@@ -378,12 +395,18 @@ fn observation_rows(
                 .flatten(),
         )
         .chain(extra_columns.iter().map(String::as_str))
-        .chain((mode == DataMode::Training || history).then_some(formula.response.as_str()));
+        .chain(
+            ((mode == DataMode::Training && paired.is_none()) || history)
+                .then_some(formula.response.as_str()),
+        );
     let columns = names
         .map(|name| table.column(name).map_err(Error::from))
         .collect::<Result<Vec<_>>>()?;
     let mut rows: Vec<_> = (0..table.nrows)
-        .filter(|&row| columns.iter().all(|column| column.present(row)))
+        .filter(|&row| {
+            columns.iter().all(|column| column.present(row))
+                && paired.is_none_or(|(first, second)| first.present(row) || second.present(row))
+        })
         .collect();
     for expression in predictors
         .iter()
@@ -574,6 +597,7 @@ fn add_history(
         history,
         DataMode::Prediction,
         true,
+        None,
     )?;
     if !recipe.formula.arma_order.stationary_ar1() {
         return add_arma_history(recipe, future, history, &history_rows, nonlinear, data);
@@ -783,12 +807,14 @@ fn prepare_data_inner(
         .nonlinear
         .as_ref()
         .map_or(&[][..], |p| p.columns.as_slice());
-    let required_columns = if mode == DataMode::Training && recipe.paired_response.is_some() {
-        recipe.paired_response.as_slice()
-    } else {
-        nonlinear_columns
-    };
-    let rows = model_rows(&recipe.formula, &predictors, required_columns, table, mode)?;
+    let rows = model_rows(
+        &recipe.formula,
+        &predictors,
+        nonlinear_columns,
+        table,
+        mode,
+        recipe.paired_response.as_deref(),
+    )?;
     let mut constants = BTreeMap::new();
     constants.insert("N".into(), DataValue::Integer(rows.len() as i64));
     prepare_design(
@@ -800,24 +826,44 @@ fn prepare_data_inner(
         new_groups,
     )?;
     if mode == DataMode::Training {
-        constants.insert(
-            "y_data".into(),
-            response(
+        if let Some(second) = &recipe.paired_response {
+            let first_column = table.column(&recipe.formula.response)?;
+            let second_column = table.column(second)?;
+            let patterns: Vec<_> = rows
+                .iter()
+                .map(|&row| {
+                    i64::from(first_column.present(row)) + 2 * i64::from(second_column.present(row))
+                })
+                .collect();
+            let first = paired_response(
                 recipe.family,
                 recipe.response_levels.as_deref(),
                 &recipe.formula,
                 table,
                 &rows,
-            )?,
-        );
-        if recipe.paired_response.is_some() {
-            let second = &recipe.predictors[crate::paired::SECOND_MEAN].formula;
+            )?;
+            let second = paired_response(
+                recipe.second_family(),
+                recipe.paired_response_levels.as_deref(),
+                &recipe.predictors[crate::paired::SECOND_MEAN].formula,
+                table,
+                &rows,
+            )?;
+            constants.insert("y_data".into(), first);
+            constants.insert(crate::paired::SECOND_DATA.into(), second);
+            if patterns.iter().any(|&pattern| pattern != 3) {
+                constants.insert(
+                    crate::paired::OBSERVED.into(),
+                    DataValue::Integers(patterns),
+                );
+            }
+        } else {
             constants.insert(
-                crate::paired::SECOND_DATA.into(),
+                "y_data".into(),
                 response(
-                    recipe.second_family(),
-                    recipe.paired_response_levels.as_deref(),
-                    second,
+                    recipe.family,
+                    recipe.response_levels.as_deref(),
+                    &recipe.formula,
                     table,
                     &rows,
                 )?,
@@ -1121,6 +1167,46 @@ fn threshold_group_indices(
         .collect()
 }
 
+pub(crate) fn observed_rows(column: &Column, rows: &[usize]) -> Vec<usize> {
+    rows.iter()
+        .copied()
+        .filter(|&row| column.present(row))
+        .collect()
+}
+
+fn paired_response(
+    family: Family,
+    levels: Option<&[GroupLevel]>,
+    formula: &Formula,
+    table: &Table,
+    rows: &[usize],
+) -> Result<DataValue> {
+    let column = table.column(&formula.response)?;
+    let observed = observed_rows(column, rows);
+    let values = response(family, levels, formula, table, &observed)?;
+    if observed.len() == rows.len() {
+        return Ok(values);
+    }
+    fn align<T: Default>(column: &Column, rows: &[usize], values: Vec<T>) -> Vec<T> {
+        let mut values = values.into_iter();
+        rows.iter()
+            .map(|&row| {
+                if column.present(row) {
+                    values.next().unwrap()
+                } else {
+                    T::default()
+                }
+            })
+            .collect()
+    }
+    Ok(match values {
+        DataValue::Real32(values) => DataValue::Real32(align(column, rows, values)),
+        DataValue::Real64(values) => DataValue::Real64(align(column, rows, values)),
+        DataValue::Integers(values) => DataValue::Integers(align(column, rows, values)),
+        DataValue::Integer(_) => unreachable!("paired observations are vectors"),
+    })
+}
+
 pub(crate) fn response_levels(
     family: Family,
     column: &Column,
@@ -1170,6 +1256,9 @@ pub(crate) fn response_levels(
         return Ok(None);
     }
     let mut levels = column.levels(rows)?;
+    if levels.is_empty() && !column.like_factor() {
+        levels.extend([GroupLevel::Integer(0), GroupLevel::Integer(1)]);
+    }
     if !column.like_factor() && levels.len() == 1 {
         if level_key(&levels[0]) == LevelKey::Integer(0) {
             levels.push(GroupLevel::Integer(1));

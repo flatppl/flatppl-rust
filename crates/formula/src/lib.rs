@@ -177,9 +177,15 @@ pub struct Conversion {
     pub data: DataDocument,
     pub recipe: Recipe,
     pub info: ModelInfo,
+    complete_template: Option<Module>,
 }
 
 impl Conversion {
+    /// When training used partial outcomes, return the unmasked template for new data.
+    pub fn complete_template(&self) -> Option<&Module> {
+        self.complete_template.as_ref()
+    }
+
     /// Export a file-backed module and its prepared numeric JSON sidecar.
     /// `source` is the sidecar path as resolved from the generated module.
     /// The caller writes both files. The original module remains external for
@@ -241,6 +247,24 @@ pub struct PredictorRecipe {
 }
 
 impl Recipe {
+    /// Adapt the complete-outcome template to a snapshot with partial observations.
+    pub fn partial_outcome_template(
+        &self,
+        template: &Module,
+        data: &DataDocument,
+    ) -> Result<Option<Module>> {
+        if !data.constants.contains_key(paired::OBSERVED) {
+            return Ok(None);
+        }
+        let second = self
+            .predictors
+            .get(paired::SECOND_MEAN)
+            .ok_or_else(|| Error("partial outcomes require a paired formula".into()))?;
+        let mut module = template.clone();
+        paired::use_partial_outcomes(&mut module, self.second_family(), [self.link, second.link])?;
+        Ok(Some(module))
+    }
+
     /// Expand noncentered group draws in this recipe's prediction template.
     /// `shapes` comes from [`prepare_data_with_new_groups`].
     pub fn extend_group_draws(&self, template: Module, shapes: &NewGroupShapes) -> Result<Module> {
@@ -526,7 +550,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let initial_levels = if family == Family::Categorical {
         let mut response_only = formula.clone();
         response_only.weights = None;
-        let rows = data::model_rows(&response_only, &[], &[], table, DataMode::Training)?;
+        let rows = data::model_rows(&response_only, &[], &[], table, DataMode::Training, None)?;
         data::response_levels(family, table.column(&formula.response)?, &rows)?
     } else {
         None
@@ -646,15 +670,14 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         }
     }
     let predictor_formulas: Vec<_> = formulas.iter().map(|(_, formula, _)| formula).collect();
-    let extra_columns = nonlinear
-        .as_ref()
-        .map_or(paired_response.as_slice(), |p| p.columns.as_slice());
+    let extra_columns = nonlinear.as_ref().map_or(&[][..], |p| p.columns.as_slice());
     let rows = data::model_rows(
         &formula,
         &predictor_formulas,
         extra_columns,
         table,
         DataMode::Training,
+        paired_response.as_deref(),
     )?;
     for name in spec.options.contrasts.keys() {
         if !formulas.iter().any(|(_, formula, _)| {
@@ -671,7 +694,11 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         }
     }
     let response_column = table.column(&formula.response)?;
-    let response_levels = data::response_levels(family, response_column, &rows)?;
+    let first_observed = paired_response
+        .as_ref()
+        .map(|_| data::observed_rows(response_column, &rows));
+    let first_rows = first_observed.as_deref().unwrap_or(&rows);
+    let response_levels = data::response_levels(family, response_column, first_rows)?;
     let threshold_groups = formula
         .threshold_group
         .as_ref()
@@ -695,11 +722,17 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     } else {
         0
     };
-    data::response(family, response_levels.as_deref(), &formula, table, &rows)?;
-    let response = if response_column.like_factor() {
+    data::response(
+        family,
+        response_levels.as_deref(),
+        &formula,
+        table,
+        first_rows,
+    )?;
+    let response = if response_column.like_factor() || first_rows.is_empty() {
         None
     } else {
-        Some(response_column.numeric(&rows)?)
+        Some(response_column.numeric(first_rows)?)
     };
     let (_, group_scale) =
         family::default_scale(family.prior_scale_link(link), response.as_deref());
@@ -707,18 +740,20 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         .as_deref()
         .map(|name| table.column(name))
         .transpose()?;
+    let second_observed = second_column.map(|column| data::observed_rows(column, &rows));
+    let second_rows = second_observed.as_deref().unwrap_or(&[]);
     let paired_response_levels = second_column
-        .map(|column| data::response_levels(second_family, column, &rows))
+        .map(|column| data::response_levels(second_family, column, second_rows))
         .transpose()?
         .flatten();
     let second_response = second_column
-        .filter(|column| second_family == Family::Gaussian || !column.like_factor())
-        .map(|column| column.numeric(&rows))
+        .filter(|column| {
+            !second_rows.is_empty() && (second_family == Family::Gaussian || !column.like_factor())
+        })
+        .map(|column| column.numeric(second_rows))
         .transpose()?;
-    let second_sigma_scale = second_response
-        .as_deref()
-        .filter(|_| second_family == Family::Gaussian)
-        .map(|values| family::default_scale(Link::Identity, Some(values)).1);
+    let second_sigma_scale = (paired_response.is_some() && second_family == Family::Gaussian)
+        .then(|| family::default_scale(Link::Identity, second_response.as_deref()).1);
     let second_group_scale = family::default_scale(
         second_family.prior_scale_link(second_link),
         second_response.as_deref(),
@@ -894,9 +929,10 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let module = emit::model(&mut recipe, &shared)?;
     let data = prepare_data(&recipe, table, DataMode::Training)?;
     let text = flatppl_syntax::print(&module);
-    let mut module = flatppl_syntax::parse(&text)
+    let module = flatppl_syntax::parse(&text)
         .map_err(|e| Error(format!("generated module failed to reparse: {e}")))?;
-    let mut validation = emit::inline(module.clone(), &data)?;
+    let partial = recipe.partial_outcome_template(&module, &data)?;
+    let mut validation = emit::inline(partial.as_ref().unwrap_or(&module).clone(), &data)?;
     let diagnostics = flatppl_infer::infer(&mut validation);
     if let Some(diagnostic) = diagnostics.first() {
         return Err(Error(format!(
@@ -905,15 +941,22 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         )));
     }
     let info = emit::info(spec, &recipe, &data, &validation, &shared)?;
-    metadata::emit(&mut module, &info)?;
-    let text = flatppl_syntax::print(&module);
-    let module = flatppl_syntax::parse(&text)
-        .map_err(|e| Error(format!("generated formula metadata failed to reparse: {e}")))?;
+    let annotate = |mut module: Module| -> Result<Module> {
+        metadata::emit(&mut module, &info)?;
+        flatppl_syntax::parse(&flatppl_syntax::print(&module))
+            .map_err(|e| Error(format!("generated formula metadata failed to reparse: {e}")))
+    };
+    let (module, complete_template) = if let Some(partial) = partial {
+        (annotate(partial)?, Some(annotate(module)?))
+    } else {
+        (annotate(module)?, None)
+    };
     recipe.shared_groups = shared;
     Ok(Conversion {
         module,
         data,
         recipe,
         info,
+        complete_template,
     })
 }

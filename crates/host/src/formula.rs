@@ -106,12 +106,30 @@ impl Context {
                 error,
             )
         })?;
-        let source = flatppl_syntax::print(&converted.module);
-        let template = self.parse(&source, if file_backed { None } else { name }, source_path)?;
-        let module = if file_backed {
-            self.formula_source(&template, &converted.data, name, source_path)?
+        let complete = converted.complete_template();
+        let source = flatppl_syntax::print(complete.unwrap_or(&converted.module));
+        let template = self.parse(
+            &source,
+            if file_backed || complete.is_some() {
+                None
+            } else {
+                name
+            },
+            source_path,
+        )?;
+        let observed = if complete.is_some() {
+            self.parse(
+                &flatppl_syntax::print(&converted.module),
+                if file_backed { None } else { name },
+                source_path,
+            )?
         } else {
-            self.set(&template, &constants(converted.data))?
+            template.clone()
+        };
+        let module = if file_backed {
+            self.formula_source(&observed, &converted.data, name, source_path)?
+        } else {
+            self.set(&observed, &constants(converted.data))?
         };
         Ok(FormulaModel {
             module,
@@ -224,7 +242,8 @@ impl FormulaModel {
         let mut prepared = flatppl_formula::prepare_data(&self.recipe, &data, mode)
             .map_err(|error| Diagnostic::new("formula", self.template.source_name(), error))?;
         let rows = std::mem::take(&mut prepared.rows);
-        let module = context.formula_source(&self.template, &prepared, None, None)?;
+        let template = self.observed_template(context, &prepared)?;
+        let module = context.formula_source(&template, &prepared, None, None)?;
         Ok((module, rows))
     }
 
@@ -238,8 +257,29 @@ impl FormulaModel {
         let mut prepared = flatppl_formula::prepare_data(&self.recipe, data, mode)
             .map_err(|error| Diagnostic::new("formula", self.template.source_name(), error))?;
         let rows = std::mem::take(&mut prepared.rows);
-        let module = context.set(&self.template, &constants(prepared))?;
+        let template = self.observed_template(context, &prepared)?;
+        let module = context.set(&template, &constants(prepared))?;
         Ok((module, rows))
+    }
+
+    fn observed_template(
+        &self,
+        context: &mut Context,
+        data: &DataDocument,
+    ) -> Result<Arc<LoadedModule>, Diagnostic> {
+        let fail =
+            |message: String| Diagnostic::new("formula", self.template.source_name(), message);
+        if !context.owns(&self.template) {
+            return Err(fail("the module belongs to a different context".into()));
+        }
+        match self
+            .recipe
+            .partial_outcome_template(self.template.parsed(), data)
+            .map_err(|error| fail(error.to_string()))?
+        {
+            Some(template) => context.parse(&flatppl_syntax::print(&template), None, None),
+            None => Ok(self.template.clone()),
+        }
     }
 
     /// Prepare prediction data, allowing unseen grouping labels.

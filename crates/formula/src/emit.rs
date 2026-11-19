@@ -324,7 +324,7 @@ pub(crate) fn model_with_forecast(
         );
     }
     let pointwise = if is_paired {
-        paired::pointwise(&mut b, recipe.second_family())
+        paired::pointwise(&mut b, recipe.second_family(), None)
     } else if recipe.formula.ar.is_some() {
         if order.stationary_ar1() {
             autoregression::pointwise(&mut b, mu, forecast)

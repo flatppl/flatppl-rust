@@ -365,10 +365,11 @@ group before continuing with the future rows.
 Orders `p=1, q=0` use the stationary AR(1) model described above.
 
 For paired Gaussian responses, set `formula` and `paired_formula` to the
-two mean formulas. Training selects complete rows across both responses
-and their predictors. `K_model` returns outcome columns `y` and `y2`, in
+two mean formulas. Training retains rows with both sets of predictors and
+at least one observed response. `K_model` returns outcome columns `y` and `y2`, in
 formula order. `expected_response` returns both means in a matrix, and
-`log_lik` gives the joint score per row. `info.response_columns` names the
+`log_lik` scores the observed responses per row. A row with one observed
+Gaussian response uses its marginal Normal law. `info.response_columns` names the
 two response columns in order.
 
 Prior class `sigma` applies to the first residual scale and `sigma2` to
@@ -382,6 +383,7 @@ Use the same grouping ID in both formulas, such as `(1 | ability | subject)`,
 to fit correlated group effects. The responses are independent given the
 predictors and group effects. The second column of `expected_response` is
 the success probability, and `K_model.y2` draws zero or one.
+Rows with one observed response contribute that response's score.
 
 Unordered factors use treatment contrasts. Ordered factors use polynomial
 contrasts. Set `options.contrasts` per column, for example
