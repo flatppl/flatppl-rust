@@ -442,6 +442,9 @@ fn lower_normalized_weight_sample(
     {
         return sample_conjugate_posterior(m, posterior, rng, None);
     }
+    if let Some(block) = flatppl_model_analysis::posterior::gaussian_block::normalized(m, measure) {
+        return sample_gaussian_block(m, block, rng);
+    }
     if let Some(sample) = lower_normalized_superpose_sample(m, measure, rng) {
         return sample;
     }
@@ -458,6 +461,40 @@ fn lower_normalized_weight_sample(
         crate::density::exponential_tilt::guard(m, value, valid)
     };
     Ok((value, next))
+}
+
+fn sample_gaussian_block(
+    m: &mut Module,
+    block: flatppl_model_analysis::posterior::gaussian_block::GaussianBlock,
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+    let invalid = m.alloc(Node::Lit(Scalar::Real(-1.0)));
+    let scale = build_call(m, "ifelse", &[block.model_valid(), one, invalid]);
+    let standard = build_call(m, "Normal", &[zero, scale]);
+    let size = m.alloc(Node::Lit(Scalar::Int(block.fields.len() as i64)));
+    let iid = build_call(m, "iid", &[standard, size]);
+    let (value, next) = lower_closed_measure_sample(m, iid, rng)?;
+    if let Some(projection) = expect_builtin_call(m, next, "get0") {
+        m.record_sample_origin(projection.args[0], block.update);
+    }
+    let value = block.draw_from_standard(m, value);
+    let valid = block.valid(m);
+    let fields: Vec<_> = block
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, &field)| {
+            let index = m.alloc(Node::Lit(Scalar::Int(i as i64)));
+            let coordinate = build_call(m, "get0", &[value, index]);
+            (
+                field,
+                crate::density::exponential_tilt::guard(m, coordinate, valid),
+            )
+        })
+        .collect();
+    Ok((build_record(m, &fields), next))
 }
 
 fn sample_conjugate_posterior(

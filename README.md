@@ -142,6 +142,12 @@ each field must have a matching update. Analysis reports the fields in prior ord
 undetermined. Runtime data can determine the posterior parameters and its
 validity. Other FlatPPL engines choose their own sampling methods.
 
+Named Normal coefficients with affine Normal observation means can use one
+exact joint Gaussian update. The rule covers explicit scalar observation
+factors with known noise, up to 64 rows including priors. It supplies normalized
+density, evidence and seeded draws through the same queries. Analysis reports
+the block as `MvNormal`.
+
 MvNormal, Dirichlet and Wishart support vector/matrix summaries. MvNormal and
 Wishart require fixed finite data or explicitly bounded runtime inputs, for
 example `y = external(cartpow(cartpow(interval(-100, 100), 3), 1000))`.

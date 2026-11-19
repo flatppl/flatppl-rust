@@ -37,6 +37,7 @@ pub use flatppl_model_analysis::{
     sufficient_statistics, sufficient_statistics_with_report,
 };
 
+pub use flatppl_model_analysis::posterior::gaussian_block::update as gaussian_posterior_block;
 pub use flatppl_model_analysis::posterior::{conjugate_product, conjugate_update};
 pub use marginal::{exponentially_modified_normal_logpdf, match_conjugate_marginal};
 pub use preparation::{

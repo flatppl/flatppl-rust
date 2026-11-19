@@ -127,6 +127,15 @@ fn describe(m: &mut Module, node: Option<NodeId>, binding: String) -> Vec<Poster
         sampling: PosteriorSampling::NotUsed,
     };
     let Some(product) = product else {
+        if let Some(block) =
+            node.and_then(|node| flatppl_determinizer::gaussian_posterior_block(m, node))
+        {
+            return vec![PosteriorUpdate {
+                family: Some("MvNormal".into()),
+                likelihoods: vec!["Normal".into(); block.observations],
+                ..update
+            }];
+        }
         return vec![update];
     };
     product

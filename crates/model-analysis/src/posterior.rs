@@ -18,6 +18,7 @@ use crate::{ConjugateRowId, measure_stochastic_ancestors, references_latent};
 
 mod evidence;
 pub use evidence::{beta_log_evidence, conjugate_log_evidence};
+pub mod gaussian_block;
 
 /// The posterior record contains one field with this native probability law.
 /// The posterior has a probability law only when `valid` holds.

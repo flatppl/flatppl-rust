@@ -23,8 +23,10 @@ pub fn beta_log_evidence(m: &mut Module, posterior: NodeId) -> Option<NodeId> {
 
 /// Exact log evidence of independent conjugate fields, relative to the observation measure.
 pub fn conjugate_log_evidence(m: &mut Module, posterior: NodeId) -> Option<NodeId> {
-    let (_, updates) = match_updates(m, posterior)?;
-    log_evidence(m, &updates)
+    if let Some((_, updates)) = match_updates(m, posterior) {
+        return log_evidence(m, &updates);
+    }
+    Some(super::gaussian_block::update(m, posterior)?.log_evidence(m))
 }
 
 struct UpdatePlan {
@@ -153,8 +155,12 @@ fn log_evidence(m: &mut Module, matched: &[MatchedUpdate]) -> Option<NodeId> {
     };
     let minus_inf = real(m, f64::NEG_INFINITY);
     let log_mass = op(m, "ifelse", &[supported, sum, minus_inf]);
-    // A unit-probability event adds zero on every valid model. Its native
-    // probability check preserves the source parameter error on invalid models.
+    let anchor = parameter_anchor(m, model_valid);
+    Some(op(m, "add", &[log_mass, anchor]))
+}
+
+/// A unit-probability event preserves the source parameter check.
+pub(super) fn parameter_anchor(m: &mut Module, model_valid: NodeId) -> NodeId {
     let one = real(m, 1.0);
     let invalid = real(m, 2.0);
     let p = op(m, "ifelse", &[model_valid, one, invalid]);
@@ -162,8 +168,7 @@ fn log_evidence(m: &mut Module, matched: &[MatchedUpdate]) -> Option<NodeId> {
     let parameters = build_record(m, &[(name, p)]);
     let name = m.intern("Bernoulli");
     let kernel = m.alloc(Node::Const(name));
-    let anchor = op(m, "builtin_logdensityof", &[kernel, parameters, one]);
-    Some(op(m, "add", &[log_mass, anchor]))
+    op(m, "builtin_logdensityof", &[kernel, parameters, one])
 }
 
 fn safe(m: &mut Module, valid: NodeId, value: NodeId, fallback: f64) -> NodeId {
