@@ -35,7 +35,12 @@ pub(crate) fn model_with_forecast(
         },
     );
     if is_paired {
-        external_vector(&mut b, paired::SECOND_DATA, "reals");
+        let set = if recipe.second_family().discrete() {
+            "nonnegintegers"
+        } else {
+            "reals"
+        };
+        external_vector(&mut b, paired::SECOND_DATA, set);
     }
     if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
         external_vector(&mut b, "trials_data", "nonnegintegers");
@@ -266,7 +271,7 @@ pub(crate) fn model_with_forecast(
             observation.parameter("bias"),
         )
     } else if is_paired {
-        paired::draw(&mut b)?
+        paired::draw(&mut b, recipe.second_family())?
     } else {
         let y = if recipe.formula.ar.is_some() {
             if order.stationary_ar1() {
@@ -319,7 +324,7 @@ pub(crate) fn model_with_forecast(
         );
     }
     let pointwise = if is_paired {
-        paired::pointwise(&mut b)
+        paired::pointwise(&mut b, recipe.second_family())
     } else if recipe.formula.ar.is_some() {
         if order.stationary_ar1() {
             autoregression::pointwise(&mut b, mu, forecast)
@@ -1769,6 +1774,8 @@ pub(crate) fn info(
         factor_levels,
         group_levels,
         response_levels: recipe.response_levels.clone(),
+        paired_family: recipe.paired_family,
+        paired_response_levels: recipe.paired_response_levels.clone(),
         threshold_groups: recipe.threshold_groups.clone(),
         dpars: recipe
             .predictors

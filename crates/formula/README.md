@@ -376,6 +376,13 @@ the second. Both use their own fitted response scale for defaults. Class
 `rescor` applies to the residual correlation and defaults to uniform on
 `(-1, 1)`. Use `dpar = "mu2"` to select second-mean predictor priors.
 
+Set `paired_family` to `"bernoulli"` for a Gaussian first response and a
+Bernoulli second response. Set `paired_link` to override the logit default.
+Use the same grouping ID in both formulas, such as `(1 | ability | subject)`,
+to fit correlated group effects. The responses are independent given the
+predictors and group effects. The second column of `expected_response` is
+the success probability, and `K_model.y2` draws zero or one.
+
 Unordered factors use treatment contrasts. Ordered factors use polynomial
 contrasts. Set `options.contrasts` per column, for example
 `{"treatment": "sum"}`. Accepted values are `treatment`, `sum`, `helmert` and
