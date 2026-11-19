@@ -11014,6 +11014,7 @@ pub(crate) fn call_valueset(
                     Type::Array { shape, .. } if shape.len() == 1 => {
                         ValueSet::CartPow(Box::new(inner), shape[0])
                     }
+                    Type::Table { nrows, .. } => ValueSet::CartPow(Box::new(inner), *nrows),
                     _ => ValueSet::Unknown,
                 },
                 _ => ValueSet::Unknown,
