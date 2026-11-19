@@ -968,7 +968,7 @@ impl Emitter<'_> {
 }
 
 /// The tensor leaf types of `ty`, depth-first in declared field order.
-fn leaf_types(ty: &Type, out: &mut Vec<Type>) {
+pub(super) fn leaf_types(ty: &Type, out: &mut Vec<Type>) {
     match ty {
         Type::Record(fields) => {
             for (_, field) in fields.iter() {

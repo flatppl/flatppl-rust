@@ -4558,7 +4558,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// [`Emitter::bind_column`] for a field that may itself be a record.
-    pub(crate) fn bind_field(&mut self, container: NodeId, name: String, value: Lowered) {
+    pub fn bind_field(&mut self, container: NodeId, name: String, value: Lowered) {
         let container = self.column_container(container);
         self.columns.insert((container, name), value);
     }
@@ -5015,9 +5015,35 @@ impl<'m> Emitter<'m> {
                         format!("broadcast: missing input '{}'", self.m.resolve(*param)),
                     )
                 })?;
-            let parts = self.lower_components(arg)?;
+            let mut parts = self.lower_components(arg)?;
             let is_collection = !matches!(self.type_of(arg), Some(Type::Record(_)));
-            types.push(self.sequence_item_type(arg)?);
+            let item_type = self.sequence_item_type(arg)?;
+            if matches!(self.type_of(arg), Some(Type::Table { .. })) {
+                let mut columns = Vec::new();
+                sequences::leaf_types(&item_type, &mut columns);
+                for (value, column) in parts.values.iter_mut().zip(&columns) {
+                    // A table maps its row axis, even when a column's physical
+                    // tensor has several axes or nested array cells.
+                    let mut axes = self.axes_of(value);
+                    axes.layers = vec![1];
+                    let mut column = column;
+                    loop {
+                        match column {
+                            Type::Array { shape, elem } => {
+                                axes.layers.push(shape.len());
+                                column = elem;
+                            }
+                            Type::TVector { elem, .. } => {
+                                axes.layers.push(1);
+                                column = elem;
+                            }
+                            _ => break,
+                        }
+                    }
+                    *value = self.axes_view(value, axes);
+                }
+            }
+            types.push(item_type);
             if is_collection {
                 leaves.extend(parts.values.clone());
             }

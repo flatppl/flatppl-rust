@@ -151,6 +151,46 @@ fn a_record_valued_broadcast_is_a_table() {
 }
 
 #[test]
+fn a_table_broadcast_maps_rows_with_scalar_and_vector_fields() {
+    let out = emit(
+        "p = elementof(cartpow(cartprod(amplitude = cartpow(reals, 2), width = reals), 3))\n\
+         inputs = p\noutputs = broadcast(row -> record(\
+         amplitude = complex(row.amplitude[1], row.amplitude[2]), width = exp(row.width)), p)\n",
+    );
+    assert_eq!(
+        signature(&out),
+        "func.func @logdensity(%arg0: tensor<3x2xf32>, %arg1: tensor<3xf32>) -> \
+         (tensor<3xcomplex<f32>>, tensor<3xf32>) {"
+    );
+    assert!(out.contains("stablehlo.exponential"), "{out}");
+}
+
+#[test]
+fn a_table_with_only_vector_leaves_reduces_each_rows_cell() {
+    let out = emit(
+        "p = elementof(cartpow(cartprod(x = cartpow(reals, 2)), 3))\n\
+         inputs = p\noutputs = broadcast(row -> sum(row.x), p)\n",
+    );
+    assert!(signature(&out).ends_with("-> tensor<3xf32> {"), "{out}");
+    assert!(out.contains("across dimensions = [1]"), "{out}");
+}
+
+#[test]
+fn nested_table_fields_keep_cell_layers_inside_a_broadcast() {
+    let out = emit(
+        "p = elementof(cartpow(cartprod(inner = cartprod(\
+         x = cartpow(cartpow(reals, 2), 4)), width = reals), 3))\n\
+         inputs = p\noutputs = broadcast(row -> record(\
+         totals = broadcast(sum, row.inner.x), width = exp(row.width)), p)\n",
+    );
+    assert!(
+        signature(&out).ends_with("-> (tensor<3x4xf32>, tensor<3xf32>) {"),
+        "{out}"
+    );
+    assert!(out.contains("across dimensions = [2]"), "{out}");
+}
+
+#[test]
 fn a_nested_record_input_flattens_depth_first() {
     let out = emit(
         "p = elementof(cartprod(x = reals, inner = cartprod(u = reals, v = cartpow(reals, 2))))\n\

@@ -75,6 +75,7 @@ const COMBINATORS: &str = r#"
 a = Exponential(rate = 1.0)
 b = Beta(2.0, 3.0)
 named = joint(x = a, y = b)
+rows = iid(named, 3)
 positional = joint(a, b)
 records = joint(named, joint(z = Dirichlet(alpha = [1.0, 1.0])))
 sum = superpose(a, LogNormal(mu = 0.0, sigma = 1.0))
@@ -88,6 +89,10 @@ fn products_and_sums_combine_their_component_supports() {
     assert_eq!(
         support(&mut module, "named"),
         "cartprod(x = nonnegreals, y = unitinterval)"
+    );
+    assert_eq!(
+        support(&mut module, "rows"),
+        "cartpow(cartprod(x = nonnegreals, y = unitinterval), 3)"
     );
     assert_eq!(
         support(&mut module, "positional"),

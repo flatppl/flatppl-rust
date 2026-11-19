@@ -96,3 +96,34 @@ fn complex_record_fields_add_a_trailing_real_coordinate_pair()
     assert_eq!(forward["output"], inverse["inputs"][0]["value"]);
     Ok(())
 }
+
+#[test]
+fn table_coordinates_preserve_rows_and_transform_each_field()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query = context.parse(
+        "p = elementof(cartpow(cartprod(gain = complexes, \
+             noise = cartprod(scale = posreals, weights = stdsimplex(3))), 4))\n\
+         inputs = p\noutputs = -sum(abs2.(p.gain)) - sum(p.noise.scale)",
+        None,
+        None,
+    )?;
+    let options = EmitOptions::default();
+    let original = serde_json::to_value(query.compile(&options)?)?;
+    let maps = context.transform(&query, true)?;
+    let forward = serde_json::to_value(maps.constrain.compile(&options)?)?;
+    let inverse = serde_json::to_value(maps.unconstrain.compile(&options)?)?;
+    let score = serde_json::to_value(maps.unconstrained.compile(&options)?)?;
+    let free = &forward["inputs"][0]["value"];
+    assert_eq!(free["rows"], 4);
+    assert_eq!(free["fields"][0]["value"]["shape"], json!([4, 2]));
+    let noise = &free["fields"][1]["value"];
+    assert_eq!(noise["rows"], 4);
+    assert_eq!(noise["fields"][0]["value"]["shape"], json!([4]));
+    assert_eq!(noise["fields"][1]["value"]["shape"], json!([4, 2]));
+    assert_eq!(*free, inverse["output"]);
+    assert_eq!(*free, score["inputs"][0]["value"]);
+    assert_eq!(forward["output"], original["inputs"][0]["value"]);
+    assert_eq!(forward["output"], inverse["inputs"][0]["value"]);
+    Ok(())
+}

@@ -850,7 +850,7 @@ impl Context {
             .is_some_and(crate::transforms::supported_container)
         {
             return Err(fail(
-                "coordinate transforms currently support scalars, scalar arrays and records; arrays with structured cells and tables are not supported".into(),
+                "coordinate transforms require scalar or scalar-array leaves in records and table rows".into(),
             ));
         }
         let output = binding("outputs")
