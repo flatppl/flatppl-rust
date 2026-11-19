@@ -72,3 +72,27 @@ fn array_nesting_is_not_silently_replaced_with_matrix_semantics()
         .compile(&EmitOptions::default())?;
     Ok(())
 }
+
+#[test]
+fn complex_record_fields_add_a_trailing_real_coordinate_pair()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query = context.parse(
+        "p = elementof(cartprod(z = complexes, a = cartpow(complexes, [2, 3])))\n\
+         inputs = p\noutputs = -abs2(p.z) - sum(abs2.(p.a))",
+        None,
+        None,
+    )?;
+    let maps = context.transform(&query, true)?;
+    let options = EmitOptions::default();
+    let inverse = serde_json::to_value(maps.unconstrain.compile(&options)?)?;
+    let forward = serde_json::to_value(maps.constrain.compile(&options)?)?;
+    let density = serde_json::to_value(maps.unconstrained.compile(&options)?)?;
+    let coords = &density["inputs"][0]["value"];
+    assert_eq!(coords["fields"][0]["value"]["shape"], json!([2]));
+    assert_eq!(coords["fields"][1]["value"]["shape"], json!([2, 3, 2]));
+    assert_eq!(coords, &inverse["output"]);
+    assert_eq!(coords, &forward["inputs"][0]["value"]);
+    assert_eq!(forward["output"], inverse["inputs"][0]["value"]);
+    Ok(())
+}
