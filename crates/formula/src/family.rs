@@ -15,6 +15,8 @@ pub enum Family {
     HurdleLognormal,
     Bernoulli,
     Binomial,
+    #[serde(rename = "beta_binomial")]
+    BetaBinomial,
     #[serde(rename = "zero_inflated_binomial")]
     ZeroInflatedBinomial,
     Poisson,
@@ -94,6 +96,7 @@ impl Family {
             "hurdle_lognormal" => Self::HurdleLognormal,
             "bernoulli" => Self::Bernoulli,
             "binomial" => Self::Binomial,
+            "beta_binomial" => Self::BetaBinomial,
             "zero_inflated_binomial" => Self::ZeroInflatedBinomial,
             "poisson" => Self::Poisson,
             "hurdle_poisson" => Self::HurdlePoisson,
@@ -123,6 +126,7 @@ impl Family {
             | Self::HurdleLognormal => Link::Identity,
             Self::Bernoulli
             | Self::Binomial
+            | Self::BetaBinomial
             | Self::ZeroInflatedBinomial
             | Self::Beta
             | Self::ZeroInflatedBeta
@@ -145,6 +149,12 @@ impl Family {
             Self::Gaussian | Self::Student => !matches!(link, Sqrt | TanHalf | Logm1),
             Self::Exgaussian => matches!(link, Identity | Log | Inverse | Softplus | Squareplus),
             Self::Lognormal | Self::HurdleLognormal => matches!(link, Identity | Inverse),
+            Self::BetaBinomial => {
+                matches!(
+                    link,
+                    Logit | Probit | ProbitApprox | Cloglog | Cauchit | Softit | Identity
+                )
+            }
             Self::Bernoulli
             | Self::Binomial
             | Self::ZeroInflatedBinomial
@@ -185,6 +195,7 @@ impl Family {
             self,
             Self::Bernoulli
                 | Self::Binomial
+                | Self::BetaBinomial
                 | Self::ZeroInflatedBinomial
                 | Self::Poisson
                 | Self::HurdlePoisson
@@ -204,7 +215,10 @@ impl Family {
     }
 
     pub(crate) fn uses_trials(self) -> bool {
-        matches!(self, Self::Binomial | Self::ZeroInflatedBinomial)
+        matches!(
+            self,
+            Self::Binomial | Self::BetaBinomial | Self::ZeroInflatedBinomial
+        )
     }
 
     pub(crate) fn auxiliaries(self) -> &'static [&'static str] {
@@ -213,7 +227,7 @@ impl Family {
             Self::Student => &["sigma", "nu"],
             Self::Exgaussian => &["sigma", "beta"],
             Self::Gamma | Self::Negbinomial | Self::Weibull => &["shape"],
-            Self::Beta => &["phi"],
+            Self::Beta | Self::BetaBinomial => &["phi"],
             Self::ZeroInflatedBeta => &["phi", "zi"],
             Self::HurdlePoisson => &["hu"],
             Self::HurdleNegbinomial | Self::HurdleGamma => &["shape", "hu"],
@@ -533,6 +547,7 @@ impl Family {
             }
             Self::Wiener => unreachable!("Wiener observations require the recorded decision"),
             Self::Exgaussian => unreachable!("ex-Gaussian uses an explicit two-stage draw"),
+            Self::BetaBinomial => unreachable!("beta-binomial uses an explicit two-stage draw"),
             Self::Cumulative | Self::Acat => {
                 unreachable!("ordinal observations use explicit cut inputs")
             }

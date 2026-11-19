@@ -164,7 +164,7 @@ number of steps in every occurrence.
 ### Families
 
 Set `family` to `gaussian`, `student`, `lognormal`, `exgaussian`, `bernoulli`, `binomial`, `poisson`,
-`negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises`,
+`negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `beta_binomial`, `von_mises`,
 `cumulative`, `acat`, `categorical`, `wiener`, `zero_inflated_poisson`, `zero_inflated_binomial`,
 `zero_inflated_negbinomial`, `zero_inflated_beta`, `hurdle_poisson`,
 `hurdle_negbinomial`, `hurdle_gamma` or `hurdle_lognormal`.
@@ -176,6 +176,7 @@ Set `family` to `gaussian`, `student`, `lognormal`, `exgaussian`, `bernoulli`, `
 | Lognormal | identity | inverse |
 | Ex-Gaussian | identity | log, inverse, softplus, squareplus |
 | Bernoulli, binomial, beta | logit | probit, probit_approx, cloglog, cauchit, softit, identity, log |
+| Beta-binomial | logit | probit, probit_approx, cloglog, cauchit, softit, identity |
 | Poisson, negative binomial, geometric | log | identity, sqrt, softplus, squareplus |
 | Gamma, exponential, Weibull | log | identity, inverse, softplus, squareplus |
 | von Mises | tan_half | identity |
@@ -227,6 +228,13 @@ integers, and binomial responses cannot exceed their trials. Gamma,
 exponential, lognormal and Weibull responses must be strictly positive.
 Bernoulli responses may be numeric, logical or factors; the recipe retains
 the training event coding when preparing new data.
+
+Use `y | trials(n) ~ x` with `family = "beta_binomial"` for overdispersed
+success counts. The model draws a separate success probability per row from
+`Beta(mu * phi, (1 - mu) * phi)`. The mean count is `n * mu`. The mean
+probability must lie strictly between zero and one, and precision `phi`
+must be positive. Precision can use a distributional formula with a log link.
+Zero trials give zero successes.
 
 Cumulative responses use ordered factors or positive integer category codes.
 Unused factor levels are dropped; integer codes retain gaps up to their maximum.

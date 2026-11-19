@@ -63,7 +63,7 @@ pub(crate) fn emit(
             let location = broadcast(b, "add", &[mu, shift]);
             broadcast(b, "exp", &[location])
         }
-        Binomial | ZeroInflatedBinomial => {
+        Binomial | BetaBinomial | ZeroInflatedBinomial => {
             broadcast(b, "mul", &[trials.expect("validated trial count"), mu])
         }
         HurdlePoisson | HurdleNegbinomial => {

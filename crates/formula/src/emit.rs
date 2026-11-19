@@ -275,6 +275,8 @@ pub(crate) fn model_with_forecast(
             } else {
                 arma::draw(&mut b, order, mu, forecast)
             }
+        } else if recipe.family == Family::BetaBinomial {
+            crate::beta_binomial::draw(&mut b, observation, predictor_n)
         } else {
             let law = if recipe.family == Family::Exgaussian {
                 crate::exgaussian::conditional_observation(&mut b, observation, predictor_n)
@@ -331,7 +333,7 @@ pub(crate) fn model_with_forecast(
         || recipe.formula.ar.is_some()
         || matches!(
             recipe.family,
-            Family::Acat | Family::Exgaussian | Family::Wiener
+            Family::Acat | Family::BetaBinomial | Family::Exgaussian | Family::Wiener
         ) {
         crate::response::observed_likelihood(&mut b, pointwise, &parameters)
     } else {
@@ -1237,6 +1239,8 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
     };
     let score = if recipe.family == Family::Exgaussian {
         crate::exgaussian::log_density(b, observation, value)
+    } else if recipe.family == Family::BetaBinomial {
+        crate::beta_binomial::log_mass(b, observation, value)
     } else if recipe.family == Family::Acat {
         crate::adjacent::log_prob(b, mu, &cuts, value)
     } else if recipe.family == Family::Wiener {
