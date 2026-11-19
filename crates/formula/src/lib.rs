@@ -85,9 +85,14 @@ impl From<serde_json::Error> for Error {
 #[serde(deny_unknown_fields)]
 pub struct Spec {
     pub formula: String,
-    /// A second response formula for a paired Gaussian model.
+    /// A second response formula.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paired_formula: Option<String>,
+    /// The second response family. Omit this for a paired Gaussian model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_link: Option<String>,
     #[serde(default = "gaussian")]
     pub family: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,6 +198,10 @@ pub struct Recipe {
     pub formula: Formula,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paired_response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) paired_family: Option<Family>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) paired_response_levels: Option<Vec<GroupLevel>>,
     pub family: Family,
     pub link: Link,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,8 +283,13 @@ impl Recipe {
             .chain(
                 self.paired_response
                     .iter()
+                    .filter(|_| self.second_family() == Family::Gaussian)
                     .flat_map(|_| paired::AUXILIARIES),
             )
+    }
+
+    pub(crate) fn second_family(&self) -> Family {
+        self.paired_family.unwrap_or(Family::Gaussian)
     }
 
     pub(crate) fn thresholds(&self) -> usize {
@@ -349,6 +363,10 @@ pub struct ModelInfo {
     /// Column names in paired prediction output order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_columns: Option<[String; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_family: Option<Family>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_response_levels: Option<Vec<GroupLevel>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_column: Option<String>,
     pub family: String,
@@ -457,6 +475,10 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         }
     }
     let second_formula = paired::parse(spec, family, &formula)?;
+    let (second_family, second_link) = match spec.paired_family.as_deref() {
+        Some(name) => Family::resolve(name, spec.paired_link.as_deref())?,
+        None => (Family::Gaussian, link),
+    };
     let paired_response = second_formula
         .as_ref()
         .map(|formula| formula.response.clone());
@@ -523,7 +545,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         vec![("mu", formula.clone(), link)]
     };
     if let Some(second_formula) = second_formula {
-        formulas.push((paired::SECOND_MEAN, second_formula, link));
+        formulas.push((paired::SECOND_MEAN, second_formula, second_link));
     }
     for (name, spec) in &spec.dpars {
         let formula = parse_formula(&spec.formula)?;
@@ -681,16 +703,27 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     };
     let (_, group_scale) =
         family::default_scale(family.prior_scale_link(link), response.as_deref());
-    let second_response = paired_response
+    let second_column = paired_response
         .as_deref()
-        .map(|name| table.column(name)?.numeric(&rows))
+        .map(|name| table.column(name))
+        .transpose()?;
+    let paired_response_levels = second_column
+        .map(|column| data::response_levels(second_family, column, &rows))
+        .transpose()?
+        .flatten();
+    let second_response = second_column
+        .filter(|column| second_family == Family::Gaussian || !column.like_factor())
+        .map(|column| column.numeric(&rows))
         .transpose()?;
     let second_sigma_scale = second_response
         .as_deref()
+        .filter(|_| second_family == Family::Gaussian)
         .map(|values| family::default_scale(Link::Identity, Some(values)).1);
-    let second_group_scale = second_response
-        .as_deref()
-        .map(|values| family::default_scale(family.prior_scale_link(link), Some(values)).1);
+    let second_group_scale = family::default_scale(
+        second_family.prior_scale_link(second_link),
+        second_response.as_deref(),
+    )
+    .1;
     let response_formula = formula;
     let global_cor = family == Family::Categorical
         || formulas
@@ -699,6 +732,11 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let mut predictors = BTreeMap::new();
     let mut auxiliary_priors = BTreeMap::new();
     for (name, formula, link) in formulas {
+        let predictor_family = if name == paired::SECOND_MEAN {
+            second_family
+        } else {
+            family
+        };
         let is_nonlinear = spec.nlpars.contains_key(name);
         let (design, means) =
             design::build((&formula).into(), table, &rows, &spec.options.contrasts)?;
@@ -787,7 +825,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             &smooths,
             monotonic_design.as_ref(),
             priors::PriorContext {
-                family,
+                family: predictor_family,
                 link,
                 thresholds: if name == "mu" { thresholds } else { 0 },
                 dpar: (name != "mu").then_some(name),
@@ -802,7 +840,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 offset_mean,
                 global_cor,
                 group_scale: if name == paired::SECOND_MEAN {
-                    second_group_scale.unwrap_or(group_scale)
+                    second_group_scale
                 } else {
                     group_scale
                 },
@@ -837,6 +875,8 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let mut recipe = Recipe {
         formula: response_formula,
         paired_response,
+        paired_family: spec.paired_family.as_ref().map(|_| second_family),
+        paired_response_levels,
         family,
         link,
         response_levels,

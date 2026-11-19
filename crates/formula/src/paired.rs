@@ -8,11 +8,29 @@ pub(crate) const AUXILIARIES: [&str; 2] = ["sigma2", "rescor"];
 
 pub(crate) fn parse(spec: &Spec, family: Family, first: &Formula) -> Result<Option<Formula>> {
     let Some(second) = &spec.paired_formula else {
+        if spec.paired_family.is_some() || spec.paired_link.is_some() {
+            return Err(Error(
+                "a second family or link requires a second formula".into(),
+            ));
+        }
         return Ok(None);
     };
-    if family != Family::Gaussian || !spec.dpars.is_empty() || !spec.nlpars.is_empty() {
+    let supported_second = matches!(
+        spec.paired_family.as_deref(),
+        None | Some("gaussian" | "bernoulli")
+    );
+    if family != Family::Gaussian
+        || !supported_second
+        || !spec.dpars.is_empty()
+        || !spec.nlpars.is_empty()
+    {
         return Err(Error(
-            "paired formulas require the Gaussian family with two mean predictors and constant-in-row scales".into(),
+            "paired formulas require a Gaussian first response and a Gaussian or Bernoulli second response with constant-in-row scales".into(),
+        ));
+    }
+    if spec.paired_link.is_some() && spec.paired_family.is_none() {
+        return Err(Error(
+            "a second link requires an explicit second family".into(),
         ));
     }
     let second = crate::parse_formula(second)?;
@@ -45,16 +63,21 @@ pub(crate) fn expected(b: &mut Builder<'_>) -> NodeId {
     b.call("colstack", &[means])
 }
 
-pub(crate) fn draw(b: &mut Builder<'_>) -> Result<NodeId> {
+pub(crate) fn draw(b: &mut Builder<'_>, family: Family) -> Result<NodeId> {
     let means = [b.self_ref("mu"), b.self_ref(SECOND_MEAN)];
-    let scales = [scale(b, "sigma")?, scale(b, "sigma2")?];
-    let correlation = b.self_ref("rescor");
-    let law = broadcast(b, "Normal", &[means[0], scales[0]]);
+    let sigma = scale(b, "sigma")?;
+    let law = broadcast(b, "Normal", &[means[0], sigma]);
     let first = b.call("draw", &[law]);
     b.bind("y", first);
     let first = b.self_ref("y");
-    let (mean, scale) = conditional(b, means, scales, correlation, first);
-    let law = broadcast(b, "Normal", &[mean, scale]);
+    let law = if family == Family::Bernoulli {
+        broadcast(b, "Bernoulli", &[means[1]])
+    } else {
+        let sigma2 = scale(b, "sigma2")?;
+        let correlation = b.self_ref("rescor");
+        let (mean, scale) = conditional(b, means, [sigma, sigma2], correlation, first);
+        broadcast(b, "Normal", &[mean, scale])
+    };
     let second = b.call("draw", &[law]);
     b.bind("y2", second);
     let second = b.self_ref("y2");
@@ -79,34 +102,38 @@ pub(crate) fn observation(b: &mut Builder<'_>) -> NodeId {
     b.call_fields("record", &[("y", first), ("y2", second)])
 }
 
-pub(crate) fn pointwise(b: &mut Builder<'_>) -> NodeId {
-    let names = [
-        "mu",
-        SECOND_MEAN,
-        "sigma",
-        "sigma2",
-        "rescor",
-        "y_data",
-        SECOND_DATA,
-    ];
-    let refs = names.map(|name| Ref {
-        ns: RefNs::Local,
-        name: b.sym(&format!("_{name}_")),
-    });
-    let [mu, mu2, sigma, sigma2, correlation, first, second] =
-        refs.map(|reference| b.m.alloc(Node::Ref(reference)));
+pub(crate) fn pointwise(b: &mut Builder<'_>, family: Family) -> NodeId {
+    let mut names = vec!["mu", SECOND_MEAN, "sigma", "y_data", SECOND_DATA];
+    if family == Family::Gaussian {
+        names.extend(AUXILIARIES);
+    }
+    let refs: Vec<_> = names
+        .iter()
+        .map(|name| Ref {
+            ns: RefNs::Local,
+            name: b.sym(&format!("_{name}_")),
+        })
+        .collect();
+    let values: Vec<_> = refs
+        .iter()
+        .map(|&reference| b.m.alloc(Node::Ref(reference)))
+        .collect();
+    let [mu, mu2, sigma, first, second, rest @ ..] = values.as_slice() else {
+        unreachable!("paired model has five row inputs")
+    };
+    let (mu, mu2, sigma, first, second) = (*mu, *mu2, *sigma, *first, *second);
     let law = b.call("Normal", &[mu, sigma]);
     let first_score = b.call("logdensityof", &[law, first]);
-    let (mean, scale) = conditional(b, [mu, mu2], [sigma, sigma2], correlation, first);
-    let law = b.call("Normal", &[mean, scale]);
+    let law = if let [sigma2, correlation] = rest {
+        let (mean, scale) = conditional(b, [mu, mu2], [sigma, *sigma2], *correlation, first);
+        b.call("Normal", &[mean, scale])
+    } else {
+        b.call("Bernoulli", &[mu2])
+    };
     let second_score = b.call("logdensityof", &[law, second]);
     let score = b.call("add", &[first_score, second_score]);
     let head = b.sym("functionof");
-    let inputs = names
-        .map(|name| b.sym(name))
-        .into_iter()
-        .zip(refs)
-        .collect();
+    let inputs = names.iter().map(|name| b.sym(name)).zip(refs).collect();
     let row_score = b.m.alloc(Node::Call(Call {
         head: CallHead::Builtin(head),
         args: Box::new([score]),
@@ -114,7 +141,7 @@ pub(crate) fn pointwise(b: &mut Builder<'_>) -> NodeId {
         inputs: Some(Inputs::Spec(inputs)),
     }));
     let mut args = vec![row_score];
-    args.extend(names.map(|name| b.self_ref(name)));
+    args.extend(names.into_iter().map(|name| b.self_ref(name)));
     b.call("broadcast", &args)
 }
 

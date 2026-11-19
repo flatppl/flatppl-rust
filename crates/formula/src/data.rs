@@ -810,9 +810,18 @@ fn prepare_data_inner(
                 &rows,
             )?,
         );
-        if let Some(second) = &recipe.paired_response {
-            let second = table.column(second)?;
-            constants.insert(crate::paired::SECOND_DATA.into(), second.data(&rows)?);
+        if recipe.paired_response.is_some() {
+            let second = &recipe.predictors[crate::paired::SECOND_MEAN].formula;
+            constants.insert(
+                crate::paired::SECOND_DATA.into(),
+                response(
+                    recipe.second_family(),
+                    recipe.paired_response_levels.as_deref(),
+                    second,
+                    table,
+                    &rows,
+                )?,
+            );
         }
         if let Some(name) = &recipe.formula.weights {
             let weights = table.column(name)?;
