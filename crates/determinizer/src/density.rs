@@ -3736,6 +3736,25 @@ fn lower_normalize(
         let score = flatppl_core::graph::fold_add(m, &scores);
         return Ok(exponential_tilt::guard(m, score, posterior.valid));
     }
+    if let Some(block) = flatppl_model_analysis::posterior::gaussian_block::normalized(m, node) {
+        let matching_fields = flatppl_core::calling::splat_fields(m, v).is_some_and(|labels| {
+            labels.len() == block.fields.len() && block.fields.iter().all(|f| labels.contains(f))
+        });
+        if !matching_fields {
+            return Err(refuse(
+                v,
+                m,
+                "a Gaussian posterior point must have the prior's fields",
+            ));
+        }
+        let fields: Vec<_> = block
+            .fields
+            .iter()
+            .map(|&field| flatppl_core::calling::project_field(m, v, field))
+            .collect();
+        let point = build_call(m, "vector", &fields);
+        return Ok(block.log_density(m, point));
+    }
     if let Some(law) = exponential_tilt::recognize(m, node) {
         if !atoms.is_empty() && !law.integer {
             let score =

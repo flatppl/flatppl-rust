@@ -1,6 +1,53 @@
 use flatppl_host::{Context, EmitOptions, ModelAnalysis};
 
 #[test]
+fn coupled_gaussian_posterior_uses_one_joint_law() {
+    use flatppl_host::PosteriorSampling::{ExactIid, NotUsed};
+    let source = "
+        a=elementof(reals)
+        b=elementof(reals)
+        K=functionof(joint(y0=Normal(a,1),y1=Normal(a+b,1)),a=a,b=b)
+        P=bayesupdate(likelihoodof(K,record(y0=1.,y1=2.)),
+                      joint(a=Normal(0,1),b=Normal(0,1)))
+        s=external(nonnegintegers)
+        inputs=s
+    ";
+    let mut ctx = Context::default();
+    for (output, sampling) in [
+        ("logdensityof(normalize(P),record(b=0.6,a=0.8))", NotUsed),
+        ("log(totalmass(P))", NotUsed),
+        ("rand(normalize(P),rnginit(s))", ExactIid),
+    ] {
+        let query = ctx
+            .parse(&format!("{source}outputs={output}"), None, None)
+            .unwrap();
+        let report = query.posterior_updates().unwrap();
+        let [law] = report.as_slice() else {
+            panic!("{report:?}")
+        };
+        assert_eq!(law.family.as_deref(), Some("MvNormal"));
+        assert_eq!(law.field, None);
+        assert_eq!(law.sampling, sampling);
+        query
+            .compile(&EmitOptions {
+                restrict_enzyme_compatible: sampling != ExactIid,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let unsupported = source.replace("Normal(a+b,1)", "Normal(a*b,1)");
+    let query = ctx
+        .parse(
+            &(unsupported + "outputs=rand(normalize(P),rnginit(s))"),
+            None,
+            None,
+        )
+        .unwrap();
+    let err = ctx.analyze_query(&query, &[], false, true).err().unwrap();
+    assert_eq!(err.posterior_updates[0].family, None);
+}
+
+#[test]
 fn independent_conjugate_fields_report_exact_draws_in_prior_order() {
     use flatppl_host::PosteriorSampling::ExactIid;
     let source = "
