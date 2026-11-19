@@ -7,6 +7,7 @@
 mod adjacent;
 mod arma;
 mod autoregression;
+mod beta_binomial;
 mod categorical;
 mod contrasts;
 mod data;
