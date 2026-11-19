@@ -54,7 +54,10 @@ pub(crate) fn supported_container(ty: &Type) -> bool {
     match ty {
         Type::Scalar(_) => true,
         Type::Array { elem, .. } => matches!(elem.as_ref(), Type::Scalar(_)),
-        Type::Record(fields) => fields.iter().all(|(_, ty)| supported_container(ty)),
+        Type::Record(fields)
+        | Type::Table {
+            columns: fields, ..
+        } => fields.iter().all(|(_, ty)| supported_container(ty)),
         _ => false,
     }
 }
@@ -322,6 +325,26 @@ impl Domain {
                     .try_fold(1u32, |a, &b| a.checked_mul(b))
                     .filter(|&n| n > 0)
                     .ok_or("coordinate array size is zero or overflows")?;
+                if let [rows] = shape.as_slice()
+                    && let Some(fields) = record_fields(of)
+                {
+                    let row = record_chart(&fields, "row", &[])?;
+                    let map_rows = |expr: &str| format!("broadcast(row -> {expr}, {point})");
+                    return Ok(Chart {
+                        domain: format!("cartpow({}, {rows})", row.domain),
+                        free: format!("cartpow({}, {rows})", row.free),
+                        constrain: map_rows(&row.constrain),
+                        unconstrain: map_rows(&row.unconstrain),
+                        log_det: if row.log_det == "0.0" {
+                            "0.0".into()
+                        } else {
+                            format!("sum({})", map_rows(&row.log_det))
+                        },
+                        size: 0,
+                        free_size: 0,
+                        scalar: false,
+                    });
+                }
                 let dims = shape
                     .iter()
                     .map(u32::to_string)
