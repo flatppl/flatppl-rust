@@ -40,22 +40,30 @@ fn moments(m: &mut Module, plan: &mut UpdatePlan, data: Data, scatter: bool) -> 
     let finite = data.apply(m, "isfinite", &[y]);
     let zero = real(m, 0.);
     let clean = data.apply(m, "ifelse", &[finite, y, zero]);
-    if data.count.is_none() {
+    let Some(count) = data.count else {
         return Moments {
             mean: clean,
             correction: zero,
             rms: zero,
             finite,
         };
-    }
+    };
     let finite = op(m, "lall", &[finite]);
     let finite = plan.summary(m, finite);
     let low = op(m, "minimum", &[clean]);
     let high = op(m, "maximum", &[clean]);
     let origin = interval_origin(m, low, high);
     let offsets = map(m, "sub", &[clean, origin]);
-    let abs = map(m, "abs", &[offsets]);
-    let scale = op(m, "maximum", &[abs]);
+    let scale = if count >= 4096 {
+        // The farthest observation from the origin is one of the extrema.
+        let below = op(m, "sub", &[origin, low]);
+        let above = op(m, "sub", &[high, origin]);
+        op(m, "max", &[below, above])
+    } else {
+        // Short-array mean scores run faster with this reduction on GPU.
+        let abs = map(m, "abs", &[offsets]);
+        op(m, "maximum", &[abs])
+    };
     let positive = op(m, "gt", &[scale, zero]);
     let divisor = safe(m, positive, scale, 1.);
     let z = map(m, "divide", &[offsets, divisor]);
