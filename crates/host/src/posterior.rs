@@ -110,16 +110,14 @@ fn output_nodes(m: &Module, mut visit: impl FnMut(NodeId, Symbol, bool)) {
 /// is called with different arguments. Preserve the instantiated proof for each.
 #[derive(Default)]
 pub(crate) struct PosteriorTrace {
-    sources: Vec<PosteriorUpdate>,
+    sources: Vec<Vec<PosteriorUpdate>>,
     by_node: HashMap<NodeId, usize>,
-    draws: HashMap<NodeId, (usize, PosteriorUpdate)>,
+    draws: HashMap<NodeId, (usize, Vec<PosteriorUpdate>)>,
 }
 
-fn describe(m: &mut Module, node: Option<NodeId>, binding: String) -> PosteriorUpdate {
-    let mut factors = Vec::new();
-    let law =
-        node.and_then(|node| flatppl_determinizer::conjugate_update(m, node, Some(&mut factors)));
-    let mut update = PosteriorUpdate {
+fn describe(m: &mut Module, node: Option<NodeId>, binding: String) -> Vec<PosteriorUpdate> {
+    let product = node.and_then(|node| flatppl_determinizer::conjugate_product(m, node));
+    let update = PosteriorUpdate {
         binding,
         backend: "rust-stablehlo",
         field: None,
@@ -128,20 +126,33 @@ fn describe(m: &mut Module, node: Option<NodeId>, binding: String) -> PosteriorU
         parameters: None,
         sampling: PosteriorSampling::NotUsed,
     };
-    if let Some(law) = law
-        && let Node::Call(distribution) = m.node(law.distribution)
-        && let CallHead::Builtin(family) = distribution.head
-    {
-        update.field = Some(m.resolve(law.field).into());
-        update.family = Some(m.resolve(family).into());
-        update.likelihoods = factors.iter().map(|&f| m.resolve(f).into()).collect();
-        update.parameters = flatppl_stablehlo::Emitter::fixed_distribution_parameters(
-            m,
-            law.valid,
-            &distribution.args,
-        );
-    }
-    update
+    let Some(product) = product else {
+        return vec![update];
+    };
+    product
+        .fields
+        .into_iter()
+        .map(|law| {
+            let mut field = update.clone();
+            if let Node::Call(distribution) = m.node(law.distribution)
+                && let CallHead::Builtin(family) = distribution.head
+            {
+                field.field = Some(m.resolve(law.field).into());
+                field.family = Some(m.resolve(family).into());
+                field.likelihoods = law
+                    .likelihoods
+                    .iter()
+                    .map(|&f| m.resolve(f).into())
+                    .collect();
+                field.parameters = flatppl_stablehlo::Emitter::fixed_distribution_parameters(
+                    m,
+                    law.valid,
+                    &distribution.args,
+                );
+            }
+            field
+        })
+        .collect()
 }
 
 impl flatppl_determinizer::SamplingObserver for PosteriorTrace {
@@ -184,7 +195,7 @@ impl flatppl_determinizer::SamplingObserver for PosteriorTrace {
             let source = m.sample_origin(node).unwrap_or(node);
             let entry = self.by_node.get(&source).copied();
             let name = entry
-                .map(|i| self.sources[i].binding.clone())
+                .map(|i| self.sources[i][0].binding.clone())
                 .unwrap_or_else(|| m.resolve(owner).into());
             let mut actual = describe(&mut scratch, Some(node), name);
             let i = entry.unwrap_or_else(|| {
@@ -193,7 +204,9 @@ impl flatppl_determinizer::SamplingObserver for PosteriorTrace {
                 self.sources.push(actual.clone());
                 index
             });
-            actual.sampling = PosteriorSampling::ExactIid;
+            for update in &mut actual {
+                update.sampling = PosteriorSampling::ExactIid;
+            }
             self.draws.insert(node, (i, actual));
         }
     }
@@ -202,30 +215,31 @@ impl flatppl_determinizer::SamplingObserver for PosteriorTrace {
 impl PosteriorTrace {
     pub(crate) fn finish(mut self, lowered: Option<&Module>) -> Vec<PosteriorUpdate> {
         let Some(m) = lowered else {
-            for update in &mut self.sources {
+            for update in self.sources.iter_mut().flatten() {
                 update.sampling = PosteriorSampling::LoweringRefused;
             }
-            return self.sources;
+            return self.sources.into_iter().flatten().collect();
         };
         let mut selected = vec![Vec::new(); self.sources.len()];
         output_nodes(m, |node, _, _| {
             if let Some(instance) = m.sampled_measure(node)
                 && let Some((i, actual)) = self.draws.remove(&instance)
-                && !selected[i].contains(&actual)
             {
-                selected[i].push(actual);
+                for update in actual {
+                    if !selected[i].contains(&update) {
+                        selected[i].push(update);
+                    }
+                }
             }
         });
         self.sources
             .into_iter()
             .zip(selected)
-            .flat_map(|(source, draws)| {
-                if draws.is_empty() {
-                    vec![source]
-                } else {
-                    draws
-                }
-            })
+            .flat_map(
+                |(source, draws)| {
+                    if draws.is_empty() { source } else { draws }
+                },
+            )
             .collect()
     }
 }

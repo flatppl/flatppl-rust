@@ -438,7 +438,7 @@ fn lower_normalized_weight_sample(
         return Ok(build_sample_term(m, ctor, input, rng, sample_name));
     }
     if let Some(posterior) =
-        flatppl_model_analysis::posterior::normalized_conjugate_posterior(m, measure)
+        flatppl_model_analysis::posterior::normalized_conjugate_product(m, measure)
     {
         return sample_conjugate_posterior(m, posterior, rng, None);
     }
@@ -462,38 +462,42 @@ fn lower_normalized_weight_sample(
 
 fn sample_conjugate_posterior(
     m: &mut Module,
-    posterior: flatppl_model_analysis::posterior::ConjugatePosterior,
-    rng: NodeId,
+    posterior: flatppl_model_analysis::posterior::ConjugateProduct,
+    mut rng: NodeId,
     size: Option<NodeId>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
-    let law = posterior.distribution;
-    let measure = match size {
-        Some(size) => build_call(m, "iid", &[law, size]),
-        None => law,
-    };
-    let (value, next) = lower_closed_measure_sample(m, measure, rng)?;
-    // Both projections refer to the same native draw. Track the primitive so
-    // either the returned value or its successor state can witness this rewrite.
-    if let Some(projection) = expect_builtin_call(m, next, "get0") {
-        m.record_sample_origin(projection.args[0], posterior.update);
+    let mut values = Vec::with_capacity(posterior.fields.len());
+    for field in posterior.fields {
+        let law = field.distribution;
+        let measure = match size {
+            Some(size) => build_call(m, "iid", &[law, size]),
+            None => law,
+        };
+        let (value, next) = lower_closed_measure_sample(m, measure, rng)?;
+        // Either projection of a native draw can witness this rewrite.
+        if let Some(projection) = expect_builtin_call(m, next, "get0") {
+            m.record_sample_origin(projection.args[0], posterior.update);
+        }
+        let mut missing = m.alloc(Node::Lit(Scalar::Real(f64::NAN)));
+        if let Some(dirichlet) = expect_builtin_call(m, law, "Dirichlet") {
+            let alpha = dirichlet.args[0];
+            let width = build_call(m, "lengthof", &[alpha]);
+            missing = build_call(m, "fill", &[missing, width]);
+        }
+        if let Some(size) = size {
+            missing = build_call(m, "fill", &[missing, size]);
+        }
+        let value = build_call(m, "ifelse", &[posterior.valid, value, missing]);
+        values.push((field.field, value));
+        rng = next;
     }
-    let mut missing = m.alloc(Node::Lit(Scalar::Real(f64::NAN)));
-    if let Some(dirichlet) = expect_builtin_call(m, law, "Dirichlet") {
-        let alpha = dirichlet.args[0];
-        let width = build_call(m, "lengthof", &[alpha]);
-        missing = build_call(m, "fill", &[missing, width]);
-    }
-    if let Some(size) = size {
-        missing = build_call(m, "fill", &[missing, size]);
-    }
-    let value = build_call(m, "ifelse", &[posterior.valid, value, missing]);
-    let record = build_record(m, &[(posterior.field, value)]);
+    let record = build_record(m, &values);
     let result = if size.is_some() {
         build_call(m, "table", &[record])
     } else {
         record
     };
-    Ok((result, next))
+    Ok((result, rng))
 }
 
 /// §06 `normalize(superpose(c₁, …, c_k))` with each `cᵢ` a probability measure
@@ -1086,7 +1090,7 @@ fn lower_iid_sample(
         return crate::jointchain::lower_iid_jointchain_sample(m, kernel, n, rng);
     }
     if let Some(posterior) =
-        flatppl_model_analysis::posterior::normalized_conjugate_posterior(m, kernel)
+        flatppl_model_analysis::posterior::normalized_conjugate_product(m, kernel)
     {
         let [_, size] = *expect_builtin_call(m, iid_node, "iid")
             .expect("iid sample")

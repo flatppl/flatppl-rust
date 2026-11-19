@@ -37,7 +37,7 @@ pub use flatppl_model_analysis::{
     sufficient_statistics, sufficient_statistics_with_report,
 };
 
-pub use flatppl_model_analysis::posterior::conjugate_update;
+pub use flatppl_model_analysis::posterior::{conjugate_product, conjugate_update};
 pub use marginal::{exponentially_modified_normal_logpdf, match_conjugate_marginal};
 pub use preparation::{
     prepare_likelihood, prepare_likelihood_with_options, prepare_likelihood_with_report,

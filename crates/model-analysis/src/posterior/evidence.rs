@@ -1,6 +1,8 @@
 //! Shared posterior updates and optional predictive log mass for each conjugate factor.
 
-use super::{Data, MatchedUpdate, Update, UpdatedLaw, match_update, op, real};
+use super::{
+    Data, MatchedUpdate, Update, UpdatedLaw, match_single_update, match_updates, op, real,
+};
 use crate::sufficient_statistics::{self as stats, ProofCache};
 use flatppl_core::graph::{build_record, special_functions_alias};
 use flatppl_core::{Call, CallHead, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol};
@@ -12,17 +14,17 @@ mod gaussian;
 
 /// Log mass of an unnormalized Beta update. An impossible observation has zero mass.
 pub fn beta_log_evidence(m: &mut Module, posterior: NodeId) -> Option<NodeId> {
-    let update = match_update(m, posterior)?;
+    let (_, update) = match_single_update(m, posterior)?;
     if !matches!(update.prior, UpdatedLaw::Beta(..)) {
         return None;
     }
-    log_evidence(m, update)
+    log_evidence(m, &[update])
 }
 
-/// Exact log evidence of a recognized one-field update, relative to the observation measure.
+/// Exact log evidence of independent conjugate fields, relative to the observation measure.
 pub fn conjugate_log_evidence(m: &mut Module, posterior: NodeId) -> Option<NodeId> {
-    let update = match_update(m, posterior)?;
-    log_evidence(m, update)
+    let (_, updates) = match_updates(m, posterior)?;
+    log_evidence(m, &updates)
 }
 
 struct UpdatePlan {
@@ -130,10 +132,20 @@ pub(super) fn apply(
     })
 }
 
-fn log_evidence(m: &mut Module, matched: MatchedUpdate) -> Option<NodeId> {
+fn log_evidence(m: &mut Module, matched: &[MatchedUpdate]) -> Option<NodeId> {
+    let (first, rest) = matched.split_first()?;
     let AppliedUpdate {
-        supported, terms, ..
-    } = apply(m, &matched, true)?;
+        mut supported,
+        mut terms,
+        ..
+    } = apply(m, first, true)?;
+    let mut model_valid = first.model_valid;
+    for field in rest {
+        let applied = apply(m, field, true)?;
+        supported = op(m, "land", &[supported, applied.supported]);
+        model_valid = op(m, "land", &[model_valid, field.model_valid]);
+        terms.extend(applied.terms);
+    }
     let sum = if terms.is_empty() {
         real(m, 0.0)
     } else {
@@ -145,7 +157,7 @@ fn log_evidence(m: &mut Module, matched: MatchedUpdate) -> Option<NodeId> {
     // probability check preserves the source parameter error on invalid models.
     let one = real(m, 1.0);
     let invalid = real(m, 2.0);
-    let p = op(m, "ifelse", &[matched.model_valid, one, invalid]);
+    let p = op(m, "ifelse", &[model_valid, one, invalid]);
     let name = m.intern("p");
     let parameters = build_record(m, &[(name, p)]);
     let name = m.intern("Bernoulli");
