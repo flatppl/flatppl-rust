@@ -11220,6 +11220,20 @@ outputs = lp
 }
 
 #[test]
+fn dynamic_axis_views_have_no_broadcast() {
+    let src = r"
+n = external(posintegers)
+x = external(cartpow(reals, n))
+inputs = x
+outputs = broadcast(y -> y, x)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(!out.contains("stablehlo.dynamic_broadcast_in_dim"), "{out}");
+    assert_eq!(out.matches("stablehlo.transpose").count(), 2, "{out}");
+}
+
+#[test]
 fn dynamic_vector_broadcast_reads_the_input_extent() {
     for expression in [
         "x .+ 1.0",
@@ -11231,8 +11245,14 @@ fn dynamic_vector_broadcast_reads_the_input_extent() {
         );
         let d = determinize_abi_roots(&src, &["inputs", "outputs"]);
         let out = emit_logdensity(&d);
-        assert!(out.contains("stablehlo.get_dimension_size %arg0"), "{out}");
-        assert!(out.contains("stablehlo.dynamic_broadcast_in_dim"), "{out}");
+        assert!(out.contains("stablehlo.get_dimension_size"), "{out}");
+        assert!(
+            out.lines().any(|line| {
+                line.contains("stablehlo.dynamic_broadcast_in_dim")
+                    && line.contains("broadcast_dimensions = array<i64>")
+            }),
+            "{out}"
+        );
         assert!(
             out.lines().all(|line| {
                 !line.contains("tensor<?x")

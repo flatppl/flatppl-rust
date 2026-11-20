@@ -457,16 +457,28 @@ impl Emitter<'_> {
         self.pure_axes(rhs, self.axes_of(v))
     }
 
-    /// A no-copy semantic view; backend canonicalization removes the reshape.
+    /// Give a tensor new logical axes without changing its shape or element order.
     pub(crate) fn axes_view(&mut self, v: &Value, axes: Axes) -> Value {
         if self.axes_of(v) == axes {
             return v.clone();
         }
-        if shape(&v.ty).contains(&None) {
-            let dims = (0..shape(&v.ty).len() as u64).collect::<Vec<_>>();
-            return self
-                .dynamic_broadcast(v, &dims, v.ty.clone(), axes, &[])
-                .expect("identity broadcast has every source extent");
+        let dims = shape(&v.ty);
+        if dims.contains(&None) {
+            // An identity transpose keeps a distinct SSA value and can be
+            // legalized by IREE for unbounded shapes.
+            let permutation = (0..dims.len())
+                .map(|axis| axis.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ty = v.ty.render(self.dtype, v.elem);
+            let ssa = self.pure_axes(
+                format!(
+                    "stablehlo.transpose {}, dims = [{permutation}] : ({ty}) -> {ty}",
+                    v.ssa
+                ),
+                axes,
+            );
+            return Value { ssa, ..v.clone() };
         }
         self.reshape_axes(v, v.ty.clone(), axes)
     }
