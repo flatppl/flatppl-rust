@@ -2906,12 +2906,12 @@ fn broadcast_to(
         return Ok(a.clone());
     }
     match (&a.ty, ty) {
-        (MlirTy::Scalar, _) => Ok(e.broadcast_in_dim(a, &[], ty.clone())),
+        (MlirTy::Scalar, _) => Ok(e.broadcast_in_dim_like(a, &[], target)),
         (MlirTy::Ranked(da), MlirTy::Ranked(db))
             if da.len() == db.len() && da.iter().zip(db).all(|(x, y)| x == y || *x == Some(1)) =>
         {
             let dims: Vec<u64> = (0..da.len() as u64).collect();
-            Ok(e.broadcast_in_dim(a, &dims, ty.clone()))
+            Ok(e.broadcast_in_dim_like(a, &dims, target))
         }
         _ => Err(EmitError::at(
             id,

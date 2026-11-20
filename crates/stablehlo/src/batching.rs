@@ -345,6 +345,10 @@ impl Emitter<'_> {
     }
 
     pub(crate) fn const_lit_like(&mut self, lit: &str, v: &Value) -> Value {
+        if shape(&v.ty).contains(&None) {
+            let scalar = self.const_lit(lit, MlirTy::Scalar);
+            return self.broadcast_in_dim_like(&scalar, &[], v);
+        }
         let ty = v.ty.render(self.dtype, ElemKind::Real);
         let ssa = self.pure_like(format!("stablehlo.constant dense<{lit}> : {ty}"), v);
         Value {
@@ -458,6 +462,12 @@ impl Emitter<'_> {
         if self.axes_of(v) == axes {
             return v.clone();
         }
+        if shape(&v.ty).contains(&None) {
+            let dims = (0..shape(&v.ty).len() as u64).collect::<Vec<_>>();
+            return self
+                .dynamic_broadcast(v, &dims, v.ty.clone(), axes, &[])
+                .expect("identity broadcast has every source extent");
+        }
         self.reshape_axes(v, v.ty.clone(), axes)
     }
 
@@ -490,15 +500,34 @@ impl Emitter<'_> {
     }
 
     pub(crate) fn expand_axes(&mut self, v: &Value, dims: &[u64], ty: MlirTy, axes: Axes) -> Value {
+        self.expand_axes_from(v, dims, ty, axes, &[])
+    }
+
+    pub(super) fn expand_axes_from(
+        &mut self,
+        v: &Value,
+        dims: &[u64],
+        ty: MlirTy,
+        axes: Axes,
+        sources: &[(&Value, &[u64])],
+    ) -> Value {
         if v.ty == ty && dims.iter().copied().eq(0..shape(&ty).len() as u64) {
             return self.axes_view(v, axes);
         }
-        if let Some(value) = self.expand_pointwise(v, dims, &ty, &axes) {
+        let dynamic = shape(&ty).contains(&None);
+        // The static expansion cache cannot distinguish equal type shapes
+        // whose unknown extents come from different runtime values.
+        if !dynamic && let Some(value) = self.expand_pointwise(v, dims, &ty, &axes) {
             return value;
         }
         if let Some(value) = self.map_complex_shape(v, |e, part| {
-            e.expand_axes(part, dims, ty.clone(), axes.clone())
+            e.expand_axes_from(part, dims, ty.clone(), axes.clone(), sources)
         }) {
+            return value;
+        }
+        if dynamic
+            && let Some(value) = self.dynamic_broadcast(v, dims, ty.clone(), axes.clone(), sources)
+        {
             return value;
         }
         let from = v.ty.render(self.dtype, v.elem);
@@ -529,6 +558,100 @@ impl Emitter<'_> {
             Pointwise::Broadcast(v.clone(), dims.to_vec()),
         );
         out
+    }
+
+    /// Expand to a shape witnessed by an existing tensor.
+    pub(crate) fn broadcast_in_dim_like(
+        &mut self,
+        v: &Value,
+        dims: &[u64],
+        target: &Value,
+    ) -> Value {
+        if !shape(&target.ty).contains(&None) {
+            return self.broadcast_in_dim(v, dims, target.ty.clone());
+        }
+        let map = (0..shape(&target.ty).len() as u64).collect::<Vec<_>>();
+        self.expand_axes_from(
+            v,
+            dims,
+            target.ty.clone(),
+            self.axes_of(target),
+            &[(target, &map)],
+        )
+    }
+
+    fn dynamic_broadcast(
+        &mut self,
+        v: &Value,
+        dims: &[u64],
+        ty: MlirTy,
+        axes: Axes,
+        sources: &[(&Value, &[u64])],
+    ) -> Option<Value> {
+        let output = shape(&ty);
+        let mut extents = Vec::with_capacity(output.len());
+        for (axis, extent) in output.iter().enumerate() {
+            let component = if let Some(extent) = extent {
+                self.pure(format!(
+                    "stablehlo.constant dense<{extent}> : tensor<1xi64>"
+                ))
+            } else {
+                let (source, input_axis) =
+                    sources
+                        .iter()
+                        .copied()
+                        .chain([(v, dims)])
+                        .find_map(|(source, map)| {
+                            let input_axis = map.iter().position(|&d| d == axis as u64)?;
+                            shape(&source.ty)[input_axis]
+                                .is_none()
+                                .then_some((source, input_axis))
+                        })?;
+                let source_ty = source.ty.render(self.dtype, source.elem);
+                let scalar = self.pure(format!(
+                    "stablehlo.get_dimension_size {}, dim = {input_axis} : ({source_ty}) -> tensor<i32>",
+                    source.ssa
+                ));
+                let wide = self.pure(format!(
+                    "stablehlo.convert {scalar} : (tensor<i32>) -> tensor<i64>"
+                ));
+                self.pure(format!(
+                    "stablehlo.reshape {wide} : (tensor<i64>) -> tensor<1xi64>"
+                ))
+            };
+            extents.push(component);
+        }
+        let rank = output.len();
+        let shape_ssa = if rank == 1 {
+            extents.pop().unwrap()
+        } else {
+            let arguments = extents.join(", ");
+            let types = vec!["tensor<1xi64>"; rank].join(", ");
+            self.pure(format!(
+                "stablehlo.concatenate {arguments}, dim = 0 : ({types}) -> tensor<{rank}xi64>"
+            ))
+        };
+        let operand_ty = v.ty.render(self.dtype, v.elem);
+        let result_ty = ty.render(self.dtype, v.elem);
+        let attributes = if dims.is_empty() {
+            "array<i64>".to_owned()
+        } else {
+            let map = dims
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("array<i64: {map}>")
+        };
+        let ssa = self.pure_axes(format!(
+            "\"stablehlo.dynamic_broadcast_in_dim\"({}, {shape_ssa}) {{broadcast_dimensions = {attributes}}} : ({operand_ty}, tensor<{rank}xi64>) -> {result_ty}",
+            v.ssa
+        ), axes);
+        Some(Value {
+            ssa,
+            ty,
+            elem: v.elem,
+        })
     }
 
     /// Align batch axes separately from cell axes. Missing batch levels never
@@ -584,8 +707,11 @@ impl Emitter<'_> {
                 .chain((batch..batch + rank - n).map(|i| i as u64))
                 .collect::<Vec<_>>()
         };
-        let a = self.expand_axes(a, &map(aa.batch, ad.len()), ty.clone(), axes.clone());
-        let b = self.expand_axes(b, &map(ba.batch, bd.len()), ty, axes);
+        let a_map = map(aa.batch, ad.len());
+        let b_map = map(ba.batch, bd.len());
+        let sources = [(a, a_map.as_slice()), (b, b_map.as_slice())];
+        let a = self.expand_axes_from(a, &a_map, ty.clone(), axes.clone(), &sources);
+        let b = self.expand_axes_from(b, &b_map, ty, axes, &sources);
         (a, b)
     }
 
@@ -596,6 +722,16 @@ impl Emitter<'_> {
         value: &Value,
         frame: &[Option<u64>],
         parent: usize,
+    ) -> Value {
+        self.finish_broadcast_from(value, frame, parent, &[])
+    }
+
+    pub(super) fn finish_broadcast_from(
+        &mut self,
+        value: &Value,
+        frame: &[Option<u64>],
+        parent: usize,
+        operands: &[Value],
     ) -> Value {
         let mut axes = self.axes_of(value);
         let mut dims = frame.to_vec();
@@ -608,7 +744,16 @@ impl Emitter<'_> {
         if added > 0 {
             axes.layers.insert(0, added);
         }
-        self.expand_axes(value, &map, tensor(dims), axes)
+        let ty = tensor(dims);
+        if !frame.contains(&None) || operands.is_empty() {
+            return self.expand_axes(value, &map, ty, axes);
+        }
+        let frame_map = (0..frame.len() as u64).collect::<Vec<_>>();
+        let sources = operands
+            .iter()
+            .map(|operand| (operand, &frame_map[..self.batch_rank(operand)]))
+            .collect::<Vec<_>>();
+        self.expand_axes_from(value, &map, ty, axes, &sources)
     }
 
     /// Consume exactly the outer collection layer. Captured values retain their
@@ -757,7 +902,7 @@ impl Emitter<'_> {
             .collect::<Vec<_>>();
         let result = build(self, &values).map(|value| {
             let frame = self.broadcast_frame.clone();
-            self.finish_broadcast(&value, &frame, parent.len())
+            self.finish_broadcast_from(&value, &frame, parent.len(), &values)
         });
         for (arg, value) in saved.into_iter().rev() {
             self.memo.insert(arg, value);
