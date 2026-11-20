@@ -1,0 +1,9 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+a = elementof(reals)
+b = 2.0 * a + 1.0
+f = functionof(b, a)
+g(z) = f(z) - 1.0
+x = elementof(reals)
+inputs = (x)
+outputs = logdensityof(Normal(g(0.5), 1.0), x)

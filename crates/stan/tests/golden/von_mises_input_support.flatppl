@@ -1,0 +1,6 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+mu = elementof(reals)
+xobs = elementof(reals)
+inputs = (mu, xobs)
+outputs = logdensityof(VonMises(mu, 2.0), xobs)

@@ -1,0 +1,7 @@
+# emit: target=obs
+flatppl_compat = "0.1"
+mu = elementof(reals)
+sigma = elementof(posreals)
+g = Normal(mu = mu, sigma = sigma)
+t = table(x = [1.27, 0.4])
+obs = likelihoodof(iid(g, 2), t.x)

@@ -1,0 +1,7 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+log_prior(point) = -0.5 * point.b ^ 2
+prior = logweighted(log_prior, Lebesgue(cartprod(b = interval(0.0, 1.0))))
+x = elementof(reals)
+inputs = (x)
+outputs = logdensityof(prior, record(b = x))

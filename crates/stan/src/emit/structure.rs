@@ -62,6 +62,9 @@ pub(super) struct Law {
     /// A user-defined `_lpdf` row (`kind: custom_lpdf`): its overloads take
     /// `vector` variates, not integer arrays.
     pub custom: bool,
+    /// The row's Stan function does not enforce `bounds` (von Mises): a
+    /// variate whose declaration does not state them is tested against them.
+    pub unchecked_support: bool,
 }
 
 impl Law {
@@ -91,7 +94,11 @@ impl Law {
     /// The literal ends of the law's support: its variate bounds, or the
     /// argument its row names as `floor`.
     fn support_ends(&self) -> (Option<String>, Option<String>) {
-        let num = |b: &Option<String>| b.clone().filter(|v| v.parse::<f64>().is_ok());
+        // A literal end: a number, or von Mises's `±pi()`.
+        let num = |b: &Option<String>| {
+            b.clone()
+                .filter(|v| v.parse::<f64>().is_ok() || matches!(v.as_str(), "pi()" | "-pi()"))
+        };
         let floor = match self.floor_arg {
             Some(k) => {
                 let open = self.call.find('(').unwrap_or(self.call.len());
@@ -189,9 +196,23 @@ struct Observation {
     name: String,
 }
 
+/// A likelihood's input signature (§06 "Likelihood construction"), over
+/// every part of a `joint_likelihood`.
+struct Signature {
+    /// Each input name with every binding it sets: a kernel input's value,
+    /// a measure likelihood's free `elementof` of that name.
+    inputs: Vec<(Symbol, Vec<Symbol>)>,
+    /// The `elementof` the parts read outside a kernel boundary and no input
+    /// sets: the module inputs the likelihood closes over.
+    free: Vec<Symbol>,
+}
+
 impl<'m> Emitter<'m> {
     /// Emit the target binding `target`.
     pub(crate) fn emit_target(&mut self, target: Symbol) -> Result<()> {
+        // The ABI target of a declared signature (§13): its `elementof`
+        // leaves must all be listed in `inputs`.
+        self.abi_target = self.name(target) == "outputs" && !self.abi_inputs().is_empty();
         let bid = self.m.alias_target(target).ok_or_else(|| {
             Refusal::new(
                 RefusalKind::NoTarget,
@@ -239,9 +260,75 @@ impl<'m> Emitter<'m> {
                 let [m, x] = c.args[..] else {
                     return Err(Refusal::not_yet(Some(rhs), "logdensityof with this arity"));
                 };
-                self.free_inputs(m)?;
-                let obs = self.measure_observations(m, x)?;
-                self.observe(obs)
+                let mr = self.resolve(m);
+                if matches!(self.head(mr), Some("bayesupdate" | "logweighted")) {
+                    return self.posterior_at_point(mr, x);
+                }
+                if matches!(self.head(mr), Some("likelihoodof" | "joint_likelihood")) {
+                    return self.likelihood_at_point(mr, x);
+                }
+                self.density_term(m, x)
+            }
+            // A sum of log densities is one program: each term adds its
+            // statements to `target` (§06: independent terms add).
+            Some("add" | "sum") if self.reads_log_density(rhs) => {
+                let mut terms = Vec::new();
+                self.density_terms(rhs, &mut terms)?;
+                for &(m, _) in &terms {
+                    let mr = self.resolve(m);
+                    if matches!(self.head(mr), Some("bayesupdate" | "logweighted")) {
+                        return Err(Refusal::not_yet(Some(m), "a sum with a posterior term"));
+                    }
+                }
+                // All terms' inputs first, so term order does not decide a block.
+                let measures: Vec<NodeId> = terms.iter().map(|t| t.0).collect();
+                let points: Vec<NodeId> = terms.iter().map(|t| t.1).collect();
+                self.declare_query_inputs(&measures, &points)?;
+                for (m, x) in terms {
+                    let obs = self.measure_observations(m, x)?;
+                    self.observe(obs)?;
+                }
+                Ok(())
+            }
+            Some("sub") if self.reads_log_density(rhs) => {
+                Err(Refusal::not_yet(Some(rhs), "a difference of log densities"))
+            }
+            Some("tuple") => Err(Refusal::new(
+                RefusalKind::NotADensity,
+                Some(rhs),
+                format!("`{}` of several values", self.name(target)),
+                format!(
+                    "`{}` holds several values; a Stan program has one output, its log density",
+                    self.name(target)
+                ),
+            )),
+            Some("log")
+                if self
+                    .call(rhs)
+                    .and_then(|c| c.args.first())
+                    .is_some_and(|&a| self.head(self.resolve(a)) == Some("densityof")) =>
+            {
+                Err(Refusal::not_yet(
+                    Some(rhs),
+                    "`log(densityof(…))`; write `logdensityof(…)`",
+                ))
+            }
+            // `densityof` and `exp(logdensityof(…))` are densities, not log
+            // densities. Another expression over a density may be a log
+            // density (`log(densityof(a, x)) + …`): not yet supported.
+            Some(h)
+                if !self.reads_any(rhs, &["logdensityof", "densityof"])
+                    || matches!(h, "densityof" | "exp") =>
+            {
+                Err(Refusal::new(
+                    RefusalKind::NotADensity,
+                    Some(rhs),
+                    format!("a `{h}` target"),
+                    format!(
+                        "`{}` is a `{h}`, not a log density; a Stan program's one output is its log density",
+                        self.name(target)
+                    ),
+                ))
             }
             Some(h) => Err(Refusal::not_yet(
                 Some(rhs),
@@ -254,16 +341,335 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// `logdensityof(M, x)` of a measure: the likelihood of M at the point x.
+    /// The free inputs M and the point read are the program's inputs.
+    fn density_term(&mut self, m: NodeId, x: NodeId) -> Result<()> {
+        self.declare_query_inputs(&[m], &[x])?;
+        let obs = self.measure_observations(m, x)?;
+        self.observe(obs)
+    }
+
+    /// The `logdensityof(M, x)` terms of a sum: `a + b`, `sum([a, b, …])`
+    /// of a literal list, through bindings.
+    fn density_terms(&mut self, e: NodeId, out: &mut Vec<(NodeId, NodeId)>) -> Result<()> {
+        let r = self.resolve(e);
+        let c = self.call(r);
+        match (self.head(r), c.map(|c| c.args.to_vec())) {
+            (Some("add"), Some(args)) if args.len() == 2 => {
+                for a in args {
+                    self.density_terms(a, out)?;
+                }
+                Ok(())
+            }
+            (Some("sum"), Some(args)) if args.len() == 1 => {
+                let list = self.resolve(args[0]);
+                match (self.head(list), self.call(list)) {
+                    (Some("vector"), Some(lc)) => {
+                        for &a in lc.args.iter() {
+                            self.density_terms(a, out)?;
+                        }
+                        Ok(())
+                    }
+                    _ => Err(Refusal::not_yet(
+                        Some(r),
+                        "a `sum` of a computed list of log densities",
+                    )),
+                }
+            }
+            (Some("logdensityof"), Some(args)) if args.len() == 2 => {
+                out.push((args[0], args[1]));
+                Ok(())
+            }
+            (h, _) => Err(Refusal::not_yet(
+                Some(r),
+                match h {
+                    Some(h) => format!(
+                        "a term that is not a `logdensityof` (`{h}`) in a sum of log densities"
+                    ),
+                    None => "a term that is not a `logdensityof` in a sum of log densities".into(),
+                },
+            )),
+        }
+    }
+
+    /// `true` when `e` reads a `logdensityof` (through bindings).
+    fn reads_log_density(&self, e: NodeId) -> bool {
+        self.reads_any(e, &["logdensityof"])
+    }
+
+    /// `true` when `e` reads a call to one of `heads` (through bindings).
+    fn reads_any(&self, e: NodeId, heads: &[&str]) -> bool {
+        let mut stack = vec![e];
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if self.head(id).is_some_and(|h| heads.contains(&h)) {
+                return true;
+            }
+            if let Node::Ref(r) = self.m.node(id)
+                && r.ns == RefNs::SelfMod
+                && let Some(b) = self
+                    .m
+                    .binding_by_name(*self.m.alias_chain(r.name).last().unwrap())
+            {
+                stack.push(self.m.binding(b).rhs);
+            }
+            self.m.for_each_child(id, |k| stack.push(k));
+        }
+        false
+    }
+
+    /// The bounds of the field's sets (`declare_from_sets`) that the Stan
+    /// variable `stan` does not carry in its declaration, for the support
+    /// test; `None` when its declaration has another base (`ordered` against
+    /// none). A `positive_ordered` field is base `ordered` with lower bound 0.
+    #[allow(clippy::type_complexity)]
+    fn field_set_residual(
+        &mut self,
+        stan: &str,
+        f: &PriorField,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let Some(t) = self.decls.get(stan).cloned() else {
+            return Ok(None);
+        };
+        let (mut ordered, mut positive) = (false, false);
+        let (mut lowers, mut uppers) = (Vec::new(), Vec::new());
+        for &s in &f.sets {
+            let mut e = self.resolve(s);
+            while self.head(e) == Some("cartpow") {
+                e = self.resolve(self.call(e).unwrap().args[0]);
+            }
+            match (self.head(e), self.m.node(e)) {
+                (Some("ordered"), _) => ordered = true,
+                (Some("interval"), _) => {
+                    let (lo, hi) = self.interval(e)?;
+                    lowers.extend(lo);
+                    uppers.extend(hi);
+                }
+                (_, Node::Const(c)) if matches!(self.name(*c), "posreals" | "nonnegreals") => {
+                    positive = true;
+                }
+                (_, Node::Const(c)) if self.name(*c) == "reals" => {}
+                _ => return Ok(None),
+            }
+        }
+        lowers.dedup();
+        uppers.dedup();
+        if positive {
+            lowers.push("0".to_string());
+            lowers.dedup();
+        }
+        if lowers.len() > 1 || uppers.len() > 1 {
+            return Ok(None);
+        }
+        let input_ordered = matches!(t.base, "ordered" | "positive_ordered");
+        if ordered != input_ordered {
+            return Ok(None);
+        }
+        // A bound the declaration states (or `positive_ordered`'s 0) is carried.
+        let num = |b: Option<&str>| b.and_then(|v| v.parse::<f64>().ok());
+        let carried_lower = if t.base == "positive_ordered" {
+            Some("0")
+        } else {
+            t.bounds.lower.as_deref()
+        };
+        let residual = |want: Option<&String>, have: Option<&str>| match want {
+            Some(w) if num(Some(w)).is_none() || num(Some(w)) != num(have) => Some(w.clone()),
+            _ => None,
+        };
+        Ok(Some((
+            residual(lowers.first(), carried_lower),
+            residual(uppers.first(), t.bounds.upper.as_deref()),
+        )))
+    }
+
+    /// `logdensityof(L, record(k = e, …))` of a likelihood: the likelihood's
+    /// value at the point, each kernel input set from the point (§06: a
+    /// likelihood is a function of the kernel inputs).
+    fn likelihood_at_point(&mut self, lik: NodeId, x: NodeId) -> Result<()> {
+        let point = self.resolve(x);
+        if self.head(point) != Some("record") {
+            return Err(Refusal::not_yet(
+                Some(x),
+                "a likelihood at a point that is not a record",
+            ));
+        }
+        // §06: one point field per input of the likelihood, each binding
+        // every denotation of its name. The `elementof` the parts read
+        // outside a kernel boundary, the point's and the observed values'
+        // are the program's inputs, in one pass.
+        let sig = self.likelihood_signature(lik);
+        self.check_point_keys(point, &sig.inputs)?;
+        let bound = self.point_binding(point, &sig.inputs)?;
+        let mut points = vec![x];
+        self.likelihood_parts(lik, &mut Vec::new(), &mut points);
+        self.declare_inputs(&sig.free, &points)?;
+        let named: Vec<(Symbol, NodeId)> = self
+            .call(point)
+            .unwrap()
+            .named
+            .iter()
+            .map(|na| (na.name, na.value))
+            .collect();
+        for (field, e) in named {
+            let stan = self.point_value(field, e)?;
+            for &(_, sym) in bound.iter().filter(|b| b.0 == field) {
+                self.env.insert(sym, stan.clone());
+            }
+            self.fields.insert(field, stan);
+        }
+        let obs = self.likelihood(lik, false)?;
+        self.observe(obs)
+    }
+
+    /// The Stan text of a point's field value: an input's name, or a local.
+    fn point_value(&mut self, field: Symbol, e: NodeId) -> Result<String> {
+        Ok(match self.self_ref(e) {
+            Some(s) => self.bind(*self.m.alias_chain(s).last().unwrap())?,
+            None => {
+                let ex = self.expr(e)?;
+                if is_identifier(&ex.s) {
+                    ex.s
+                } else {
+                    let base = self.name(field).to_string();
+                    self.place(&base, e, Ok(ex))?
+                }
+            }
+        })
+    }
+
+    /// `logdensityof(post, record(f = e, …))` of a posterior (`bayesupdate`
+    /// or `logweighted`): each prior field takes the point's value, and the
+    /// inputs the point reads are the program's parameters (§06: the density
+    /// of the posterior measure at the point).
+    fn posterior_at_point(&mut self, post: NodeId, x: NodeId) -> Result<()> {
+        let (lik, prior) = match self.head(post) {
+            Some("bayesupdate") => {
+                let c = self.call(post).unwrap();
+                (Some(c.args[0]), c.args[1])
+            }
+            _ => (None, post),
+        };
+        let point = self.resolve(x);
+        if self.head(point) != Some("record") {
+            return Err(Refusal::not_yet(
+                Some(x),
+                "a posterior at a point that is not a record",
+            ));
+        }
+        let fields = self.prior_fields(prior)?;
+        // The prior's inputs, the likelihood's outside its kernel boundaries,
+        // the point's and the observed values': in one pass. A prior field
+        // declared by `elementof` takes the point's value, not a declaration.
+        let denotes: Vec<(Symbol, Vec<Symbol>)> = fields
+            .iter()
+            .filter_map(|f| {
+                let b = f.binding?;
+                let rhs = self.m.binding(self.m.binding_by_name(b)?).rhs;
+                (self.head(rhs) == Some("elementof")).then(|| (f.field, vec![b]))
+            })
+            .collect();
+        let bound = self.point_binding(point, &denotes)?;
+        let mut params = self.free_input_syms(prior);
+        let mut points = vec![x];
+        if let Some(l) = lik {
+            params.extend(self.likelihood_signature(l).free);
+            self.likelihood_parts(l, &mut Vec::new(), &mut points);
+        }
+        params.retain(|s| !bound.iter().any(|b| b.1 == *s));
+        self.declare_inputs(&params, &points)?;
+        for f in &fields {
+            let e = self.obs_field(x, f.field)?;
+            let stan = self.point_value(f.field, e)?;
+            for &(_, sym) in bound.iter().filter(|b| b.0 == f.field) {
+                self.env.insert(sym, stan.clone());
+            }
+            // A declared set (`ordered`, an interval) restricts a parameter
+            // through its declaration: a point carries it as an input declared
+            // on the same base, and the support test checks any bound that
+            // declaration does not state.
+            if !f.sets.is_empty() {
+                let Some(residual) = self.field_set_residual(&stan, f)? else {
+                    return Err(Refusal::not_yet(
+                        Some(f.node),
+                        format!(
+                            "the prior field `{}` with a declared set at a point that is not an input on that set",
+                            self.name(f.field)
+                        ),
+                    ));
+                };
+                if residual.0.is_some() || residual.1.is_some() {
+                    self.point_guards.insert(f.field, residual);
+                }
+                self.set_declared.insert(stan.clone());
+            }
+            if let Some(b) = f.binding {
+                self.env.insert(b, stan.clone());
+            }
+            self.fields.insert(f.field, stan);
+        }
+        for (name, sym) in std::mem::take(&mut self.links) {
+            if let Some(stan) = self.fields.get(&name).cloned() {
+                self.env.insert(sym, stan);
+            }
+        }
+        let obs = match lik {
+            Some(l) => Some(self.likelihood(l, true)?),
+            None => None,
+        };
+        self.point_fields = fields.iter().map(|f| f.field).collect();
+        self.prior_statements(&fields)?;
+        match obs {
+            Some(o) => self.observe(o),
+            None => Ok(()),
+        }
+    }
+
     // ---------------------------------------------------------------- prior
 
     /// The prior's `~` lines, then one `target +=` per log weight.
     fn prior_statements(&mut self, fields: &[PriorField]) -> Result<()> {
         for f in fields {
-            if let Some(law) = f.law {
-                let lhs = self.fields[&f.field].clone();
-                let lines = self.tilde(&lhs, law)?;
-                self.prior.extend(lines);
+            let lhs = self.fields[&f.field].clone();
+            self.relies_on_bounds = false;
+            let mut lines = match f.law {
+                Some(law) => self.tilde(&lhs, law)?,
+                None => vec![],
+            };
+            let relies_on_bounds = std::mem::take(&mut self.relies_on_bounds);
+            // A field set from a point is tested against its support only where
+            // the line alone gives a finite value outside it: a declared set's
+            // bounds its input does not state, a truncation printed without
+            // `T[]` (the render reports it), or a field with no statement
+            // (`tilde` itself guards an `unchecked_support` law).
+            if self.point_fields.contains(&f.field) {
+                let bounds = match (self.point_guards.get(&f.field).cloned(), f.law) {
+                    (Some(b), _) => Some(b),
+                    (None, Some(law)) if lines.is_empty() || relies_on_bounds => {
+                        self.support(law)?
+                    }
+                    (None, Some(_)) => None,
+                    (None, None) => self.interval(self.resolve(f.node)).ok(),
+                };
+                if let Some((lo, hi)) = bounds
+                    && (lo.is_some() || hi.is_some())
+                {
+                    let Some(g) = self.guarded(&lhs, lo.as_deref(), hi.as_deref(), lines.clone())
+                    else {
+                        return Err(Refusal::not_yet(
+                            Some(f.node),
+                            format!(
+                                "the restricted prior field `{}` at a point",
+                                self.name(f.field)
+                            ),
+                        ));
+                    };
+                    lines = vec![g];
+                }
             }
+            self.prior.extend(lines);
         }
         self.emit_weights()
     }
@@ -542,6 +948,12 @@ impl<'m> Emitter<'m> {
     }
 
     fn kernel(&mut self, k: NodeId, obs: NodeId, has_prior: bool) -> Result<Vec<Observation>> {
+        // `likelihoodof(M, obs)` of a measure: M's free inputs are its kernel
+        // inputs (as for `logdensityof(M, x)`).
+        if !has_prior && matches!(self.m.type_of(k), Some(Type::Measure { .. })) {
+            self.free_inputs(k)?;
+            return self.measure_observations(k, obs);
+        }
         let c = self
             .call(k)
             .ok_or_else(|| Refusal::not_yet(Some(k), "this kernel"))?;
@@ -651,14 +1063,35 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    /// Declare each `elementof` binding `m` reads as a flat parameter, in
-    /// module order.
-    fn free_inputs(&mut self, m: NodeId) -> Result<()> {
+    /// The `elementof` bindings `m` reads, in module order.
+    fn free_input_syms(&self, m: NodeId) -> Vec<Symbol> {
+        self.free_input_syms_cut(m, &HashSet::new())
+    }
+
+    /// The `elementof` bindings `m` reads other than through a binding in
+    /// `cut` (a kernel input's value), in module order.
+    fn free_input_syms_cut(&self, m: NodeId, cut: &HashSet<Symbol>) -> Vec<Symbol> {
+        let found = self.reached(m, cut);
+        self.m
+            .bindings()
+            .map(|(_, b)| b)
+            .filter(|b| found.contains(&b.name) && self.head(b.rhs) == Some("elementof"))
+            .map(|b| b.name)
+            .collect()
+    }
+
+    /// The bindings (alias ends) `m` reads, through bindings, up to an
+    /// `elementof` and not through a binding in `cut`. A reification
+    /// (`functionof`, `kernelof`, their `fn` and named-function forms) is a
+    /// boundary: its body does not read its own inputs, a call sets them.
+    fn reached(&self, m: NodeId, cut: &HashSet<Symbol>) -> HashSet<Symbol> {
         let mut found = HashSet::new();
-        let mut stack = vec![m];
+        // Each node is walked once per boundary context.
+        let mut cuts = vec![cut.clone()];
+        let mut stack = vec![(m, 0usize)];
         let mut seen = HashSet::new();
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
+        while let Some((id, at)) = stack.pop() {
+            if !seen.insert((id, at)) {
                 continue;
             }
             if let Node::Ref(r) = self.m.node(id)
@@ -667,50 +1100,315 @@ impl<'m> Emitter<'m> {
                     .m
                     .binding_by_name(*self.m.alias_chain(r.name).last().unwrap())
             {
-                let rhs = self.m.binding(b).rhs;
-                if self.head(rhs) == Some("elementof") {
-                    found.insert(self.m.binding(b).name);
+                let name = self.m.binding(b).name;
+                if cuts[at].contains(&name) {
                     continue;
                 }
-                stack.push(rhs);
+                found.insert(name);
+                let rhs = self.m.binding(b).rhs;
+                if self.head(rhs) == Some("elementof") {
+                    continue;
+                }
+                stack.push((rhs, at));
             }
-            self.m.for_each_child(id, |k| stack.push(k));
+            let inputs = match self.m.node(id) {
+                Node::Call(c) => match &c.inputs {
+                    Some(Inputs::Spec(list)) => Some(&list[..]),
+                    Some(Inputs::Auto) => self.m.auto_inputs_of(id),
+                    None => None,
+                },
+                _ => None,
+            };
+            let mut inner = at;
+            if let Some(list) = inputs {
+                let mut c = cuts[at].clone();
+                c.extend(
+                    list.iter()
+                        .filter(|(_, r)| r.ns == RefNs::SelfMod)
+                        .map(|(_, r)| *self.m.alias_chain(r.name).last().unwrap()),
+                );
+                inner = match cuts.iter().position(|k| *k == c) {
+                    Some(i) => i,
+                    None => {
+                        cuts.push(c);
+                        cuts.len() - 1
+                    }
+                };
+            }
+            self.m.for_each_child(id, |k| stack.push((k, inner)));
         }
-        let order: Vec<Symbol> = self
-            .m
-            .bindings()
-            .map(|(_, b)| b.name)
-            .filter(|n| found.contains(n))
-            .collect();
-        for sym in order {
-            let rhs = self.m.binding(self.m.binding_by_name(sym).unwrap()).rhs;
-            let stan = self.fresh(self.name(sym));
-            let vs = self.m.valueset_of(rhs).cloned();
-            let hints = self.set_hints(self.call(rhs).unwrap().args[0]);
-            // Stan has no integer parameters: an integer or boolean input is
-            // data, supplied with the query point.
-            if self.m.type_of(rhs).is_some_and(ty_is_int) {
-                let t = self.declare_data(rhs, vs.as_ref(), true, &stan, &hints)?;
-                self.data.push(format!("{};", t.render(&stan)));
-                self.record_decl(&stan, t);
-                self.env.insert(sym, stan);
-                continue;
-            }
-            let t = self.declare(rhs, vs.as_ref(), true, &stan, &hints)?;
-            self.params.push(format!("{};", t.render(&stan)));
-            self.record_decl(&stan, t);
-            self.env.insert(sym, stan.clone());
-            // A free input is a scoring input, as a kernel input is.
-            self.fields.insert(sym, stan.clone());
-            self.manifest_bindings.push(Some(sym));
-            self.manifest.push(ManifestParam {
-                stan,
-                field: self.name(sym).to_string(),
-                input: None,
-                index: None,
-            });
+        found
+    }
+
+    /// Declare each `elementof` binding `m` reads as a flat parameter, in
+    /// module order.
+    fn free_inputs(&mut self, m: NodeId) -> Result<()> {
+        for sym in self.free_input_syms(m) {
+            self.declare_free_input(sym, false)?;
         }
         Ok(())
+    }
+
+    /// Declare the `elementof` binding `sym` once: data when it is integer or
+    /// boolean (Stan has no integer parameters) or when `as_data`, else a
+    /// flat parameter, a scoring input as a kernel input is.
+    fn declare_free_input(&mut self, sym: Symbol, as_data: bool) -> Result<()> {
+        if self.env.contains_key(&sym) {
+            return Ok(());
+        }
+        let rhs = self.m.binding(self.m.binding_by_name(sym).unwrap()).rhs;
+        // §13 "Signature": `inputs` lists every `elementof` an output reaches.
+        if self.abi_target && !self.abi_syms().contains(&sym) {
+            let name = self.name(sym).to_string();
+            return Err(Refusal::new(
+                RefusalKind::IllFormedModule,
+                Some(rhs),
+                format!("`{name}` outside `inputs`"),
+                format!(
+                    "`outputs` reads the `elementof` `{name}`, which `inputs` does not list; \
+                     the module's signature is ill-formed (§13)"
+                ),
+            ));
+        }
+        let stan = self.fresh(self.name(sym));
+        let vs = self.m.valueset_of(rhs).cloned();
+        let hints = self.set_hints(self.call(rhs).unwrap().args[0]);
+        if as_data || self.m.type_of(rhs).is_some_and(ty_is_int) {
+            let t = self.declare_data(rhs, vs.as_ref(), true, &stan, &hints)?;
+            self.data.push(format!("{};", t.render(&stan)));
+            self.record_decl(&stan, t);
+            self.env.insert(sym, stan);
+            return Ok(());
+        }
+        let t = self.declare(rhs, vs.as_ref(), true, &stan, &hints)?;
+        self.params.push(format!("{};", t.render(&stan)));
+        self.record_decl(&stan, t);
+        self.env.insert(sym, stan.clone());
+        self.fields.insert(sym, stan.clone());
+        self.manifest_bindings.push(Some(sym));
+        self.manifest.push(ManifestParam {
+            stan,
+            field: self.name(sym).to_string(),
+            input: None,
+            index: None,
+        });
+        Ok(())
+    }
+
+    /// The alias ends of the module inputs (`inputs = (…)`).
+    fn abi_syms(&self) -> HashSet<Symbol> {
+        self.abi_inputs()
+            .into_iter()
+            .map(|w| *self.m.alias_chain(w).last().unwrap())
+            .collect()
+    }
+
+    /// The inputs of a density query, declared in one order-free pass: an
+    /// `elementof` any measure reads is a parameter; one only points read is
+    /// data, or a parameter when the query declares `inputs`.
+    fn declare_query_inputs(&mut self, measures: &[NodeId], points: &[NodeId]) -> Result<()> {
+        let params: Vec<Symbol> = measures
+            .iter()
+            .flat_map(|&m| self.free_input_syms(m))
+            .collect();
+        self.declare_inputs(&params, points)
+    }
+
+    /// Declare `params` as parameters, then each `elementof` the points read
+    /// (data without `inputs`). A point that restates an input it sets
+    /// (`record(mu = mu)`) declares it.
+    fn declare_inputs(&mut self, params: &[Symbol], points: &[NodeId]) -> Result<()> {
+        let as_data = self.abi_inputs().is_empty();
+        for &sym in params {
+            self.declare_free_input(sym, false)?;
+        }
+        for &x in points {
+            for sym in self.free_input_syms(x) {
+                self.declare_free_input(sym, as_data)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The measures and the observed values of a likelihood.
+    fn likelihood_parts(&self, l: NodeId, measures: &mut Vec<NodeId>, obs: &mut Vec<NodeId>) {
+        let l = self.resolve(l);
+        let c = self.call(l);
+        match (self.head(l), c) {
+            (Some("joint_likelihood"), Some(c)) => {
+                for &a in c.args.iter() {
+                    self.likelihood_parts(a, measures, obs);
+                }
+            }
+            (Some("likelihoodof"), Some(c)) if c.args.len() == 2 => {
+                measures.push(c.args[0]);
+                obs.push(c.args[1]);
+            }
+            _ => measures.push(l),
+        }
+    }
+
+    /// The input signature of a likelihood, over every part of a
+    /// `joint_likelihood`: a kernel's inputs denote their value bindings and
+    /// cut what lies behind them; a measure's free `elementof` are its inputs.
+    fn likelihood_signature(&self, lik: NodeId) -> Signature {
+        let mut measures = Vec::new();
+        self.likelihood_parts(lik, &mut measures, &mut Vec::new());
+        let mut inputs: Vec<(Symbol, Vec<Symbol>)> = Vec::new();
+        let mut add = |name: Symbol, sym: Option<Symbol>| {
+            let at = match inputs.iter().position(|(n, _)| *n == name) {
+                Some(i) => i,
+                None => {
+                    inputs.push((name, vec![]));
+                    inputs.len() - 1
+                }
+            };
+            if let Some(s) = sym
+                && !inputs[at].1.contains(&s)
+            {
+                inputs[at].1.push(s);
+            }
+        };
+        let mut free: Vec<Symbol> = Vec::new();
+        for m in measures {
+            let r = self.resolve(m);
+            let Some(c) = self.call(r) else { continue };
+            let list = match &c.inputs {
+                Some(Inputs::Spec(list)) => &list[..],
+                Some(Inputs::Auto) => self.m.auto_inputs_of(r).unwrap_or(&[]),
+                None => {
+                    if matches!(self.m.type_of(r), Some(Type::Measure { .. })) {
+                        for s in self.free_input_syms(r) {
+                            add(s, Some(s));
+                        }
+                    }
+                    continue;
+                }
+            };
+            let mut cut = HashSet::new();
+            for (name, v) in list.iter() {
+                let sym =
+                    (v.ns == RefNs::SelfMod).then(|| *self.m.alias_chain(v.name).last().unwrap());
+                cut.extend(sym);
+                add(*name, sym);
+            }
+            for &a in c.args.iter() {
+                for s in self.free_input_syms_cut(a, &cut) {
+                    if !free.contains(&s) {
+                        free.push(s);
+                    }
+                }
+            }
+        }
+        free.retain(|s| !inputs.iter().any(|(_, d)| d.contains(s)));
+        Signature { inputs, free }
+    }
+
+    /// §06: a likelihood's point has one field per input, by name.
+    fn check_point_keys(&self, point: NodeId, inputs: &[(Symbol, Vec<Symbol>)]) -> Result<()> {
+        let keys: Vec<Symbol> = self
+            .call(point)
+            .unwrap()
+            .named
+            .iter()
+            .map(|na| na.name)
+            .collect();
+        let names = inputs
+            .iter()
+            .map(|(n, _)| format!("`{}`", self.name(*n)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ill = |short: String, long: String| {
+            Err(Refusal::new(
+                RefusalKind::IllFormedModule,
+                Some(point),
+                short,
+                long,
+            ))
+        };
+        if let Some(&k) = keys.iter().find(|k| !inputs.iter().any(|(n, _)| n == *k)) {
+            let k = self.name(k);
+            return ill(
+                format!("point field `{k}` is not a likelihood input"),
+                format!(
+                    "the point sets `{k}`, which is not an input of the likelihood (inputs: {names}); \
+                     §06 gives a likelihood point one field per input"
+                ),
+            );
+        }
+        if let Some((n, _)) = inputs.iter().find(|(n, _)| !keys.contains(n)) {
+            let n = self.name(*n);
+            return ill(
+                format!("point lacks the likelihood input `{n}`"),
+                format!(
+                    "the point does not set the likelihood input `{n}` (inputs: {names}); \
+                     §06 gives a likelihood point one field per input"
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// The bindings a record point sets, each key binding every denotation of
+    /// its name. A point value may read a binding the point sets only where
+    /// it restates it (`record(mu = mu)`): otherwise one Stan name would
+    /// carry two values.
+    fn point_binding(
+        &self,
+        point: NodeId,
+        denotes: &[(Symbol, Vec<Symbol>)],
+    ) -> Result<Vec<(Symbol, Symbol)>> {
+        let named: Vec<(Symbol, NodeId)> = self
+            .call(point)
+            .unwrap()
+            .named
+            .iter()
+            .map(|na| (na.name, na.value))
+            .collect();
+        let mut out: Vec<(Symbol, Symbol)> = Vec::new();
+        for &(key, _) in &named {
+            for (_, ds) in denotes.iter().filter(|(n, _)| *n == key) {
+                for &d in ds {
+                    if let Some(&(other, _)) = out.iter().find(|b| b.1 == d) {
+                        return Err(Refusal::not_yet(
+                            Some(point),
+                            format!(
+                                "`{}` set by both `{}` and `{}`",
+                                self.name(d),
+                                self.name(other),
+                                self.name(key)
+                            ),
+                        ));
+                    }
+                    out.push((key, d));
+                }
+            }
+        }
+        for &(key, e) in &named {
+            let reads = self.reached(e, &HashSet::new());
+            let restated = self
+                .self_ref(e)
+                .map(|s| *self.m.alias_chain(s).last().unwrap());
+            for &(k, d) in &out {
+                if !reads.contains(&d) || (k == key && restated == Some(d)) {
+                    continue;
+                }
+                let whose = if k == key {
+                    "the input it sets".to_string()
+                } else {
+                    format!("the input `{}` sets", self.name(k))
+                };
+                return Err(Refusal::not_yet(
+                    Some(e),
+                    format!(
+                        "the point value of `{}` reads `{}`, {whose}",
+                        self.name(key),
+                        self.name(d)
+                    ),
+                ));
+            }
+        }
+        Ok(out)
     }
 
     /// The observations of data `x` under the measure `m`: one per field of a
@@ -886,6 +1584,11 @@ impl<'m> Emitter<'m> {
             return None;
         }
         let t = self.decls.get(data)?.clone();
+        // A vector bound (one end per component) is compared elementwise.
+        let vector = |b: Option<&str>| b.is_some_and(|b| b.starts_with('['));
+        if (vector(lo) || vector(hi)) && t.array.len() + t.dims.len() != 1 {
+            return None;
+        }
         let test = |v: &str, whole: bool| -> String {
             let (small, big) = if whole {
                 (format!("min({v})"), format!("max({v})"))
@@ -894,10 +1597,18 @@ impl<'m> Emitter<'m> {
             };
             let mut parts = Vec::new();
             if let Some(l) = lo {
-                parts.push(format!("{small} < {l}"));
+                parts.push(if vector(lo) {
+                    format!("min({v} - {l}) < 0")
+                } else {
+                    format!("{small} < {l}")
+                });
             }
             if let Some(h) = hi {
-                parts.push(format!("{big} > {h}"));
+                parts.push(if vector(hi) {
+                    format!("max({v} - {h}) > 0")
+                } else {
+                    format!("{big} > {h}")
+                });
             }
             parts.join(" || ")
         };
@@ -1039,12 +1750,11 @@ impl<'m> Emitter<'m> {
                             return Err(Refusal::not_yet(Some(m), "a joint of vector laws"));
                         }
                         self.declared_variate(lhs, &law, m)?;
-                        out.push(law.statement(
-                            m,
-                            &law.lhs(&format!("{lhs}[{}]", k + 1)),
-                            &law.call_text(None),
-                        )?);
-                        out.extend(law.extra);
+                        let y = format!("{lhs}[{}]", k + 1);
+                        let mut lines =
+                            vec![law.statement(m, &law.lhs(&y), &law.call_text(None))?];
+                        lines.extend(law.extra.iter().cloned());
+                        out.extend(self.unchecked_guard(&y, false, &law, lines));
                     }
                     return Ok(out);
                 }
@@ -1080,6 +1790,7 @@ impl<'m> Emitter<'m> {
             self.used.remove(&i);
             let mut out = vec![stmt];
             out.extend(law.extra.iter().cloned());
+            let out = self.unchecked_guard(lhs, lhs_rank > 0, &law, out);
             return Ok(self.support_guarded(lhs, &law, out));
         }
         let (target, rhs) = match (flat, &law.flat_call) {
@@ -1129,7 +1840,45 @@ impl<'m> Emitter<'m> {
         };
         let mut out = vec![law.statement(m, &law.lhs(&target), &rhs)?];
         out.extend(law.extra.iter().cloned());
+        let out = self.unchecked_guard(lhs, lhs_rank > 0, &law, out);
         Ok(self.support_guarded(lhs, &law, out))
+    }
+
+    /// `lines` behind a test of `expr` against the law's bounds, for a row
+    /// whose Stan function does not enforce them (`unchecked_support`, von
+    /// Mises): outside them the density is zero. A variate whose declaration
+    /// states the bounds needs no test.
+    pub(super) fn unchecked_guard(
+        &self,
+        expr: &str,
+        array: bool,
+        law: &Law,
+        lines: Vec<String>,
+    ) -> Vec<String> {
+        // A two-sided `T[L, U]`, its ends clamped into the support, already
+        // gives -inf outside it.
+        if !law.unchecked_support || matches!(law.trunc, Some((Some(_), Some(_)))) {
+            return lines;
+        }
+        let (lo, hi) = &law.bounds;
+        if self
+            .decls
+            .get(expr)
+            .is_some_and(|t| &t.bounds.lower == lo && &t.bounds.upper == hi)
+        {
+            return lines;
+        }
+        let Some(test) = Self::outside_test(expr, array, lo.as_deref(), hi.as_deref()) else {
+            return lines;
+        };
+        let body: String = lines
+            .iter()
+            .flat_map(|l| l.lines())
+            .map(|l| format!("  {l}\n"))
+            .collect();
+        vec![format!(
+            "if ({test}) {{\n  target += negative_infinity();\n}} else {{\n{body}}}"
+        )]
     }
 
     /// `T[lo, hi]` on data reaching outside the law's support: Stan's `_lpdf`
@@ -1203,10 +1952,13 @@ impl<'m> Emitter<'m> {
             }
         }
         let base = base.split('[').next().unwrap_or(base);
-        if law.discrete && self.is_data(base) && self.decls.get(base).is_some_and(|t| !t.is_int()) {
+        if law.discrete && self.decls.get(base).is_some_and(|t| !t.is_int()) {
+            // A real scoring input is a parameter, and Stan has no integer
+            // parameters to cast it to.
+            let what = if self.is_data(base) { "data" } else { "input" };
             return Err(Refusal::not_yet(
                 Some(at),
-                format!("real-typed data under the discrete law `{}`", law.flatppl),
+                format!("real-typed {what} under the discrete law `{}`", law.flatppl),
             ));
         }
         Ok(())
@@ -1850,8 +2602,26 @@ impl<'m> Emitter<'m> {
                     None => Ok(None),
                 }
             }
-            _ => Ok(None),
+            _ => Ok(self.unchecked_bounds(m)),
         }
+    }
+
+    /// The variate bounds of a law whose Stan function does not enforce them
+    /// (`unchecked_support` rows: von Mises), for `D(…)` and `D.(…)`.
+    fn unchecked_bounds(&self, m: NodeId) -> Option<(Option<String>, Option<String>)> {
+        let head = match self.head(m)? {
+            "iid" => return self.unchecked_bounds(self.resolve(self.call(m)?.args[0])),
+            "broadcast" => match self.m.node(self.call(m)?.args[0]) {
+                Node::Const(f) => self.name(*f).to_string(),
+                _ => return None,
+            },
+            h => h.to_string(),
+        };
+        let rows = tables::law_rows_by_head(&head, None);
+        if rows.is_empty() || !rows.iter().all(|r| r.unchecked_support) {
+            return None;
+        }
+        Some(variate_bounds(&rows[0].variate))
     }
 
     /// The variate bounds of a standard-module law's row (`Argus`:
@@ -2756,6 +3526,7 @@ impl<'m> Emitter<'m> {
             stan_name: row.stan.clone(),
             flatppl: row.flatppl.clone(),
             custom: row.kind == "custom_lpdf",
+            unchecked_support: row.unchecked_support,
         })
     }
 
@@ -2947,7 +3718,15 @@ pub(super) fn is_identifier(s: &str) -> bool {
 /// (`int<lower=0, upper=1>`).
 /// The larger (or smaller) of two ends, folded when both are literals.
 fn pick(x: &str, b: &str, larger: bool, discrete: bool) -> String {
-    match (x.parse::<f64>(), b.parse::<f64>()) {
+    // A literal value: a number, or von Mises's `±pi()`.
+    let lit = |s: &str| -> std::result::Result<f64, ()> {
+        match s {
+            "pi()" => Ok(std::f64::consts::PI),
+            "-pi()" => Ok(-std::f64::consts::PI),
+            _ => s.parse::<f64>().map_err(|_| ()),
+        }
+    };
+    match (lit(x), lit(b)) {
         // A tie keeps the end as written, or the integer literal for a
         // discrete law (`0`, not `0.0`, reaches an integer CDF argument).
         (Ok(xv), Ok(bv)) if xv == bv => {

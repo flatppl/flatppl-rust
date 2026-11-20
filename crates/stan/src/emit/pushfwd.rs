@@ -366,7 +366,8 @@ impl<'m> Emitter<'m> {
         // An unnormalized base prints `target += …_lpdf(…)` (`Law::statement`).
         let mut out = vec![law.statement(m, &y, &law.call_text(None))?];
         out.extend(map.jacobian());
-        Ok(out)
+        // An `unchecked_support` base (von Mises): its preimage is tested.
+        Ok(self.unchecked_guard(&y, false, &law, out))
     }
 
     /// M's support mapped through f: the bounds of a `pushfwd` parameter.

@@ -1,0 +1,10 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+s ~ normalize(truncate(Gamma(2.0, 1.0), interval(0.5, 4.0)))
+v ~ VonMises(0.0, 2.0)
+y ~ Normal(s + v, 1.0)
+L = likelihoodof(kernelof(record(y = y), s = s, v = v), record(y = 1.2))
+post = bayesupdate(L, lawof(record(s = s, v = v)))
+theta = elementof(cartpow(reals, 2))
+inputs = theta
+outputs = logdensityof(post, record(s = theta[1], v = theta[2]))

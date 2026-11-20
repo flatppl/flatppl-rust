@@ -1,0 +1,8 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+a = elementof(reals)
+b = elementof(posreals)
+x = elementof(reals)
+k = elementof(integers)
+inputs = (a, b, x, k)
+outputs = logdensityof(Normal(a, b), x) + sum([logdensityof(Poisson(b), k), logdensityof(Exponential(b), 2.0)])

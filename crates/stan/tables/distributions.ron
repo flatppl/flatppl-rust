@@ -32,6 +32,10 @@
 //               the parameters set (binomial: {y} > {n}). Stan's lpmf throws there, where the
 //               FlatPPL density is 0, so the component's lp is negative_infinity(). For an
 //               array variate the emitter tests max({y}). "" when the support is fixed.
+//   unchecked_support: optional; the Stan function does not enforce the `variate` bounds
+//               (it returns a finite value outside them): a variate declared without them is
+//               tested against them, -inf outside. A BridgeStan probe outside the bounds of every
+//               bounded row found von_mises only; the others throw or return -inf.
 //   functions:  Stan functions-block source the row needs ("" if none).
 //   status:     "verified" (verify.py PASS, Stan 2.40.0) | "unverified: <reason>" | "n/a".
 //   note:       caveats for the emitter.
@@ -122,8 +126,8 @@ real flatppl_generalized_normal_lpdf(vector x, real mu, real alpha, real beta) {
     (id: "von_mises", flatppl: "VonMises", module: None, params: ["mu", "kappa"],
      pattern: "VonMises(mu, kappa)", vars: ["mu", "kappa"], kind: "builtin",
      stan: "von_mises", suffix: "lpdf", lhs: "{y}", args: "{mu}, {kappa}", variate: "real<lower=-pi(), upper=pi()>",
-     sizes: [], vectorized: true, lcdf: true, normalized: true, guard: "", functions: "", status: "verified",
-     note: "Stan does not restrict y; the declaration must carry the (-pi, pi) bounds."),
+     sizes: [], vectorized: true, lcdf: true, normalized: true, guard: "", unchecked_support: true, functions: "", status: "verified",
+     note: "Stan does not restrict y; a variate declared without the (-pi, pi) bounds is tested against them."),
     (id: "laplace", flatppl: "Laplace", module: None, params: ["location", "scale"],
      pattern: "Laplace(location, scale)", vars: ["location", "scale"], kind: "builtin",
      stan: "double_exponential", suffix: "lpdf", lhs: "{y}", args: "{location}, {scale}", variate: "real",

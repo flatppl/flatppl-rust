@@ -1,0 +1,6 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+z = elementof(complexes)
+y = elementof(reals)
+inputs = (z, y)
+outputs = logdensityof(Normal(real(z) + 3 * imag(z), 1), y)
