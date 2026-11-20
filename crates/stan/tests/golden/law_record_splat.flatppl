@@ -1,0 +1,9 @@
+# emit: target=post
+flatppl_compat = "0.1"
+y_data = [1.8, 2.3, 1.1]
+shape_rate(mu, sd) = record(shape = mu^2 / sd^2, rate = mu / sd^2)
+mu ~ Normal(record(mu = 0.0, sigma = 5.0))
+sigma ~ Gamma(shape_rate(2.0, 1.0))
+y ~ iid(Normal(mu, sigma), 3)
+prior = lawof(record(mu = mu, sigma = sigma))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), mu = mu, sigma = sigma), record(y = y_data)), prior)

@@ -1,0 +1,12 @@
+# emit: target=post
+flatppl_compat = "0.1"
+u_data = [0.5, -0.3, 1.2]
+omega ~ Normal(0.0, 1.0)
+scale(p) = p
+next(m, p, u, g) = (m = m + g * (u - m), p = p + 1.0)
+update(s, u, w) = next(s.m, s.p, u, w / scale(s.p))
+states = scan(update, (m = 0, p = 1), u_data, omega)
+means = (s -> s.m).(states)
+y ~ Normal.(means, 1.0)
+prior = lawof(record(omega = omega))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), omega = omega), record(y = [0.2, 0.1, 0.4])), prior)
