@@ -3645,8 +3645,12 @@ impl<'m> Emitter<'m> {
             return (a.clone(), b.clone());
         }
         match (&a.ty, &b.ty) {
-            (MlirTy::Scalar, MlirTy::Ranked(_)) => (self.broadcast_scalar(a, &b.ty), b.clone()),
-            (MlirTy::Ranked(_), MlirTy::Scalar) => (a.clone(), self.broadcast_scalar(b, &a.ty)),
+            (MlirTy::Scalar, MlirTy::Ranked(_)) => {
+                (self.broadcast_in_dim_like(a, &[], b), b.clone())
+            }
+            (MlirTy::Ranked(_), MlirTy::Scalar) => {
+                (a.clone(), self.broadcast_in_dim_like(b, &[], a))
+            }
             (MlirTy::Ranked(da), MlirTy::Ranked(db)) => {
                 assert_eq!(
                     da.len(),
@@ -3659,8 +3663,7 @@ impl<'m> Emitter<'m> {
                     .zip(db.iter())
                     .map(|(&x, &y)| match (x, y) {
                         (Some(m), Some(n)) if m == n => Some(m),
-                        (Some(1), Some(n)) => Some(n),
-                        (Some(m), Some(1)) => Some(m),
+                        (Some(1), extent) | (extent, Some(1)) => extent,
                         (None, None) => None,
                         _ => panic!(
                             "broadcast_pair: incompatible axis sizes ({x:?} vs {y:?}) in \
@@ -3671,6 +3674,14 @@ impl<'m> Emitter<'m> {
                     .collect();
                 let common_ty = MlirTy::Ranked(common);
                 let dims: Vec<u64> = (0..da.len() as u64).collect();
+                if shape(&common_ty).contains(&None) {
+                    let sources = [(a, dims.as_slice()), (b, dims.as_slice())];
+                    let axes = self.axes_of(a);
+                    let a =
+                        self.expand_axes_from(a, &dims, common_ty.clone(), axes.clone(), &sources);
+                    let b = self.expand_axes_from(b, &dims, common_ty, axes, &sources);
+                    return (a, b);
+                }
                 let a_out = if a.ty == common_ty {
                     a.clone()
                 } else {
@@ -5051,6 +5062,11 @@ impl<'m> Emitter<'m> {
             args.push(parts);
         }
         let parent = self.enter_broadcast(id, &mut leaves)?;
+        let extent_operands = if self.broadcast_frame.contains(&None) {
+            leaves.clone()
+        } else {
+            Vec::new()
+        };
         let mut leaves = leaves.into_iter();
         for (arg, mapped) in args.iter_mut().zip(mapped) {
             if mapped {
@@ -5064,7 +5080,8 @@ impl<'m> Emitter<'m> {
             .map(|mut parts| {
                 let frame = self.broadcast_frame.clone();
                 for value in &mut parts.values {
-                    *value = self.finish_broadcast(value, &frame, parent.len());
+                    *value =
+                        self.finish_broadcast_from(value, &frame, parent.len(), &extent_operands);
                 }
                 parts
             });

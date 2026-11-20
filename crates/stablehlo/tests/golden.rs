@@ -11219,6 +11219,32 @@ outputs = lp
     );
 }
 
+#[test]
+fn dynamic_vector_broadcast_reads_the_input_extent() {
+    for expression in [
+        "x .+ 1.0",
+        "broadcast(y -> logdensityof(Normal(0.0, 1.0), y), x)",
+        "broadcast(y -> 2.0, x)",
+    ] {
+        let src = format!(
+            "n = external(posintegers)\nx = external(cartpow(reals, n))\ninputs = x\noutputs = {expression}\n"
+        );
+        let d = determinize_abi_roots(&src, &["inputs", "outputs"]);
+        let out = emit_logdensity(&d);
+        assert!(out.contains("stablehlo.get_dimension_size %arg0"), "{out}");
+        assert!(out.contains("stablehlo.dynamic_broadcast_in_dim"), "{out}");
+        assert!(
+            out.lines().all(|line| {
+                !line.contains("tensor<?x")
+                    || !(line.contains("stablehlo.constant")
+                        || line.contains("stablehlo.broadcast_in_dim")
+                        || (line.contains("stablehlo.reshape") && line.ends_with("tensor<?xf32>")))
+            }),
+            "{out}"
+        );
+    }
+}
+
 /// The explicit `broadcast(add, s, v)` spelling — `add` in higher-order position,
 /// which §07 permits — lowers through the same `"add"` entry in
 /// `ops::lower_builtin` and must keep broadcasting.
