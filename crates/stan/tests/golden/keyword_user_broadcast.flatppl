@@ -1,0 +1,11 @@
+# emit: target=post
+flatppl_compat = "0.1"
+x_data = [-1.0, 0.2, 0.5, 1.3]
+y_data = [0, 1, 2, 5]
+a0 ~ Normal(0.0, 1.0)
+b0 ~ Normal(0.0, 1.0)
+predict(a, b, x) = a + b * x
+eta = broadcast(predict, x = x_data, b = b0, a = a0)
+y ~ Poisson.(exp.(eta))
+prior = lawof(record(a0 = a0, b0 = b0))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), a0 = a0, b0 = b0), record(y = y_data)), prior)

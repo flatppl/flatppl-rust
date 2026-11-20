@@ -56,7 +56,15 @@ struct Step {
     /// Module bindings between the body and module-binding inputs
     /// ([`super::functions::FnCtx::through`]).
     through: HashSet<Symbol>,
+    /// A step whose body is a chain of user calls ending in a record
+    /// expression, outermost first. `fields` are the last callee's record
+    /// fields, read with every level's inputs bound to its arguments.
+    inner: Vec<Level>,
 }
+
+/// One inlined call of a scan step: the callee's inputs, the arguments and
+/// the callee's binding name (for its locals' names).
+type Level = (Vec<(Symbol, Ref)>, Vec<NodeId>, String);
 
 impl<'m> Emitter<'m> {
     /// `scan(…)` as a value: `cumulative_sum`, a map, or the column of a
@@ -158,8 +166,37 @@ impl<'m> Emitter<'m> {
         }
         let mut marks = FnCtx::default();
         self.mark_boundary(&mut marks, id, body, &entries)?;
+        let mut inner = Vec::new();
         let fields = if matches!(self.ty(init), Some(Type::Record(_))) {
-            let rec = self.resolve(body);
+            let mut rec = self.resolve(body);
+            // A step that calls a user function (in turn) returning a record
+            // is that record with each callee's inputs bound to its call's
+            // arguments.
+            let mut bound: Vec<Ref> = entries.iter().map(|(_, r)| *r).collect();
+            while let Some((ifun, iargs)) = self.user_call_parts(rec) {
+                let (ibody, ientries) = self.callable_parts(ifun)?;
+                if ientries.len() != iargs.len() {
+                    return Err(Refusal::not_yet(
+                        Some(id),
+                        "a record scan step calling a function with another arity",
+                    ));
+                }
+                // An input named as an outer input must carry it unchanged:
+                // both read one Stan text.
+                for ((_, r), &a) in ientries.iter().zip(&iargs) {
+                    if bound.iter().any(|e| e.name == r.name)
+                        && !matches!(self.m.node(a), Node::Ref(x) if x == r)
+                    {
+                        return Err(Refusal::not_yet(
+                            Some(id),
+                            "a record scan step whose callee input shadows an outer input",
+                        ));
+                    }
+                }
+                bound.extend(ientries.iter().map(|(_, r)| *r));
+                rec = self.resolve(ibody);
+                inner.push((ientries, iargs, self.owner_name_of(ifun)));
+            }
             if self.head(rec) != Some("record") {
                 return Err(Refusal::not_yet(
                     Some(id),
@@ -186,7 +223,106 @@ impl<'m> Emitter<'m> {
             param,
             fields,
             through: marks.through,
+            inner,
         })
+    }
+
+    /// Bind each inlined step callee's inputs to its call's arguments, outer
+    /// level first, read in the step's context (installed as `self.fctx`).
+    fn bind_inner(&mut self, step: &Step) -> Result<()> {
+        for (entries, args, callee) in &step.inner {
+            let mut values = Vec::new();
+            for ((name, _), &a) in entries.iter().zip(args) {
+                let ty = self
+                    .fctx
+                    .as_ref()
+                    .and_then(|c| c.scoped.get(&a))
+                    .cloned()
+                    .or_else(|| self.ty(a));
+                let base = self.name(*name).to_string();
+                values.push(match ty {
+                    Some(Type::Record(fs)) => {
+                        let mut m = self.record_map(a)?;
+                        for (f, t) in fs.iter() {
+                            let f = self.name(*f).to_string();
+                            if let Some(text) = m.get(&f).cloned() {
+                                let local =
+                                    self.inner_local(&format!("{base}_{f}"), callee, t, text);
+                                m.insert(f, local);
+                            }
+                        }
+                        Err(m)
+                    }
+                    t => {
+                        let text = self.expr(a)?.at(P_ATOM);
+                        Ok(match t {
+                            Some(t) => self.inner_local(&base, callee, &t, text),
+                            None => text,
+                        })
+                    }
+                });
+            }
+            let ctx = self.fctx.as_mut().unwrap();
+            for ((_, r), v) in entries.iter().zip(values) {
+                match v {
+                    Ok(t) => {
+                        ctx.locals.insert(r.name, t);
+                    }
+                    Err(m) => {
+                        ctx.records.insert(r.name, m);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// An inlined callee's scalar input as a step local, so its value prints
+    /// once: `real probability = inv_logit(mean);`. An identifier, a literal
+    /// or a non-scalar keeps its text.
+    // The locals precede the first field assignment: the call reads the
+    // accumulator before this step updates it.
+    fn inner_local(&mut self, base: &str, callee: &str, ty: &Type, text: String) -> String {
+        let base_ty = match ty {
+            Type::Scalar(flatppl_core::ScalarType::Real) => "real",
+            Type::Scalar(flatppl_core::ScalarType::Integer) => "int",
+            _ => return text,
+        };
+        if super::structure::is_identifier(&text) || text.parse::<f64>().is_ok() {
+            return text;
+        }
+        // A name in scope (a state field) gets the callee's name, so the local
+        // does not read as a second copy of it.
+        let name = if self.used.contains(base) {
+            self.fresh(&format!("{callee}_{base}"))
+        } else {
+            self.fresh(base)
+        };
+        let ctx = self.fctx.as_mut().unwrap();
+        ctx.lines.push(format!("{base_ty} {name} = {text};"));
+        name
+    }
+
+    /// The accumulator fields a step field reads: through each inlined
+    /// callee's inputs, the fields their arguments read.
+    fn step_field_reads(&self, step: &Step, v: NodeId, acc: Ref) -> Option<BTreeSet<String>> {
+        self.reads_at(step, step.inner.len(), v, acc)
+    }
+
+    /// [`Self::step_field_reads`] of a node at inlining level `level` (0 is
+    /// the step body).
+    fn reads_at(&self, step: &Step, level: usize, v: NodeId, acc: Ref) -> Option<BTreeSet<String>> {
+        if level == 0 {
+            return self.fields_read_through(v, acc, 0, &step.through);
+        }
+        let (entries, args, _) = &step.inner[level - 1];
+        let mut out = BTreeSet::new();
+        for ((_, r), &a) in entries.iter().zip(args) {
+            if mentions(self, v, *r, &step.through) {
+                out.extend(self.reads_at(step, level - 1, a, acc)?);
+            }
+        }
+        Some(out)
     }
 
     fn reads_accumulator(&self, step: &Step) -> bool {
@@ -575,8 +711,42 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    /// The element type of `xs` and the step's argument types.
+    /// The element type of `xs` and the step's argument types. A record
+    /// accumulator runs at its fields' step types: an integer init
+    /// (`precision = 1`) under a real update is real, also where the step
+    /// passes it to a function.
     fn step_types(&mut self, step: &Step) -> Result<HashMap<NodeId, Type>> {
+        let init = self
+            .ty(step.init)
+            .ok_or_else(|| Refusal::not_yet(Some(step.init), "an untyped value"))?;
+        let types = self.step_types_at(step, init.clone())?;
+        let (Type::Record(fs), Some(fields)) = (&init, &step.fields) else {
+            return Ok(types);
+        };
+        let promoted: Vec<(Symbol, Type)> = fs
+            .iter()
+            .map(|(n, t)| {
+                let update = fields
+                    .iter()
+                    .find(|(f, _)| f == self.name(*n))
+                    .and_then(|(_, v)| types.get(v));
+                match (t, update) {
+                    (
+                        Type::Scalar(flatppl_core::ScalarType::Integer),
+                        Some(u @ Type::Scalar(flatppl_core::ScalarType::Real)),
+                    ) => (*n, u.clone()),
+                    _ => (*n, t.clone()),
+                }
+            })
+            .collect();
+        if promoted.iter().zip(fs.iter()).all(|(a, b)| a == b) {
+            return Ok(types);
+        }
+        self.step_types_at(step, Type::Record(promoted.into()))
+    }
+
+    /// [`Self::step_types`] with the accumulator at `acc`.
+    fn step_types_at(&mut self, step: &Step, acc: Type) -> Result<HashMap<NodeId, Type>> {
         let elem = match self.ty(step.xs) {
             Some(Type::Table { .. }) => {
                 return Err(Refusal::not_yet(Some(step.at), "scan over a table"));
@@ -587,18 +757,33 @@ impl<'m> Emitter<'m> {
             }
             _ => return Err(Refusal::not_yet(Some(step.at), "scan over this value")),
         };
-        let mut tys = vec![
-            self.ty(step.init)
-                .ok_or_else(|| Refusal::not_yet(Some(step.init), "an untyped value"))?,
-            elem,
-        ];
+        let mut tys = vec![acc, elem];
         if let Some(p) = step.param {
             tys.push(
                 self.ty(p)
                     .ok_or_else(|| Refusal::not_yet(Some(p), "an untyped value"))?,
             );
         }
-        self.instantiate(step.at, step.body, &step.entries, &tys)
+        let mut types = self.instantiate(step.at, step.body, &step.entries, &tys)?;
+        // Each inlined callee's body at its arguments' types.
+        let mut call = self.resolve(step.body);
+        for (entries, args, _) in &step.inner {
+            let (fun, _) = self.user_call_parts(call).unwrap();
+            let (ibody, _) = self.callable_parts(fun)?;
+            let mut itys = Vec::new();
+            for &a in args {
+                itys.push(
+                    types
+                        .get(&a)
+                        .cloned()
+                        .or_else(|| self.ty(a))
+                        .ok_or_else(|| Refusal::not_yet(Some(a), "an untyped argument"))?,
+                );
+            }
+            types.extend(self.instantiate(step.at, ibody, entries, &itys)?);
+            call = self.resolve(ibody);
+        }
+        Ok(types)
     }
 
     /// The step's parameter argument `p`: a record's fields by name, or one
@@ -674,14 +859,9 @@ impl<'m> Emitter<'m> {
             Some(fs) => {
                 let mut reads = HashMap::new();
                 for (f, v) in fs {
-                    let r = self
-                        .fields_read_through(*v, acc, 0, &step.through)
-                        .ok_or_else(|| {
-                            Refusal::not_yet(
-                                Some(*v),
-                                "a step that uses its record accumulator whole",
-                            )
-                        })?;
+                    let r = self.step_field_reads(step, *v, acc).ok_or_else(|| {
+                        Refusal::not_yet(Some(*v), "a step that uses its record accumulator whole")
+                    })?;
                     reads.insert(f.clone(), r);
                 }
                 (fs.clone(), reads)
@@ -840,7 +1020,9 @@ impl<'m> Emitter<'m> {
         let base = self.scan_base(step.at);
         let outer = self.fctx.replace(ctx);
         let outer_owner = self.owner.replace((base, step.body));
-        let out = self.step_statements(&row, bodies, reads, names, columns, wanted, last_mode);
+        let out = self.bind_inner(step).and_then(|()| {
+            self.step_statements(&row, bodies, reads, names, columns, wanted, last_mode)
+        });
         let ctx = std::mem::replace(&mut self.fctx, outer).unwrap();
         self.owner = outer_owner;
         self.merge_declared(&ctx);
@@ -986,6 +1168,10 @@ impl<'m> Emitter<'m> {
         types: &HashMap<NodeId, Type>,
         v: NodeId,
     ) -> Result<Option<Ex>> {
+        // An inlined callee's inputs are not lifted: the map fills by loop.
+        if !step.inner.is_empty() {
+            return Ok(None);
+        }
         let xs = self.expr(step.xs)?;
         let int = self.shape(step.xs).is_some_and(|s| s.int);
         let mut ctx = FnCtx {
@@ -1079,8 +1265,8 @@ impl<'m> Emitter<'m> {
         let outer = self.fctx.replace(ctx);
         let outer_owner = self.owner.replace((base, step.body));
         let mut body = Vec::new();
-        let mut failed = None;
-        for (name, v) in looped {
+        let mut failed = self.bind_inner(step).err();
+        for (name, v) in looped.iter().filter(|_| failed.is_none()) {
             match self.step_value(*v, &mut body) {
                 // A matrix row takes the vector entry as a row_vector.
                 Ok(e) if matrix_rows => body.push(format!("{name}[{row}] = ({e})';")),
@@ -1122,7 +1308,7 @@ impl<'m> Emitter<'m> {
     /// any other body fills its value row by row.
     pub(super) fn table_broadcast(&mut self, base: &str, id: NodeId) -> Result<String> {
         let c = self.call(id).unwrap();
-        let args = c.args[1..].to_vec();
+        let args = self.broadcast_args(id)?;
         let over_table = || Refusal::not_yet(Some(id), "a broadcast over a table");
         let tables: Vec<usize> = args
             .iter()
@@ -1306,7 +1492,89 @@ impl<'m> Emitter<'m> {
         {
             return Ok(m);
         }
+        if let Some((fun, args)) = self.record_call(rec) {
+            return self.inline_record_call(rec, fun, &args);
+        }
         Err(Refusal::not_yet(Some(a), "a record argument of this form"))
+    }
+
+    /// A positional call of a user function: its callee and arguments.
+    fn user_call_parts(&self, id: NodeId) -> Option<(NodeId, Vec<NodeId>)> {
+        let fun = self.is_user_call(id)?;
+        let c = self.call(id)?;
+        c.named.is_empty().then(|| (fun, c.args.to_vec()))
+    }
+
+    /// A positional call of a user function whose body is a record
+    /// expression: its callee and arguments.
+    pub(super) fn record_call(&self, id: NodeId) -> Option<(NodeId, Vec<NodeId>)> {
+        let (fun, args) = self.user_call_parts(id)?;
+        let (body, _) = self.callable_parts(fun).ok()?;
+        (self.head(self.resolve(body)) == Some("record")).then_some((fun, args))
+    }
+
+    /// The fields of a record-valued user call, each its inlined text.
+    fn inline_record_call(
+        &mut self,
+        id: NodeId,
+        fun: NodeId,
+        args: &[NodeId],
+    ) -> Result<HashMap<String, String>> {
+        let (body, entries) = self.callable_parts(fun)?;
+        if entries.len() != args.len() {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "a user function called with another arity",
+            ));
+        }
+        let mut ctx = FnCtx {
+            inline_only: true,
+            ..Default::default()
+        };
+        let mut tys = Vec::new();
+        for ((_, r), &a) in entries.iter().zip(args) {
+            let t = self
+                .ty(a)
+                .ok_or_else(|| Refusal::not_yet(Some(a), "an untyped argument"))?;
+            if matches!(t, Type::Record(_)) {
+                let m = self.record_map(a)?;
+                ctx.records.insert(r.name, m);
+            } else {
+                let e = self.expr(a)?;
+                ctx.locals.insert(r.name, e.at(P_ATOM));
+            }
+            tys.push(t);
+        }
+        ctx.scoped = self.instantiate(id, body, &entries, &tys)?;
+        self.mark_boundary(&mut ctx, id, body, &entries)?;
+        let fields: Vec<(String, NodeId)> = self
+            .call(self.resolve(body))
+            .unwrap()
+            .named
+            .iter()
+            .map(|na| (self.name(na.name).to_string(), na.value))
+            .collect();
+        let outer = self.fctx.replace(ctx);
+        let mut out = HashMap::new();
+        let mut failed = None;
+        for (f, v) in fields {
+            match self.expr(v) {
+                Ok(e) => {
+                    out.insert(f, e.at(P_ATOM));
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        let ctx = std::mem::replace(&mut self.fctx, outer).unwrap();
+        self.merge_declared(&ctx);
+        if !ctx.lines.is_empty() {
+            let fixed = self.m.phase_of(id) == Some(Phase::Fixed);
+            self.put(fixed, ctx.lines);
+        }
+        failed.map_or(Ok(out), Err)
     }
 
     /// A user function called with a record argument, inlined: Stan functions

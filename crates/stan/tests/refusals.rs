@@ -1474,6 +1474,51 @@ fn sum_and_density_targets_name_what_the_user_wrote() {
 }
 
 #[test]
+fn a_nested_record_observation_is_not_yet_supported() {
+    let r = refuse_with(
+        "t1 = elementof(reals)\nt2 = elementof(posreals)\n\
+         prior = joint(t1 = Normal(0, 1), t2 = Exponential(1))\n\
+         K = functionof(joint(a = Normal(t1, 1.0), b = joint(c = Normal(t1, t2), d = Normal(0.0, t2))))\n\
+         post = bayesupdate(likelihoodof(K, record(a = 0.4, b = record(c = 0.1, d = -0.2))), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a nested record observation"), "{r}");
+}
+
+#[test]
+fn a_not_a_density_refusal_names_the_call_as_written() {
+    let r = refuse_with(
+        "mu = elementof(reals)\nx ~ Normal(mu, 1.0)\nkernel = kernelof(x, mu = mu)\n\
+         dist = kernel(mu = 1.5)\n",
+        Some("dist"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotADensity, "{r}");
+    assert!(r.reason.contains("`kernel(…)`"), "{r}");
+    assert!(!r.to_string().contains('%'), "{r}");
+}
+
+#[test]
+fn a_restricted_joint_law_has_a_density_not_yet_written() {
+    // `restrict` conditions the joint on observed fields: a density, so not
+    // `NotADensity`.
+    let src = "theta ~ Normal(0.0, 1.0)\nobs ~ iid(Normal(theta, 1.0), 2)\n\
+               joint_model = lawof(record(theta = theta, obs = obs))\n\
+               post = restrict(joint_model, record(obs = [0.3, -0.2]))\n";
+    let r = refuse_with(src, Some("post"));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("`restrict` of a joint law"), "{r}");
+    let r = refuse_with(
+        &format!(
+            "{src}t = elementof(reals)\ninputs = (t)\noutputs = logdensityof(post, record(theta = t))\n"
+        ),
+        Some("outputs"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("`restrict` of a joint law"), "{r}");
+}
+
+#[test]
 fn a_log_density_written_through_densityof_is_not_yet_supported() {
     let r = refuse_with(
         "x = elementof(reals)\ninputs = (x)\noutputs = log(densityof(Normal(0.0, 1.0), x))\n",

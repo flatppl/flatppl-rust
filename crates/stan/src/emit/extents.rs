@@ -588,11 +588,11 @@ impl<'m> Emitter<'m> {
             "vector" if axis == 0 => Some(Lin::konst(args.len() as i64)),
             "vector" => self.sym_extent(*args.first()?, axis - 1, d),
             "broadcast" => {
-                let operands = &args[1..];
                 if matches!(self.m.node(args[0]), Node::Const(_)) {
-                    return self.carried(id, operands, axis, d);
+                    return self.carried(id, &args[1..], axis, d);
                 }
                 let fun = self.user_callee(args[0])?;
+                let operands = &self.broadcast_args(id).ok()?;
                 let top = |me: &Self, a: NodeId| match me.ty(a) {
                     Some(Type::Array { shape, .. }) => shape.len(),
                     _ => 0,
@@ -707,11 +707,16 @@ impl<'m> Emitter<'m> {
             }
             "normalize" | "truncate" => self.law_extent(args[0], axis, d),
             "broadcast" => {
-                // The variate has the shape of the highest-rank argument.
-                let r = args[1..].iter().filter_map(|&a| self.arank(a)).max()?;
-                let full: Vec<NodeId> = args[1..]
+                // The variate has the shape of the highest-rank argument,
+                // positional or keyword.
+                let all: Vec<NodeId> = args[1..]
                     .iter()
                     .copied()
+                    .chain(c.named.iter().map(|na| na.value))
+                    .collect();
+                let r = all.iter().filter_map(|&a| self.arank(a)).max()?;
+                let full: Vec<NodeId> = all
+                    .into_iter()
                     .filter(|&a| self.arank(a) == Some(r))
                     .collect();
                 self.unified(&full, axis, d)

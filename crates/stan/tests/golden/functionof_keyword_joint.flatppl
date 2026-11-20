@@ -1,0 +1,7 @@
+# emit: target=post
+flatppl_compat = "0.1"
+prior = joint(t1 = Normal(0, 1), t2 = Exponential(1))
+t1 = elementof(reals)
+t2 = elementof(posreals)
+K = functionof(joint(obs = iid(Normal(mu = t1, sigma = t2), 3)))
+post = bayesupdate(likelihoodof(K, record(obs = [1.2, 0.4, -0.3])), prior)

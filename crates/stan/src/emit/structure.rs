@@ -263,6 +263,9 @@ impl<'m> Emitter<'m> {
                     return Err(Refusal::not_yet(Some(rhs), "logdensityof with this arity"));
                 };
                 let mr = self.resolve(m);
+                if self.head(mr) == Some("restrict") {
+                    return Err(Self::restrict_not_yet(mr));
+                }
                 if matches!(self.head(mr), Some("bayesupdate" | "logweighted")) {
                     return self.posterior_at_point(mr, x);
                 }
@@ -295,6 +298,9 @@ impl<'m> Emitter<'m> {
             Some("sub") if self.reads_log_density(rhs) => {
                 Err(Refusal::not_yet(Some(rhs), "a difference of log densities"))
             }
+            // A restricted measure has a density (the joint at the observed
+            // fields); its Stan form is not written yet.
+            Some("restrict") => Err(Self::restrict_not_yet(rhs)),
             Some("tuple") => Err(Refusal::new(
                 RefusalKind::NotADensity,
                 Some(rhs),
@@ -322,6 +328,7 @@ impl<'m> Emitter<'m> {
                 if !self.reads_any(rhs, &["logdensityof", "densityof"])
                     || matches!(h, "densityof" | "exp") =>
             {
+                let h = self.written_head(rhs, h);
                 Err(Refusal::new(
                     RefusalKind::NotADensity,
                     Some(rhs),
@@ -341,6 +348,28 @@ impl<'m> Emitter<'m> {
                 format!("the target `{}`", self.name(target)),
             )),
         }
+    }
+
+    /// The head of `id` as the user wrote it: a user call by its callee's
+    /// name (`kernel(…)`), not the internal `%call`.
+    fn written_head(&self, id: NodeId, head: &str) -> String {
+        if !head.starts_with('%') {
+            return head.to_string();
+        }
+        match self.call(id).map(|c| c.head) {
+            Some(flatppl_core::CallHead::User(callee)) => match self.m.node(callee) {
+                Node::Ref(r) => format!("{}(…)", self.name(r.name)),
+                _ => "call".to_string(),
+            },
+            _ => "call".to_string(),
+        }
+    }
+
+    fn restrict_not_yet(at: NodeId) -> Refusal {
+        Refusal::not_yet(
+            Some(at),
+            "`restrict` of a joint law to observed fields (the posterior density)",
+        )
     }
 
     /// `logdensityof(M, x)` of a measure: the likelihood of M at the point x.
@@ -1073,6 +1102,44 @@ impl<'m> Emitter<'m> {
                         law,
                         value: obs_value,
                         name,
+                    });
+                }
+                Ok(result)
+            }
+            // A keyword `joint` body has a record variate: one observation
+            // per field, as for a `kernelof` record.
+            Some("functionof")
+                if self.head(self.resolve(body)) == Some("joint")
+                    && self
+                        .call(self.resolve(body))
+                        .is_some_and(|j| j.args.is_empty() && !j.named.is_empty()) =>
+            {
+                let parts: Vec<(Symbol, NodeId)> = self
+                    .call(self.resolve(body))
+                    .unwrap()
+                    .named
+                    .iter()
+                    .map(|na| (na.name, na.value))
+                    .collect();
+                let mut result = Vec::new();
+                for (f, law) in parts {
+                    let lr = self.resolve(law);
+                    if self.head(lr) == Some("joint")
+                        && self.call(lr).is_some_and(|j| !j.named.is_empty())
+                    {
+                        return Err(Refusal::not_yet(
+                            Some(law),
+                            format!(
+                                "a nested record observation (the keyword `joint` field `{}` inside a keyword `joint`)",
+                                self.name(f)
+                            ),
+                        ));
+                    }
+                    result.push(Observation {
+                        draw: None,
+                        law,
+                        value: self.obs_field(obs, f)?,
+                        name: self.name(f).to_string(),
                     });
                 }
                 Ok(result)
@@ -3454,13 +3521,18 @@ impl<'m> Emitter<'m> {
         args: &[NodeId],
         broadcast: bool,
     ) -> Result<Law> {
+        let params = flatppl_infer::distribution_param_names(name).unwrap_or_default();
+        // §04 "Auto-splatting": a callable with two or more required inputs
+        // called with a single positional record "is decomposed into keyword
+        // arguments (record field names and values)".
+        if let [a] = args
+            && params.len() >= 2
+            && matches!(self.ty(*a), Some(Type::Record(_)))
+        {
+            return self.splat_law(m, name, module, *a, &params, broadcast);
+        }
         let mut found = None;
-        let general = format!(
-            "{name}({})",
-            flatppl_infer::distribution_param_names(name)
-                .unwrap_or_default()
-                .join(", ")
-        );
+        let general = format!("{name}({})", params.join(", "));
         for row in tables::law_rows_by_head(name, module) {
             // A joint's components share one row: the general one.
             if self.general_rows && row.pattern != general {
@@ -3480,6 +3552,82 @@ impl<'m> Emitter<'m> {
             ));
         };
         self.law_from_row(m, name, row, pat, binds, broadcast)
+    }
+
+    /// A law called with one record argument, its fields as the keyword
+    /// arguments: a record literal's field values match the rows as written
+    /// arguments; a computed record's field texts bind the variables of a row
+    /// whose arguments are all variables.
+    fn splat_law(
+        &mut self,
+        m: NodeId,
+        name: &str,
+        module: Option<&str>,
+        rec: NodeId,
+        params: &[String],
+        broadcast: bool,
+    ) -> Result<Law> {
+        let r = self.resolve(rec);
+        let unknown = |mut fields: Vec<String>| -> Result<()> {
+            fields.sort();
+            let mut want = params.to_vec();
+            want.sort();
+            if fields == want {
+                return Ok(());
+            }
+            Err(Refusal::not_yet(
+                Some(m),
+                format!(
+                    "`{name}` of a record with the fields ({}), not its inputs ({})",
+                    fields.join(", "),
+                    params.join(", ")
+                ),
+            ))
+        };
+        if self.head(r) == Some("record") {
+            let named: Vec<(String, NodeId)> = self
+                .call(r)
+                .unwrap()
+                .named
+                .iter()
+                .map(|na| (self.name(na.name).to_string(), na.value))
+                .collect();
+            unknown(named.iter().map(|f| f.0.clone()).collect())?;
+            let ordered: Vec<NodeId> = params
+                .iter()
+                .map(|p| named.iter().find(|f| &f.0 == p).unwrap().1)
+                .collect();
+            return self.table_law_in(m, name, module, &ordered, broadcast);
+        }
+        let fields = self.record_map(rec)?;
+        unknown(fields.keys().cloned().collect())?;
+        for row in tables::law_rows_by_head(name, module) {
+            let pat = pattern::parse(&row.pattern);
+            let pattern::Pat::Call(_, pargs) = &pat else {
+                continue;
+            };
+            if pargs.len() != params.len() {
+                continue;
+            }
+            let mut binds = HashMap::new();
+            let all_vars = pargs.iter().zip(params).all(|(p, name)| match p {
+                pattern::Pat::Var(v) => {
+                    binds.insert(
+                        v.clone(),
+                        pattern::Bound::Expr(Ex::atom(fields[name].clone())),
+                    );
+                    true
+                }
+                _ => false,
+            });
+            if all_vars {
+                return self.law_from_row(m, name, row, pat, binds, broadcast);
+            }
+        }
+        Err(Refusal::not_yet(
+            Some(m),
+            format!("the law `{name}` of a computed record in this form"),
+        ))
     }
 
     /// The law of a matched `distributions.ron` row with its pattern

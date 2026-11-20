@@ -535,6 +535,41 @@ impl<'m> Emitter<'m> {
         Ok(Ex::atom(Self::apply_user(&name, parts, &caps)))
     }
 
+    /// The arguments of a user broadcast `broadcast(f, …)` in the callee's
+    /// input order: positional as written, or keyword arguments bound to the
+    /// inputs by name (§04 "Keyword arguments").
+    pub(super) fn broadcast_args(&self, id: NodeId) -> Result<Vec<NodeId>> {
+        let c = self.call(id).unwrap();
+        if c.named.is_empty() {
+            return Ok(c.args[1..].to_vec());
+        }
+        let fun = self
+            .user_callee(c.args[0])
+            .ok_or_else(|| Refusal::not_yet(Some(id), "a broadcast of this callee"))?;
+        let (_, entries) = self.callable_parts(fun)?;
+        if c.args.len() > 1 || c.named.len() != entries.len() {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "a user broadcast with positional and keyword arguments",
+            ));
+        }
+        entries
+            .iter()
+            .map(|(n, _)| {
+                c.named
+                    .iter()
+                    .find(|na| na.name == *n)
+                    .map(|na| na.value)
+                    .ok_or_else(|| {
+                        Refusal::not_yet(
+                            Some(id),
+                            format!("a user broadcast without the input `{}`", self.name(*n)),
+                        )
+                    })
+            })
+            .collect()
+    }
+
     /// The type of `f.(args…)` inside an instantiated body, where inference
     /// leaves a user broadcast untyped: the traversed argument's outer shape
     /// around the callee's result at the element types.
@@ -546,7 +581,9 @@ impl<'m> Emitter<'m> {
         let Some(fun) = self.user_callee(c.args[0]) else {
             return;
         };
-        let args = c.args[1..].to_vec();
+        let Ok(args) = self.broadcast_args(id) else {
+            return;
+        };
         let Some(tys) = args.iter().map(|&a| self.ty(a)).collect::<Option<Vec<_>>>() else {
             return;
         };
@@ -599,11 +636,8 @@ impl<'m> Emitter<'m> {
     ) -> Result<std::result::Result<Ex, String>> {
         self.ensure_broadcast_type(id);
         let c = self.call(id).unwrap();
-        if !c.named.is_empty() {
-            return Ok(Err("keyword arguments".into()));
-        }
         let fun = self.user_callee(c.args[0]).unwrap();
-        let args = c.args[1..].to_vec();
+        let args = self.broadcast_args(id)?;
         let tys: Vec<Option<Type>> = args.iter().map(|&a| self.ty(a)).collect();
         let brank = tys.iter().map(|t| top_rank(t.as_ref())).max().unwrap_or(0);
         if brank == 0 || brank > 2 {
@@ -910,14 +944,8 @@ impl<'m> Emitter<'m> {
         }
         self.ensure_broadcast_type(id);
         let c = self.call(id).unwrap();
-        if !c.named.is_empty() {
-            return Err(Refusal::not_yet(
-                Some(id),
-                "a user broadcast with keyword arguments",
-            ));
-        }
         let fun = self.user_callee(c.args[0]).unwrap();
-        let args = c.args[1..].to_vec();
+        let args = self.broadcast_args(id)?;
         let tys: Vec<Option<Type>> = args.iter().map(|&a| self.ty(a)).collect();
         let brank = tys.iter().map(|t| top_rank(t.as_ref())).max().unwrap_or(0);
         if brank == 0 {
@@ -1019,7 +1047,7 @@ impl<'m> Emitter<'m> {
         let fun = self
             .user_callee(c.args[0])
             .ok_or_else(|| Refusal::not_yet(Some(m), "a broadcast of a user law"))?;
-        let args = c.args[1..].to_vec();
+        let args = self.broadcast_args(m)?;
         let (body, entries) = self.callable_parts(fun)?;
         if entries.len() != args.len() {
             return Err(Refusal::not_yet(
@@ -1099,9 +1127,9 @@ impl<'m> Emitter<'m> {
         let Some(fun) = self.user_callee(c.args[0]) else {
             return Ok(None);
         };
-        let args = c.args[1..].to_vec();
+        let args = self.broadcast_args(m)?;
         let (body, entries) = self.callable_parts(fun)?;
-        if entries.len() != args.len() || !c.named.is_empty() {
+        if entries.len() != args.len() {
             return Ok(None);
         }
         let refs: Vec<Ref> = entries.iter().map(|(_, r)| *r).collect();
