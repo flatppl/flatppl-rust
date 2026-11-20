@@ -1,0 +1,7 @@
+# emit: target=post
+flatppl_compat = "0.1"
+mu ~ Normal(0, 1)
+y_obs = [0.5, 4.0, -1.0]
+y ~ iid(VonMises(mu, 2.0), 3)
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = y_obs))
+post = bayesupdate(L, lawof(record(mu = mu)))

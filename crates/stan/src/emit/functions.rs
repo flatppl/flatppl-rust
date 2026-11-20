@@ -513,6 +513,12 @@ impl<'m> Emitter<'m> {
 
     /// A user call `f(args…)`.
     pub(super) fn user_call(&mut self, id: NodeId, fun: NodeId, args: &[NodeId]) -> Result<Ex> {
+        if self.call(id).is_some_and(|c| !c.named.is_empty()) {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "a user function called with keyword arguments",
+            ));
+        }
         if self.has_record_argument(args) {
             return self.inline_call(id, fun, args);
         }

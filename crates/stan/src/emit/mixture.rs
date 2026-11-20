@@ -1041,6 +1041,22 @@ impl<'m> Emitter<'m> {
             }
             None => lp,
         };
+        // An `unchecked_support` row (von Mises) does not test its own
+        // support: outside it the component's density is zero.
+        let outside = if law.unchecked_support {
+            Self::outside_test(
+                y,
+                self.decls.get(y).is_some_and(|d| d.rank() > 0),
+                law.bounds.0.as_deref(),
+                law.bounds.1.as_deref(),
+            )
+        } else {
+            None
+        };
+        let lp = match outside {
+            Some(out) => format!("({out} ? negative_infinity() : {lp})"),
+            None => lp,
+        };
         Ok(match guard {
             Some(g) => {
                 let g = match index {

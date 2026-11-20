@@ -37,6 +37,12 @@ pub enum RefusalKind {
     /// A law or function with no Stan counterpart (`kind: "none"` in the
     /// mapping tables).
     NoStanFunction,
+    /// A target that is not a log density (a function value, `densityof`,
+    /// several outputs): a Stan program has one output, its log density.
+    NotADensity,
+    /// The module breaks a spec rule (an `elementof` that `outputs` reads but
+    /// `inputs` does not list, §13): no program is defined for it.
+    IllFormedModule,
     /// A construct with a Stan form this emitter does not write yet.
     NotYetSupported,
 }
@@ -55,6 +61,7 @@ impl RefusalKind {
         match self {
             RefusalKind::NotYetSupported => "not yet supported",
             RefusalKind::NoTarget | RefusalKind::AmbiguousTarget => "no target",
+            RefusalKind::IllFormedModule => "ill-formed module",
             _ => "no Stan form",
         }
     }

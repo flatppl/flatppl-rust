@@ -1,0 +1,6 @@
+# emit: target=post
+flatppl_compat = "0.1"
+mu ~ Normal(0.0, 1.0)
+y ~ normalize(truncate(VonMises(mu, 2.0), interval(-1.0, 4.0)))
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = 1.0))
+post = bayesupdate(L, lawof(record(mu = mu)))

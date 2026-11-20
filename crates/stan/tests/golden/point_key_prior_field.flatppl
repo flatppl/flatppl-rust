@@ -1,0 +1,10 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+alpha = elementof(reals)
+a ~ Normal(alpha, 1.0)
+y ~ Normal(a, 1.0)
+L = likelihoodof(kernelof(record(y = y), alpha = a), record(y = 0.5))
+post = bayesupdate(L, lawof(record(alpha = a)))
+t = elementof(reals)
+inputs = (alpha, t)
+outputs = logdensityof(post, record(alpha = t))

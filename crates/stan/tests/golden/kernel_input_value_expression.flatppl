@@ -1,0 +1,8 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+m1 = elementof(reals)
+m2 = elementof(reals)
+mu = m1 + m2
+y ~ Normal(mu, 1.0)
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = 0.5))
+lp = logdensityof(L, record(mu = 0.3))

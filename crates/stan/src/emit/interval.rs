@@ -55,7 +55,9 @@ impl<'m> Emitter<'m> {
         let statement = format!("{lhs} ~ {};", law.call);
         let minus = format!("target += -{count}{mass};");
         if !self.is_data(lhs) {
-            // A parameter's declared bounds keep it in [lo, hi].
+            // A parameter's declared bounds keep it in [lo, hi]; the caller
+            // learns that this form relies on them (`relies_on_bounds`).
+            self.relies_on_bounds = true;
             return Ok(Some(vec![statement, minus]));
         }
         // Data outside [lo, hi] and the support has zero density; inside, the

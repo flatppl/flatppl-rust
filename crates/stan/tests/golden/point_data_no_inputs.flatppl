@@ -1,0 +1,6 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+alpha = elementof(posreals)
+xobs = elementof(unitinterval)
+a ~ Beta(alpha, 2.0)
+lp = logdensityof(lawof(record(a = a)), record(a = xobs))

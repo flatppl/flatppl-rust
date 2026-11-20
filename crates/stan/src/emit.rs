@@ -161,6 +161,17 @@ pub(crate) struct Emitter<'m> {
     env: HashMap<Symbol, String>,
     /// Prior field or kernel input name → its Stan parameter.
     fields: HashMap<Symbol, String>,
+    /// Prior fields a query point sets (`logdensityof(post, record(…))`):
+    /// locals with no declared bounds.
+    point_fields: HashSet<Symbol>,
+    /// The bounds of a point field's declared set its input's declaration
+    /// does not state: the support test checks them.
+    point_guards: HashMap<Symbol, (Option<String>, Option<String>)>,
+    /// Set by a `tilde` that printed a truncation without `T[]` (the
+    /// interval-mass form), whose line relies on the variate's declared bounds.
+    relies_on_bounds: bool,
+    /// The target is `outputs` of a declared signature (§13).
+    abi_target: bool,
     /// Stan name → its declaration.
     decls: HashMap<String, StanType>,
     /// Kernel inputs inside the prior, bound by name to prior fields.
@@ -306,6 +317,10 @@ impl<'m> Emitter<'m> {
             reserved: module_names(m),
             env: HashMap::new(),
             fields: HashMap::new(),
+            point_fields: HashSet::new(),
+            point_guards: HashMap::new(),
+            relies_on_bounds: false,
+            abi_target: false,
             decls: HashMap::new(),
             links: vec![],
             functions: vec![],
@@ -1901,8 +1916,9 @@ impl<'m> Emitter<'m> {
                     .map(|s| Ex::atom(s.clone()))
                     .ok_or_else(|| Refusal::not_yet(Some(id), format!("the field access `.{f}`")));
             }
+            // A field of a literal record, or a column of a literal table.
             let r = self.resolve(x);
-            if self.head(r) == Some("record")
+            if matches!(self.head(r), Some("record" | "table"))
                 && let Some(na) = self
                     .call(r)
                     .unwrap()

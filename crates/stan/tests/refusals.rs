@@ -1268,3 +1268,269 @@ fn custom_prior_bounded_by_a_derived_value_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("derived value"), "{r}");
 }
+
+#[test]
+fn an_output_that_is_not_a_log_density_has_no_stan_form() {
+    for (out, reason) in [
+        ("outputs = (lp, x)", "several values"),
+        ("outputs = ifelse(x > 0.0, x, 0.0)", "`ifelse`"),
+        ("outputs = densityof(Normal(0.0, 1.0), x)", "`densityof`"),
+    ] {
+        let r = refuse_with(
+            &format!(
+                "x = elementof(reals)\nlp = logdensityof(Normal(0.0, 1.0), x)\ninputs = (x)\n{out}\n"
+            ),
+            Some("outputs"),
+        );
+        assert_eq!(r.kind, RefusalKind::NotADensity, "{out}: {r}");
+        assert!(r.reason.contains(reason), "{out}: {r}");
+    }
+}
+
+#[test]
+fn log_density_sums_this_emitter_does_not_write_are_not_yet() {
+    for (out, reason) in [
+        (
+            "outputs = logdensityof(Normal(0.0, 1.0), x) - logdensityof(Normal(1.0, 1.0), x)",
+            "difference of log densities",
+        ),
+        (
+            "outputs = sum([logdensityof(Normal(0.0, 1.0), x)] .* 2.0)",
+            "computed list of log densities",
+        ),
+        (
+            "outputs = logdensityof(post, record(m = x)) + logdensityof(Normal(0.0, 1.0), x)",
+            "posterior term",
+        ),
+    ] {
+        let r = refuse_with(
+            &format!(
+                "m ~ Normal(0.0, 1.0)\ny ~ Normal(m, 1.0)\n\
+                 L = likelihoodof(kernelof(record(y = y), m = m), record(y = 0.5))\n\
+                 post = bayesupdate(L, lawof(record(m = m)))\nx = elementof(reals)\ninputs = (x)\n{out}\n"
+            ),
+            Some("outputs"),
+        );
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{out}: {r}");
+        assert!(r.reason.contains(reason), "{out}: {r}");
+    }
+}
+
+#[test]
+fn an_ordered_prior_field_from_an_unordered_input_is_not_yet() {
+    // The `ordered` field's restriction lives in a declaration; an input
+    // declared on `reals` carries none of it.
+    let r = refuse_with(
+        "v ~ tilt(iid(Normal(0.0, 2.0), 2), Lebesgue(ordered(2)))\ny ~ Normal(v[1], 1.0)\n\
+         L = likelihoodof(kernelof(record(y = y), v = v), record(y = 0.5))\n\
+         post = bayesupdate(L, lawof(record(v = v)))\nx = elementof(cartpow(reals, 2))\ninputs = (x)\n\
+         outputs = logdensityof(post, record(v = x))\n",
+        Some("outputs"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("declared set"), "{r}");
+}
+
+#[test]
+fn a_real_input_under_a_discrete_law_is_not_yet() {
+    // Stan has no integer parameters, and a real value is not cast.
+    let r = refuse_with(
+        "t_y = elementof(cartpow(reals, 3))\ninputs = (t_y)\n\
+         outputs = logdensityof(broadcast(Poisson, [2.0, 3.5, 1.0]), t_y)\n",
+        Some("outputs"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("real-typed input under the discrete law"),
+        "{r}"
+    );
+}
+
+fn emit_code(source: &str, target: &str) -> String {
+    let mut module = flatppl_syntax::parse(source).expect("parse");
+    let diagnostics = flatppl_infer::infer(&mut module);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| d.severity != flatppl_infer::Severity::Error),
+        "{diagnostics:?}"
+    );
+    let opts = EmitOptions {
+        target: Some(target.to_string()),
+        ..Default::default()
+    };
+    flatppl_stan::emit(&module, &opts).expect("emits").code
+}
+
+/// The `data` and `parameters` blocks of a program.
+fn declarations(code: &str) -> String {
+    code.split("model {").next().unwrap_or_default().to_string()
+}
+
+#[test]
+fn query_inputs_do_not_depend_on_term_order() {
+    // `t` is read by a measure in one term: a parameter in either order.
+    let a = emit_code(
+        "t = elementof(reals)\nlp = logdensityof(Normal(0.0, 1.0), t) + logdensityof(Normal(t, 1.0), 0.5)\n",
+        "lp",
+    );
+    let b = emit_code(
+        "t = elementof(reals)\nlp = logdensityof(Normal(t, 1.0), 0.5) + logdensityof(Normal(0.0, 1.0), t)\n",
+        "lp",
+    );
+    assert_eq!(declarations(&a), declarations(&b), "{a}\n{b}");
+    assert!(declarations(&a).contains("parameters {\n  real t;"), "{a}");
+}
+
+#[test]
+fn an_input_outside_the_declared_signature_is_ill_formed() {
+    // §13: `inputs` lists every `elementof` an output reaches.
+    for out in [
+        "outputs = logdensityof(Normal(a, 1.0), b)",
+        "outputs = logdensityof(Normal(b, 1.0), a)",
+    ] {
+        let r = refuse_with(
+            &format!("a = elementof(reals)\nb = elementof(reals)\ninputs = (a)\n{out}\n"),
+            Some("outputs"),
+        );
+        assert_eq!(r.kind, RefusalKind::IllFormedModule, "{out}: {r}");
+        assert!(r.kind.is_never(), "{out}: {r}");
+        assert!(r.reason.contains("`inputs` does not list"), "{out}: {r}");
+    }
+}
+
+#[test]
+fn an_input_behind_a_reification_boundary_is_not_free() {
+    // `functionof(b)` makes `a` an input of `f`; the call sets it, so the
+    // output does not read the leaf `a` (§13 does not apply).
+    let r = refuse_with(
+        "a = elementof(reals)\nb = 2.0 * a\nf = functionof(b)\nmu = f(a = 0.5)\n\
+         x = elementof(reals)\ninputs = (x)\noutputs = logdensityof(Normal(mu, 1.0), x)\n",
+        Some("outputs"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(!r.reason.contains("§13"), "{r}");
+    assert!(
+        r.reason
+            .contains("a user function called with keyword arguments"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_positional_function_called_by_keyword_is_not_yet_supported() {
+    // Infer rejects a true arity mismatch, so the arity text never reaches
+    // a well-typed module; a keyword call of a positional boundary names
+    // the keyword form.
+    let r = refuse_with(
+        "a = elementof(reals)\nb = 2.0 * a\nfe = functionof(b, a)\n\
+         lp = logdensityof(Normal(fe(a = 0.5), 1.0), 0.3)\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a user function called with keyword arguments"),
+        "{r}"
+    );
+}
+
+#[test]
+fn an_input_read_beside_its_bound_use_is_still_free() {
+    // `f(0.5)` sets the boundary input `a`, but `+ a` reads the leaf itself.
+    let r = refuse_with(
+        "a = elementof(reals)\nb = 2.0 * a + 1.0\nf = functionof(b, a)\n\
+         x = elementof(reals)\ninputs = (x)\noutputs = logdensityof(Normal(f(0.5) + a, 1.0), x)\n",
+        Some("outputs"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason.contains("`a`, which `inputs` does not list"),
+        "{r}"
+    );
+}
+
+#[test]
+fn sum_and_density_targets_name_what_the_user_wrote() {
+    let r = refuse_with(
+        "x = elementof(reals)\ninputs = (x)\noutputs = logdensityof(Normal(0.0, 1.0), x) + 1.0\n",
+        Some("outputs"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("a term that is not a `logdensityof`"),
+        "{r}"
+    );
+    let r = refuse_with(
+        "x = elementof(reals)\ninputs = (x)\noutputs = exp(logdensityof(Normal(0.0, 1.0), x))\n",
+        Some("outputs"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotADensity, "{r}");
+    let r = refuse_with(
+        "x = elementof(reals)\ninputs = (x)\noutputs = 2.0 * logdensityof(Normal(0.0, 1.0), x)\n",
+        Some("outputs"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+}
+
+#[test]
+fn a_log_density_written_through_densityof_is_not_yet_supported() {
+    let r = refuse_with(
+        "x = elementof(reals)\ninputs = (x)\noutputs = log(densityof(Normal(0.0, 1.0), x))\n",
+        Some("outputs"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("write `logdensityof(…)`"), "{r}");
+    let r = refuse_with(
+        "x = elementof(reals)\ninputs = (x)\n\
+         outputs = log(densityof(Normal(0.0, 1.0), x)) + log(densityof(Normal(1.0, 1.0), x))\n",
+        Some("outputs"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+}
+
+#[test]
+fn a_likelihood_point_with_an_unknown_key_is_ill_formed() {
+    let r = refuse_with(
+        "mu = elementof(reals)\nL = likelihoodof(Normal(mu, 1.0), 0.5)\n\
+         lp = logdensityof(L, record(zz = 0.3))\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason.contains(
+            "the point sets `zz`, which is not an input of the likelihood (inputs: `mu`)"
+        ),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_likelihood_point_with_a_missing_key_is_ill_formed() {
+    let r = refuse_with(
+        "mu = elementof(reals)\nsg = elementof(posreals)\nL = likelihoodof(Normal(mu, sg), 0.5)\n\
+         lp = logdensityof(L, record(mu = 0.3))\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason
+            .contains("the point does not set the likelihood input `sg` (inputs: `mu`, `sg`)"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_point_value_that_reads_the_input_it_sets_is_refused() {
+    let r = refuse_with(
+        "mu = elementof(reals)\nL = likelihoodof(Normal(mu, 1.0), 0.5)\n\
+         lp = logdensityof(L, record(mu = mu + 1.0))\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("the point value of `mu` reads `mu`, the input it sets"),
+        "{r}"
+    );
+}
