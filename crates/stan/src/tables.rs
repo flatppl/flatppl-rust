@@ -36,10 +36,11 @@ pub(crate) struct LawRow {
     /// variate type has no literal one: the helper clamps the interval to it.
     #[serde(default)]
     pub floor: String,
-    /// The Stan function does not enforce the `variate` bounds (von Mises
-    /// returns a finite value outside (-pi, pi)): a variate whose declaration
-    /// does not state them is tested against them. Set where a BridgeStan
-    /// probe outside the bounds returned a finite value.
+    /// The Stan function does not enforce the `variate` support (von Mises
+    /// returns a finite value outside (-pi, pi), `lkj_corr_cholesky` for rows
+    /// that are not unit length): a variate whose declaration does not state
+    /// it is tested against it. Set where a BridgeStan probe outside the
+    /// support returned a finite value.
     #[serde(default)]
     pub unchecked_support: bool,
     pub functions: String,

@@ -350,6 +350,15 @@ impl<'m> Emitter<'m> {
         {
             return Err(Refusal::not_yet(Some(m), "pushfwd of this law"));
         }
+        if law
+            .support_type
+            .is_some_and(crate::stan_type::square_support)
+        {
+            return Err(Refusal::not_yet(
+                Some(m),
+                "pushfwd of a law on a constrained matrix set",
+            ));
+        }
         let inverse = map.inverse(lhs);
         let y = if law.lhs("{y}") == "{y}" {
             inverse
@@ -367,7 +376,7 @@ impl<'m> Emitter<'m> {
         let mut out = vec![law.statement(m, &y, &law.call_text(None))?];
         out.extend(map.jacobian());
         // An `unchecked_support` base (von Mises): its preimage is tested.
-        Ok(self.unchecked_guard(&y, false, &law, out))
+        self.unchecked_guard(&y, false, &law, out)
     }
 
     /// M's support mapped through f: the bounds of a `pushfwd` parameter.

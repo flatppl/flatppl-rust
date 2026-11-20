@@ -1,0 +1,9 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+L ~ LKJCholesky(3, 2.0)
+y ~ Normal(0.0, 1.0)
+prior = lawof(record(L = L))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), L = L), record(y = 0.4)), prior)
+q = elementof(reals)
+inputs = (q)
+outputs = logdensityof(post, record(L = rowstack([[1.0, 0.0, 0.0], [q, 0.8, 0.0], [0.0, 0.6, 0.8]])))

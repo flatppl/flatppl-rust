@@ -178,6 +178,7 @@ impl<'m> Emitter<'m> {
                 base: "int",
                 dims: vec![],
                 bounds: Default::default(),
+                support: None,
             },
         );
         // One data index array per select: 2 where the condition holds.

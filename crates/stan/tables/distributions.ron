@@ -32,10 +32,11 @@
 //               the parameters set (binomial: {y} > {n}). Stan's lpmf throws there, where the
 //               FlatPPL density is 0, so the component's lp is negative_infinity(). For an
 //               array variate the emitter tests max({y}). "" when the support is fixed.
-//   unchecked_support: optional; the Stan function does not enforce the `variate` bounds
-//               (it returns a finite value outside them): a variate declared without them is
-//               tested against them, -inf outside. A BridgeStan probe outside the bounds of every
-//               bounded row found von_mises only; the others throw or return -inf.
+//   unchecked_support: optional; the Stan function does not enforce the `variate` support
+//               (it returns a finite value outside it): a variate declared without it is
+//               tested against it, -inf outside. A BridgeStan probe outside the support of every
+//               bounded and constrained row found von_mises (bounds) and lkj_cholesky (unit row
+//               norms) only; the others throw or return -inf.
 //   functions:  Stan functions-block source the row needs ("" if none).
 //   status:     "verified" (verify.py PASS, Stan 2.40.0) | "unverified: <reason>" | "n/a".
 //   note:       caveats for the emitter.
@@ -196,8 +197,8 @@ real flatppl_generalized_normal_lpdf(vector x, real mu, real alpha, real beta) {
     (id: "lkj_cholesky", flatppl: "LKJCholesky", module: None, params: ["n", "eta"],
      pattern: "LKJCholesky(n, eta)", vars: ["eta"], kind: "builtin",
      stan: "lkj_corr_cholesky", suffix: "lpdf", lhs: "{y}", args: "{eta}", variate: "cholesky_factor_corr[{n}]",
-     sizes: [("n", "n")], vectorized: false, lcdf: false, normalized: true, guard: "", functions: "", status: "verified",
-     note: "n moves to the declaration."),
+     sizes: [("n", "n")], vectorized: false, lcdf: false, normalized: true, guard: "", unchecked_support: true, functions: "", status: "verified",
+     note: "n moves to the declaration. Stan checks the triangle and the positive diagonal, not the unit row norms (a 3x3 factor with a row of norm 1.08 scores finite); a variate not declared cholesky_factor_corr is tested against them."),
     (id: "dirichlet", flatppl: "Dirichlet", module: None, params: ["alpha"],
      pattern: "Dirichlet(alpha)", vars: ["alpha"], kind: "builtin",
      stan: "dirichlet", suffix: "lpdf", lhs: "{y}", args: "{alpha}", variate: "simplex[{n}]",

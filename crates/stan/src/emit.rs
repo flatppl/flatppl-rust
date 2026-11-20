@@ -136,6 +136,27 @@ pub(crate) enum Flat {
     Row,
 }
 
+/// A table law's variate, from its rows' `variate` and `sizes` columns.
+struct RowVariate {
+    /// The constrained Stan type of the law's support, if the variate names one.
+    support: Option<&'static str>,
+    /// The variate axes the size spans (2 for a square matrix type).
+    axes: usize,
+    size: RowSize,
+    /// The `sizes` expression as written, for a refusal.
+    expr: String,
+}
+
+/// The size of a law's variate, by the argument it reads.
+enum RowSize {
+    /// The argument itself (`LKJ(n, eta)`).
+    Arg(NodeId),
+    /// `lengthof(a)`.
+    Length(NodeId),
+    /// `sizeof(a)[i]`, 1-based.
+    Extent(NodeId, usize),
+}
+
 /// One prior field of a posterior target.
 struct PriorField {
     field: Symbol,
@@ -518,6 +539,8 @@ impl<'m> Emitter<'m> {
 
     /// [`Self::declare`] for a `data` value: an extent with no symbolic
     /// source is a data size of its own.
+    // A set written on the value (`elementof(S)`, `load_data`) is its domain, so it is declared;
+    // a law's support is not: observed data stays plain and scores -inf outside it.
     fn declare_data(
         &mut self,
         node: NodeId,
@@ -646,18 +669,73 @@ impl<'m> Emitter<'m> {
                 out
             }
             Some("normalize" | "truncate") => self.law_hints(c.args[0]),
-            Some(name @ ("Dirichlet" | "MvNormal")) => self
-                .law_args(name, m)
-                .ok()
-                .map(|a| vec![self.length_hint(a[0])])
-                .unwrap_or_default(),
-            Some("LKJCholesky") => self
-                .law_args("LKJCholesky", m)
-                .ok()
-                .map(|a| vec![Some(a[0]), Some(a[0])])
-                .unwrap_or_default(),
-            _ => vec![],
+            Some(head) => match self.row_variate(head, m) {
+                Some(v) => {
+                    let hint = match v.size {
+                        RowSize::Arg(a) => Some(a),
+                        RowSize::Length(a) => self.length_hint(a),
+                        RowSize::Extent(..) => None,
+                    };
+                    vec![hint; v.axes]
+                }
+                None => vec![],
+            },
+            None => vec![],
         }
+    }
+
+    /// A table law's variate as its rows state it (`cholesky_factor_corr[{n}]`
+    /// with `n` from `sizes`): `None` when the rows of `head` disagree or
+    /// the variate names no sized base.
+    fn row_variate(&self, head: &str, m: NodeId) -> Option<RowVariate> {
+        let rows = tables::law_rows_by_head(head, None);
+        let first = rows.first()?;
+        if rows
+            .iter()
+            .any(|r| r.variate != first.variate || r.sizes != first.sizes)
+        {
+            return None;
+        }
+        let (base, rest) = first.variate.split_once('[')?;
+        if base == "array" || base.contains('<') {
+            return None;
+        }
+        let key = rest.strip_prefix('{')?.strip_suffix("}]")?;
+        let expr = first.sizes.iter().find(|(k, _)| k == key)?.1.clone();
+        let support = crate::stan_type::support_type(base);
+        let axes = match support {
+            Some(s) => 1 + usize::from(crate::stan_type::square_support(s)),
+            None if base == "vector" => 1,
+            None => return None,
+        };
+        let params = flatppl_infer::distribution_param_names(head)?;
+        let args = self.law_args(head, m).ok()?;
+        let arg = |p: &str| {
+            params
+                .iter()
+                .position(|q| q == p)
+                .and_then(|i| args.get(i).copied())
+        };
+        // The three `sizes` forms: an argument, `lengthof(a)`, `sizeof(a)[i]`.
+        let size = if let Some(p) = expr
+            .strip_prefix("lengthof(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            RowSize::Length(arg(p)?)
+        } else if let Some((p, i)) = expr
+            .strip_prefix("sizeof(")
+            .and_then(|s| s.split_once(")["))
+        {
+            RowSize::Extent(arg(p)?, i.strip_suffix(']')?.parse().ok()?)
+        } else {
+            RowSize::Arg(arg(&expr)?)
+        };
+        Some(RowVariate {
+            support,
+            axes,
+            size,
+            expr,
+        })
     }
 
     /// The length expression of `ones(K)`, `zeros(K)` or `fill(x, K)`.

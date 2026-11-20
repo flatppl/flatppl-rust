@@ -1,0 +1,6 @@
+# emit: target=post
+flatppl_compat = "0.1"
+C ~ iid(LKJ(3, 2.0), 2)
+y ~ MvNormal([0.0, 0.0, 0.0], C[1])
+prior = lawof(record(C = C))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), C = C), record(y = [0.3, -0.2, 0.5])), prior)

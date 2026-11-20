@@ -1,0 +1,5 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+m = elementof(reals)
+Lobs = rowstack([[1.0, 0.0, 0.0], [0.6, 0.8, 0.0], [0.0, 0.6, 0.8]])
+lp = logdensityof(LKJCholesky(3, 2.0), Lobs) + logdensityof(Normal(0.0, 1.0), m)

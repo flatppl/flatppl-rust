@@ -1,0 +1,7 @@
+# emit: target=post
+flatppl_compat = "0.1"
+S = rowstack([[1.0, 0.2, 0.0], [0.2, 1.0, 0.1], [0.0, 0.1, 1.0]])
+W ~ InverseWishart(4.0, S)
+y ~ MvNormal([0.0, 0.0, 0.0], W)
+prior = lawof(record(W = W))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), W = W), record(y = [0.3, -0.2, 0.5])), prior)
