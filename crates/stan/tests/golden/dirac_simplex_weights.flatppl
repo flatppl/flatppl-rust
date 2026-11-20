@@ -1,0 +1,9 @@
+# emit: target=post
+flatppl_compat = "0.1"
+y_obs = [3, 0, 2, 0, 0, 5]
+lam ~ Gamma(2.0, 1.0)
+w ~ Dirichlet([1.0, 1.0])
+ZIP = superpose(weighted(w[1], Poisson(lam)), weighted(w[2], Dirac(0)))
+y ~ iid(ZIP, 6)
+prior = lawof(record(lam = lam, w = w))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), lam = lam, w = w), record(y = y_obs)), prior)

@@ -3523,11 +3523,16 @@ impl<'m> Emitter<'m> {
     ) -> Result<Law> {
         let params = flatppl_infer::distribution_param_names(name).unwrap_or_default();
         // §04 "Auto-splatting": a callable with two or more required inputs
-        // called with a single positional record "is decomposed into keyword
-        // arguments (record field names and values)".
+        // called with a single positional record or table "is decomposed into
+        // keyword arguments (record field names and values or table column
+        // names and columns)". A table reaches a law only through a broadcast
+        // (`D.(T)`, a `ksuperpose` component).
         if let [a] = args
             && params.len() >= 2
-            && matches!(self.ty(*a), Some(Type::Record(_)))
+            && matches!(
+                self.ty(*a),
+                Some(Type::Record(_) | Type::Table { .. } | Type::Any) | None
+            )
         {
             return self.splat_law(m, name, module, *a, &params, broadcast);
         }
@@ -3558,6 +3563,30 @@ impl<'m> Emitter<'m> {
     /// arguments: a record literal's field values match the rows as written
     /// arguments; a computed record's field texts bind the variables of a row
     /// whose arguments are all variables.
+    /// The keyword arguments a lone positional argument at a splat site gives
+    /// (§04 "Auto-splatting"): a record or table literal's field or column
+    /// names and values. `None` for a computed record, which
+    /// [`Self::splat_law`] reads by its field texts; any other argument (a
+    /// loaded table, an untyped value) refuses.
+    pub(super) fn splat_fields(&self, arg: NodeId) -> Result<Option<Vec<(String, NodeId)>>> {
+        let r = self.resolve(arg);
+        match self.head(r) {
+            Some("record" | "table") => Ok(Some(
+                self.call(r)
+                    .unwrap()
+                    .named
+                    .iter()
+                    .map(|na| (self.name(na.name).to_string(), na.value))
+                    .collect(),
+            )),
+            _ if matches!(self.ty(arg), Some(Type::Record(_))) => Ok(None),
+            _ => Err(Refusal::not_yet(
+                Some(arg),
+                "a splat of an argument that is not a record or a `table(…)` literal",
+            )),
+        }
+    }
+
     fn splat_law(
         &mut self,
         m: NodeId,
@@ -3567,7 +3596,6 @@ impl<'m> Emitter<'m> {
         params: &[String],
         broadcast: bool,
     ) -> Result<Law> {
-        let r = self.resolve(rec);
         let unknown = |mut fields: Vec<String>| -> Result<()> {
             fields.sort();
             let mut want = params.to_vec();
@@ -3578,20 +3606,13 @@ impl<'m> Emitter<'m> {
             Err(Refusal::not_yet(
                 Some(m),
                 format!(
-                    "`{name}` of a record with the fields ({}), not its inputs ({})",
+                    "`{name}` of a record or table with the fields ({}), not its inputs ({})",
                     fields.join(", "),
                     params.join(", ")
                 ),
             ))
         };
-        if self.head(r) == Some("record") {
-            let named: Vec<(String, NodeId)> = self
-                .call(r)
-                .unwrap()
-                .named
-                .iter()
-                .map(|na| (self.name(na.name).to_string(), na.value))
-                .collect();
+        if let Some(named) = self.splat_fields(rec)? {
             unknown(named.iter().map(|f| f.0.clone()).collect())?;
             let ordered: Vec<NodeId> = params
                 .iter()

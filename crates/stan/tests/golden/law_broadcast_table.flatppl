@@ -1,0 +1,7 @@
+# emit: target=post
+flatppl_compat = "0.1"
+m0 ~ Normal(0.0, 1.0)
+T = table(mu = [m0, m0 + 1.0], sigma = [0.7, 0.9])
+y ~ Normal.(T)
+prior = lawof(record(m0 = m0))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), m0 = m0), record(y = [0.1, 0.9])), prior)

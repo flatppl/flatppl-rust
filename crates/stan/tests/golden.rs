@@ -30,15 +30,20 @@ fn options(source: &str) -> flatppl_stan::EmitOptions {
 }
 
 fn emit(source: &str) -> flatppl_stan::StanProgram {
+    emit_named("inline source", source)
+}
+
+/// [`emit`] naming the golden in a failure, so a refusal says which file.
+fn emit_named(name: &str, source: &str) -> flatppl_stan::StanProgram {
     let mut module = flatppl_syntax::parse(source).expect("parse");
     let diagnostics = flatppl_infer::infer(&mut module);
     assert!(
         diagnostics
             .iter()
             .all(|d| d.severity != flatppl_infer::Severity::Error),
-        "{diagnostics:?}"
+        "{name}: {diagnostics:?}"
     );
-    flatppl_stan::emit(&module, &options(source)).expect("emit")
+    flatppl_stan::emit(&module, &options(source)).unwrap_or_else(|r| panic!("{name}: emit: {r:?}"))
 }
 
 #[test]
@@ -54,7 +59,10 @@ fn goldens() {
     entries.sort();
     assert!(!entries.is_empty());
     for path in entries {
-        let program = emit(&std::fs::read_to_string(&path).unwrap());
+        let program = emit_named(
+            &path.display().to_string(),
+            &std::fs::read_to_string(&path).unwrap(),
+        );
         let data =
             serde_json::to_string_pretty(&serde_json::Value::Object(program.data)).unwrap() + "\n";
         // A golden with a `.manifest.json` beside it checks the manifest too.
