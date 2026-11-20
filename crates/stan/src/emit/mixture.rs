@@ -1041,6 +1041,15 @@ impl<'m> Emitter<'m> {
             }
             None => lp,
         };
+        if law
+            .support_type
+            .is_some_and(crate::stan_type::square_support)
+        {
+            return Err(Refusal::not_yet(
+                None,
+                "a mixture component on a constrained matrix set",
+            ));
+        }
         // An `unchecked_support` row (von Mises) does not test its own
         // support: outside it the component's density is zero.
         let outside = if law.unchecked_support {

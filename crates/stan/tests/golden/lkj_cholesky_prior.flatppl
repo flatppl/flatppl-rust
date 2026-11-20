@@ -1,0 +1,6 @@
+# emit: target=Pi_post
+flatppl_compat = "0.1"
+L_corr ~ LKJCholesky(2, 1)
+y ~ MvNormal([0.0, 0.0], L_corr * transpose(L_corr))
+Pi_prior = lawof(record(L_corr = L_corr))
+Pi_post = bayesupdate(likelihoodof(kernelof(record(y = y), L_corr = L_corr), record(y = [0.3, -0.2])), Pi_prior)

@@ -1,12 +1,12 @@
 //! Target decomposition and the `~` statements.
 
 use super::pattern;
-use super::{Emitter, Ex, Flat, P_ATOM, PriorField};
+use super::{Emitter, Ex, Flat, P_ATOM, PriorField, RowSize};
 use crate::ManifestParam;
 use crate::refuse::{Refusal, RefusalKind, Result};
 use crate::stan_type::StanType;
 use crate::tables;
-use flatppl_core::{Inputs, NamedKind, Node, NodeId, RefNs, Scalar, Symbol, Type, ValueSet};
+use flatppl_core::{Dim, Inputs, NamedKind, Node, NodeId, RefNs, Scalar, Symbol, Type, ValueSet};
 use std::collections::{HashMap, HashSet};
 
 /// The loop index a per-element argument of a broadcast law is rendered with.
@@ -65,6 +65,8 @@ pub(super) struct Law {
     /// The row's Stan function does not enforce `bounds` (von Mises): a
     /// variate whose declaration does not state them is tested against them.
     pub unchecked_support: bool,
+    /// The constrained Stan type of the row's `variate` (`cholesky_factor_corr`).
+    pub support_type: Option<&'static str>,
 }
 
 impl Law {
@@ -888,6 +890,16 @@ impl<'m> Emitter<'m> {
                 Some(law) => self.law_hints(law),
                 None => self.set_hints(f.node),
             };
+            // A law whose support is a constrained set (§08: correlation,
+            // covariance matrices, the simplex) declares its variate on it.
+            let support = match f.law {
+                Some(law) => self.law_support(law)?,
+                None => None,
+            };
+            let ty = match support {
+                Some((_, axes, Some(n))) => with_extent(&ty, axes, n),
+                _ => ty,
+            };
             let mut t = if f.sets.is_empty() {
                 self.declare_ty(&ty, vs.as_ref(), true, f.node, &stan, &hints)?
             } else {
@@ -906,6 +918,18 @@ impl<'m> Emitter<'m> {
                 if t.bounds.upper.is_none() {
                     t.bounds.upper = hi;
                 }
+            }
+            if let Some((s, ..)) = support
+                && t.base != s
+            {
+                if !matches!(t.base, "vector" | "matrix") {
+                    return Err(Refusal::not_yet(
+                        Some(f.node),
+                        format!("a `{s}` variate declared as `{}`", t.base),
+                    ));
+                }
+                t.support = Some(s);
+                t.bounds = Default::default();
             }
             self.params.push(format!("{};", t.render(&stan)));
             self.record_decl(&stan, t);
@@ -1754,7 +1778,7 @@ impl<'m> Emitter<'m> {
                         let mut lines =
                             vec![law.statement(m, &law.lhs(&y), &law.call_text(None))?];
                         lines.extend(law.extra.iter().cloned());
-                        out.extend(self.unchecked_guard(&y, false, &law, lines));
+                        out.extend(self.unchecked_guard(&y, false, &law, lines)?);
                     }
                     return Ok(out);
                 }
@@ -1790,7 +1814,7 @@ impl<'m> Emitter<'m> {
             self.used.remove(&i);
             let mut out = vec![stmt];
             out.extend(law.extra.iter().cloned());
-            let out = self.unchecked_guard(lhs, lhs_rank > 0, &law, out);
+            let out = self.unchecked_guard(lhs, lhs_rank > 0, &law, out)?;
             return Ok(self.support_guarded(lhs, &law, out));
         }
         let (target, rhs) = match (flat, &law.flat_call) {
@@ -1840,45 +1864,68 @@ impl<'m> Emitter<'m> {
         };
         let mut out = vec![law.statement(m, &law.lhs(&target), &rhs)?];
         out.extend(law.extra.iter().cloned());
-        let out = self.unchecked_guard(lhs, lhs_rank > 0, &law, out);
+        let out = self.unchecked_guard(lhs, lhs_rank > 0, &law, out)?;
         Ok(self.support_guarded(lhs, &law, out))
     }
 
-    /// `lines` behind a test of `expr` against the law's bounds, for a row
-    /// whose Stan function does not enforce them (`unchecked_support`, von
-    /// Mises): outside them the density is zero. A variate whose declaration
-    /// states the bounds needs no test.
+    /// `lines` behind a test of `expr` against the law's support, for a row
+    /// whose Stan function does not enforce it (`unchecked_support`: von
+    /// Mises, `lkj_corr_cholesky`): outside it the density is zero. A
+    /// variate whose declaration states the support needs no test.
     pub(super) fn unchecked_guard(
         &self,
         expr: &str,
         array: bool,
         law: &Law,
         lines: Vec<String>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>> {
         // A two-sided `T[L, U]`, its ends clamped into the support, already
         // gives -inf outside it.
         if !law.unchecked_support || matches!(law.trunc, Some((Some(_), Some(_)))) {
-            return lines;
+            return Ok(lines);
         }
         let (lo, hi) = &law.bounds;
-        if self
-            .decls
-            .get(expr)
-            .is_some_and(|t| &t.bounds.lower == lo && &t.bounds.upper == hi)
-        {
-            return lines;
+        if self.decls.get(expr).is_some_and(|t| {
+            &t.bounds.lower == lo && &t.bounds.upper == hi && t.support == law.support_type
+        }) {
+            return Ok(lines);
         }
-        let Some(test) = Self::outside_test(expr, array, lo.as_deref(), hi.as_deref()) else {
-            return lines;
+        let Some(test) = self.unchecked_test(expr, array, law)? else {
+            return Ok(lines);
         };
         let body: String = lines
             .iter()
             .flat_map(|l| l.lines())
             .map(|l| format!("  {l}\n"))
             .collect();
-        vec![format!(
+        Ok(vec![format!(
             "if ({test}) {{\n  target += negative_infinity();\n}} else {{\n{body}}}"
-        )]
+        )])
+    }
+
+    /// The test that `y` lies outside an `unchecked_support` law's support:
+    /// its `variate` bounds, or for `cholesky_factor_corr` rows that are not
+    /// unit length (`lkj_corr_cholesky_lpdf` checks the triangle and the
+    /// diagonal itself, not the row norms).
+    pub(super) fn unchecked_test(&self, y: &str, array: bool, law: &Law) -> Result<Option<String>> {
+        if law.support_type == Some("cholesky_factor_corr") {
+            // The variate is itself a matrix: an array is one of rank > 2.
+            if self.decls.get(y).is_some_and(|t| t.rank() > 2) {
+                return Err(Refusal::not_yet(
+                    None,
+                    "an array of Cholesky correlation factors not declared as such",
+                ));
+            }
+            // 1e-8 is Stan's own constraint tolerance (`CONSTRAINT_TOLERANCE`),
+            // with which it checks a declared `cholesky_factor_corr`.
+            return Ok(Some(format!("max(abs(rows_dot_self({y}) - 1)) > 1e-8")));
+        }
+        Ok(Self::outside_test(
+            y,
+            array,
+            law.bounds.0.as_deref(),
+            law.bounds.1.as_deref(),
+        ))
     }
 
     /// `T[lo, hi]` on data reaching outside the law's support: Stan's `_lpdf`
@@ -2604,6 +2651,62 @@ impl<'m> Emitter<'m> {
             }
             _ => Ok(self.unchecked_bounds(m)),
         }
+    }
+
+    /// The constrained Stan type a prior law's support is (its rows'
+    /// `variate`), the variate axes it spans, and the static size a
+    /// `sizeof(a)[i]` size gives where inference leaves the extent open.
+    fn law_support(&self, law: NodeId) -> Result<Option<(&'static str, usize, Option<u32>)>> {
+        let mut m = self.resolve(law);
+        while self.head(m) == Some("iid") {
+            m = self.resolve(self.call(m).unwrap().args[0]);
+        }
+        let Some(head) = self.head(m) else {
+            return Ok(None);
+        };
+        if head == "broadcast" {
+            let constrained = match self.m.node(self.call(m).unwrap().args[0]) {
+                Node::Const(f) => tables::law_rows_by_head(self.name(*f), None)
+                    .iter()
+                    .any(|r| {
+                        r.variate
+                            .split_once('[')
+                            .is_some_and(|(b, _)| crate::stan_type::support_type(b).is_some())
+                    }),
+                _ => false,
+            };
+            if constrained {
+                return Err(Refusal::not_yet(
+                    Some(m),
+                    "a broadcast of a law on a constrained set",
+                ));
+            }
+            return Ok(None);
+        }
+        let Some(v) = self.row_variate(head, m) else {
+            return Ok(None);
+        };
+        let Some(s) = v.support else {
+            return Ok(None);
+        };
+        let n = match v.size {
+            RowSize::Extent(a, i) => match self.ty(a) {
+                Some(Type::Array { shape, .. }) if i >= 1 => match shape.get(i - 1) {
+                    Some(Dim::Static(n)) => Some(*n),
+                    _ => None,
+                },
+                _ => None,
+            }
+            .map(Some)
+            .ok_or_else(|| {
+                Refusal::not_yet(
+                    Some(m),
+                    format!("a `{head}` variate whose size `{}` is not static", v.expr),
+                )
+            })?,
+            _ => None,
+        };
+        Ok(Some((s, v.axes, n)))
     }
 
     /// The variate bounds of a law whose Stan function does not enforce them
@@ -3527,6 +3630,10 @@ impl<'m> Emitter<'m> {
             flatppl: row.flatppl.clone(),
             custom: row.kind == "custom_lpdf",
             unchecked_support: row.unchecked_support,
+            support_type: row
+                .variate
+                .split_once('[')
+                .and_then(|(b, _)| crate::stan_type::support_type(b)),
         })
     }
 
@@ -3747,6 +3854,29 @@ fn pick(x: &str, b: &str, larger: bool, discrete: bool) -> String {
             };
             format!("{f}({x}, {b})")
         }
+    }
+}
+
+/// `ty` with its last `axes` extents set to `n`: a variate size inference
+/// leaves open, from the law's `sizes`.
+fn with_extent(ty: &Type, axes: usize, n: u32) -> Type {
+    match ty {
+        Type::Array { shape, elem } if matches!(elem.as_ref(), Type::Array { .. }) => Type::Array {
+            shape: shape.clone(),
+            elem: Box::new(with_extent(elem, axes, n)),
+        },
+        Type::Array { shape, elem } => {
+            let mut s = shape.to_vec();
+            let k = s.len().saturating_sub(axes);
+            for d in &mut s[k..] {
+                *d = Dim::Static(n);
+            }
+            Type::Array {
+                shape: s.into(),
+                elem: elem.clone(),
+            }
+        }
+        t => t.clone(),
     }
 }
 

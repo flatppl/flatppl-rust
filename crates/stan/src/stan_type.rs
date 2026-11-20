@@ -13,6 +13,10 @@ pub(crate) struct StanType {
     /// The base's own dimensions (`vector[n]`, `matrix[r, c]`).
     pub dims: Vec<String>,
     pub bounds: Bounds,
+    /// A constrained type the declaration prints in place of `base`
+    /// (`cholesky_factor_corr` for a `matrix`): the support of the law the
+    /// value is drawn from.
+    pub support: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -26,6 +30,16 @@ impl StanType {
         let mut out = String::new();
         if !self.array.is_empty() {
             out.push_str(&format!("array[{}] ", self.array.join(", ")));
+        }
+        if let Some(s) = self.support {
+            // A square matrix type takes its one size.
+            let dims = if square_support(s) {
+                &self.dims[..1]
+            } else {
+                &self.dims[..]
+            };
+            out.push_str(&format!("{s}[{}] {name}", dims.join(", ")));
+            return out;
         }
         out.push_str(self.base);
         out.push_str(&self.bounds.render());
@@ -56,6 +70,28 @@ impl Bounds {
             (Some(l), Some(u)) => format!("<lower={l}, upper={u}>"),
         }
     }
+}
+
+/// The stanc 2.39 constrained type a law's `variate` names, or `None` for an
+/// unconstrained base (`real`, `vector`, `matrix`).
+pub(crate) fn support_type(base: &str) -> Option<&'static str> {
+    Some(match base {
+        "simplex" => "simplex",
+        "unit_vector" => "unit_vector",
+        "ordered" => "ordered",
+        "positive_ordered" => "positive_ordered",
+        "sum_to_zero_vector" => "sum_to_zero_vector",
+        "cholesky_factor_corr" => "cholesky_factor_corr",
+        "cholesky_factor_cov" => "cholesky_factor_cov",
+        "corr_matrix" => "corr_matrix",
+        "cov_matrix" => "cov_matrix",
+        _ => return None,
+    })
+}
+
+/// A constrained type over square matrices, sized by one extent.
+pub(crate) fn square_support(s: &str) -> bool {
+    matches!(s, "cholesky_factor_corr" | "corr_matrix" | "cov_matrix")
 }
 
 /// Stands for a `Dim::Dynamic` extent while a declaration names its axes:
@@ -173,6 +209,7 @@ fn declare_layout(
             base: scalar(s),
             dims: vec![],
             bounds,
+            support: None,
         }),
         Type::TVector { len, elem } => match elem.as_ref() {
             Type::Scalar(s @ (ScalarType::Real | ScalarType::Complex)) => Ok(StanType {
@@ -184,6 +221,7 @@ fn declare_layout(
                 },
                 dims: vec![extent(len, size, node)?],
                 bounds,
+                support: None,
             }),
             _ => Err(Refusal::not_yet(Some(node), "a non-real transposed vector")),
         },
@@ -211,6 +249,7 @@ fn declare_layout(
                             base,
                             dims,
                             bounds: Bounds::default(),
+                            support: None,
                         });
                     }
                     match dims.len() {
@@ -219,18 +258,21 @@ fn declare_layout(
                             base: "vector",
                             dims,
                             bounds,
+                            support: None,
                         }),
                         2 => Ok(StanType {
                             array: vec![],
                             base: "matrix",
                             dims,
                             bounds,
+                            support: None,
                         }),
                         _ => Ok(StanType {
                             array: dims,
                             base: "real",
                             dims: vec![],
                             bounds,
+                            support: None,
                         }),
                     }
                 }
@@ -243,12 +285,14 @@ fn declare_layout(
                     },
                     dims,
                     bounds,
+                    support: None,
                 }),
                 Type::Scalar(s) => Ok(StanType {
                     array: dims,
                     base: scalar(s),
                     dims: vec![],
                     bounds,
+                    support: None,
                 }),
                 inner @ (Type::Array { .. } | Type::TVector { .. }) => {
                     let inner_vs = match vs {
@@ -280,6 +324,30 @@ fn declare_layout(
 mod tests {
     use super::declare;
     use flatppl_core::{Dim, Idx, NodeId, ScalarType, Type, ValueSet};
+
+    /// The two routes to `simplex`: a `stdsimplex(n)` value set, and a law
+    /// whose row's `variate` is `simplex[{n}]` (`Dirichlet`).
+    #[test]
+    fn simplex_from_value_set_and_from_law_support_agree() {
+        let ty = Type::Array {
+            shape: vec![Dim::Static(3)].into(),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        };
+        let size = &mut |e: u32| e.to_string();
+        let node = NodeId::from_usize(0);
+        let by_set = declare(
+            &ty,
+            Some(&ValueSet::StdSimplex(Dim::Static(3))),
+            true,
+            size,
+            node,
+        )
+        .expect("declares");
+        let mut by_law = declare(&ty, None, true, size, node).expect("declares");
+        by_law.support = super::support_type("simplex");
+        assert_eq!(by_set.render("w"), "simplex[3] w");
+        assert_eq!(by_law.render("w"), by_set.render("w"));
+    }
 
     /// Every `sets.ron` row this builder covers, filled from the row's own
     /// template, must equal the declaration `declare` writes for that set.
