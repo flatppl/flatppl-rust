@@ -65,7 +65,7 @@ impl<'m> Emitter<'m> {
                 "a `Dirac` atom beside an iid mixture in this form",
             ));
         }
-        if !(norm && (self.complement(wl, wd) || self.complement(wd, wl))) {
+        if !self.dirac_weights(wl, wd, norm) {
             return Err(Refusal::not_yet(
                 Some(mix),
                 "a `Dirac` mixture with these weights",
@@ -294,7 +294,7 @@ impl<'m> Emitter<'m> {
                 ));
             }
         };
-        if !(norm && (self.complement(wl, wd) || self.complement(wd, wl))) {
+        if !self.dirac_weights(wl, wd, norm) {
             return Err(Refusal::not_yet(
                 Some(mix),
                 "an iid mixture with these weights",

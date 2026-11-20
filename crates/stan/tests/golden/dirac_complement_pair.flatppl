@@ -1,0 +1,10 @@
+# emit: target=post
+flatppl_compat = "0.1"
+K = 20
+y_obs = [7, 0, 5, 0, 9]
+p ~ Beta(1.5, 1.5)
+psi ~ Beta(1.5, 1.5)
+ZIB = superpose(weighted(psi, Binomial(K, p)), weighted(1 - psi, Dirac(0)))
+y ~ iid(ZIB, 5)
+prior = lawof(record(p = p, psi = psi))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), p = p, psi = psi), record(y = y_obs)), prior)

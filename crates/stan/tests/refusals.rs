@@ -1474,6 +1474,36 @@ fn sum_and_density_targets_name_what_the_user_wrote() {
 }
 
 #[test]
+fn a_splat_of_a_loaded_table_is_not_yet_supported() {
+    let r = refuse_with(
+        "m0 ~ Normal(0.0, 1.0)\nT = load_data(\"t.csv\", anything)\ny ~ Normal.(T)\n\
+         prior = lawof(record(m0 = m0))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(y = y), m0 = m0), record(y = [0.1, 0.9])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a splat of an argument that is not a record or a `table(…)` literal"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_negative_literal_mixture_weight_is_ill_formed() {
+    // §06 `weighted` takes a non-negative weight; `log(-0.5)` would be NaN.
+    let r = refuse_with(
+        "mu ~ Normal(0.0, 1.0)\n\
+         y ~ normalize(superpose(weighted(-0.5, Normal(mu, 1.0)), weighted(1.5, Normal(2.0, 1.0))))\n\
+         prior = lawof(record(mu = mu))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(y = y), mu = mu), record(y = 0.5)), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(r.reason.contains("non-negative weight"), "{r}");
+}
+
+#[test]
 fn a_nested_record_observation_is_not_yet_supported() {
     let r = refuse_with(
         "t1 = elementof(reals)\nt2 = elementof(posreals)\n\

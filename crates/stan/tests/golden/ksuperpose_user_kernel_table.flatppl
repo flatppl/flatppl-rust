@@ -1,0 +1,9 @@
+# emit: target=post
+flatppl_compat = "0.1"
+components = table(m = [-2.0, 2.0], s = [0.7, 0.9])
+k(m, s) = Normal(m, s)
+weights ~ Dirichlet([2.0, 2.0])
+mixture = ksuperpose(k, weights, components)
+y ~ iid(mixture, 4)
+prior = lawof(record(weights = weights))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), weights = weights), record(y = [-2.3, -1.6, 1.8, 2.6])), prior)

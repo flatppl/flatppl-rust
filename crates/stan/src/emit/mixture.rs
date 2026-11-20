@@ -5,8 +5,10 @@
 //! is `Σ w_i` because every component is a probability measure. Stan cannot
 //! vectorize a mixture over observations (User's Guide "Vectorizing
 //! mixtures"), so an iid variate takes one `target +=` per element. The
-//! provably normalized forms of §06 use `log_mix`: the complement pair
-//! `weighted(w, A), weighted(1 - w, B)` and a simplex `ksuperpose` weight.
+//! provably normalized forms of §06 ([`Emitter::provably_normalized`]: exact
+//! literal weights, the complement pair, simplex weights) need no
+//! normalizer, written `normalize` or not; the complement pair and a simplex
+//! `ksuperpose` weight use `log_mix`.
 //! A `Dirac` component beside a discrete law splits observed data in
 //! `transformed data` into the values at the atom and the rest (User's Guide
 //! "Zero-inflated and hurdle models").
@@ -15,7 +17,7 @@ use super::Emitter;
 use super::functions::FnCtx;
 use super::structure::Law;
 use crate::refuse::{Refusal, RefusalKind, Result};
-use flatppl_core::{Node, NodeId, Type};
+use flatppl_core::{Node, NodeId, Type, ValueSet};
 use std::collections::HashMap;
 
 mod nested;
@@ -275,7 +277,7 @@ impl<'m> Emitter<'m> {
                 "a `Dirac` atom over a vector variate in this form",
             ));
         }
-        if !(norm && (self.complement(wl, wd) || self.complement(wd, wl))) {
+        if !self.dirac_weights(wl, wd, norm) {
             return Err(Refusal::not_yet(
                 Some(mix),
                 "a `Dirac` mixture with these weights",
@@ -512,6 +514,7 @@ impl<'m> Emitter<'m> {
             let r = self.resolve(a);
             let (w, law) = if self.head(r) == Some("weighted") {
                 let wc = self.call(r).unwrap();
+                self.nonnegative_weight(wc.args[0])?;
                 (Some(wc.args[0]), self.resolve(wc.args[1]))
             } else {
                 (None, r)
@@ -523,6 +526,34 @@ impl<'m> Emitter<'m> {
             });
         }
         Ok(out)
+    }
+
+    /// A negative numeric literal weight (`-0.5`) refuses: §06 `weighted`
+    /// takes "a non-negative weight", and its `log(w)` would be NaN. A
+    /// computed weight is the model's own.
+    fn nonnegative_weight(&self, w: NodeId) -> Result<()> {
+        let lit = |n: NodeId| match self.m.node(self.resolve(n)) {
+            Node::Lit(flatppl_core::Scalar::Int(k)) => Some(*k as f64),
+            Node::Lit(flatppl_core::Scalar::Real(x)) => Some(*x),
+            _ => None,
+        };
+        let r = self.resolve(w);
+        let value = match self.head(r) {
+            Some("neg") => lit(self.call(r).unwrap().args[0]).map(|x| -x),
+            _ => lit(w),
+        };
+        match value {
+            Some(x) if x < 0.0 => Err(Refusal::new(
+                RefusalKind::IllFormedModule,
+                Some(w),
+                format!("the negative weight {x}"),
+                format!(
+                    "the weight {x} is negative; §06 `weighted` takes a non-negative weight, so \
+                     the module is ill-formed"
+                ),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// `log(w)` of a mixture weight, `log1m(x)` when `w` is `1 - x`: the
@@ -541,7 +572,8 @@ impl<'m> Emitter<'m> {
         Ok(format!("log({})", self.real(w)?.s))
     }
 
-    /// `weighted(w, A), weighted(1 - w, B)`: the second weight is `1 - w`.
+    /// `weighted(w, A), weighted(1 - w, B)`: the second weight is `1 - w`,
+    /// `w` one node.
     fn complement(&self, a: Option<NodeId>, b: Option<NodeId>) -> bool {
         let (Some(a), Some(b)) = (a, b) else {
             return false;
@@ -558,6 +590,101 @@ impl<'m> Emitter<'m> {
         one && self.m.structural_eq(bc.args[1], a)
     }
 
+    /// `true` when the value set of `x` lies within `unitinterval`.
+    fn within_unit(&self, x: NodeId) -> bool {
+        match self.value_set(x) {
+            Some(ValueSet::UnitInterval | ValueSet::Booleans) => true,
+            Some(ValueSet::Interval(lo, hi)) => lo >= 0.0 && hi <= 1.0,
+            _ => false,
+        }
+    }
+
+    /// The value set of `x`, through the binding it names.
+    fn value_set(&self, x: NodeId) -> Option<ValueSet> {
+        self.m.valueset_of(x).cloned().or_else(|| {
+            let s = self.self_ref(x)?;
+            let b = self
+                .m
+                .binding_by_name(*self.m.alias_chain(s).last().unwrap())?;
+            self.m.valueset_of(self.m.binding(b).rhs).cloned()
+        })
+    }
+
+    /// §06 "Provably normalized superpositions": weights under which a
+    /// superposition of probability measures is one. The forms every engine
+    /// must recognize: numeric literals whose values as written sum to
+    /// exactly one; the complement pair `w`, `1 - w`; and `p[1]`, …, `p[n]`
+    /// of one node `p` whose value set lies within `stdsimplex(n)`. An
+    /// unweighted part has weight 1.
+    pub(super) fn provably_normalized(&self, weights: &[Option<NodeId>]) -> bool {
+        if let [a, b] = weights
+            && let Some(w) = if self.complement(*a, *b) {
+                *a
+            } else if self.complement(*b, *a) {
+                *b
+            } else {
+                None
+            }
+        {
+            return self.within_unit(w);
+        }
+        // Exact decimal arithmetic on the literals, never a floating-point sum.
+        let literal = |w: &Option<NodeId>| -> Option<String> {
+            match w {
+                None => Some("1".to_string()),
+                Some(n) => match self.m.node(self.resolve(*n)) {
+                    Node::Lit(flatppl_core::Scalar::Int(k)) => Some(k.to_string()),
+                    Node::Lit(flatppl_core::Scalar::Real(x)) => Some(format!("{x}")),
+                    _ => None,
+                },
+            }
+        };
+        if let Some(texts) = weights.iter().map(literal).collect::<Option<Vec<_>>>() {
+            return decimal_sum_is_one(&texts);
+        }
+        // `p[1], …, p[n]` of one simplex vector.
+        let Some(Some(first)) = weights.first() else {
+            return false;
+        };
+        let base = |w: NodeId| -> Option<(NodeId, i64)> {
+            let r = self.resolve(w);
+            let c = self.call(r).filter(|_| self.head(r) == Some("get"))?;
+            match (c.args.len(), self.m.node(c.args[1])) {
+                (2, Node::Lit(flatppl_core::Scalar::Int(k))) => Some((c.args[0], *k)),
+                _ => None,
+            }
+        };
+        let Some((p, _)) = base(*first) else {
+            return false;
+        };
+        let mut seen = vec![false; weights.len()];
+        for w in weights {
+            let Some((q, k)) = w.and_then(base) else {
+                return false;
+            };
+            let Some(slot) = usize::try_from(k - 1).ok().and_then(|i| seen.get_mut(i)) else {
+                return false;
+            };
+            if *slot || !self.m.structural_eq(p, q) {
+                return false;
+            }
+            *slot = true;
+        }
+        matches!(self.value_set(p), Some(ValueSet::StdSimplex(flatppl_core::Dim::Static(n))) if n as usize == weights.len())
+    }
+
+    /// The two weights of a `Dirac` atom beside one law, where the split
+    /// terms may read the law's weight as one minus the atom's.
+    // Without `normalize` the mixture is a probability measure only by a §06
+    // form, so the pair needs `w` within `unitinterval`. Under a written
+    // `normalize`, Z = w + (1 - w) = 1 for any `w`: it is the identity.
+    fn dirac_weights(&self, wl: Option<NodeId>, wd: Option<NodeId>, norm: bool) -> bool {
+        wl.is_some()
+            && wd.is_some()
+            && (self.provably_normalized(&[wl, wd])
+                || (norm && (self.complement(wl, wd) || self.complement(wd, wl))))
+    }
+
     /// The log density of the scalar `y` under `law`, for one element of a
     /// weighted log likelihood. A `Dirac(c)` atom beside a law splits on
     /// `y == c`, from the same terms as the Dirac split: at the atom the
@@ -572,7 +699,7 @@ impl<'m> Emitter<'m> {
                     _ => None,
                 };
                 if let Some((dirac_first, (wd, atom), (wl, inner))) = split {
-                    if !(norm && (self.complement(wl, wd) || self.complement(wd, wl))) {
+                    if !self.dirac_weights(wl, wd, norm) {
                         return Err(Refusal::not_yet(
                             Some(mix),
                             "a `Dirac` mixture with these weights",
@@ -709,7 +836,7 @@ impl<'m> Emitter<'m> {
             lp = format!("{lp} - log_sum_exp([{}]')", zs.join(", "));
         } else if norm && weights.iter().all(Option::is_none) {
             lp = format!("{lp} - log({})", weights.len());
-        } else if norm {
+        } else if norm && !self.provably_normalized(&weights) {
             let ws: Vec<String> = weights
                 .iter()
                 .map(|w| -> Result<String> {
@@ -732,6 +859,12 @@ impl<'m> Emitter<'m> {
             return Err(Refusal::not_yet(Some(mix), "ksuperpose with no weights"));
         }
         let (kernel, weights) = (c.args[0], c.args[1]);
+        let wr = self.resolve(weights);
+        if self.head(wr) == Some("vector") {
+            for &w in self.call(wr).unwrap().args.iter() {
+                self.nonnegative_weight(w)?;
+            }
+        }
         let params: Vec<NodeId> = c.args[2..].to_vec();
         let named: Vec<(String, NodeId)> = c
             .named
@@ -763,11 +896,9 @@ impl<'m> Emitter<'m> {
             format!("for ({k} in 1:{n}) {{\n  {lps}[{k}] = {lp};\n}}"),
         ];
         let w = self.real(weights)?;
-        let simplex = self
-            .self_ref(weights)
-            .and_then(|s| self.env.get(&s).cloned())
-            .and_then(|n| self.decls.get(&n))
-            .is_some_and(|t| t.base == "simplex");
+        // §06 "Provably normalized superpositions": a weights vector whose
+        // value set lies within `stdsimplex(n)`, passed whole.
+        let simplex = matches!(self.value_set(weights), Some(ValueSet::StdSimplex(_)));
         let lp = if norm && simplex {
             format!("log_mix({}, {lps})", w.s)
         } else if norm {
@@ -826,19 +957,52 @@ impl<'m> Emitter<'m> {
         let fun = self
             .user_callee(kernel)
             .ok_or_else(|| Refusal::not_yet(Some(at), "ksuperpose of this kernel"))?;
-        if !named.is_empty() {
-            return Err(Refusal::not_yet(
-                Some(at),
-                "ksuperpose of a user kernel with keyword arguments",
-            ));
-        }
         let (body, entries) = self.callable_parts(fun)?;
+        // §04 "Auto-splatting" of a lone record or table, then keyword
+        // arguments bound to the kernel's inputs by name (§06 `ksuperpose`:
+        // a table's columns are the kernel's inputs).
+        let mut named = named.to_vec();
+        let mut params = params.to_vec();
+        if let [a] = params[..]
+            && named.is_empty()
+            && entries.len() >= 2
+            && let Some(fields) = self.splat_fields(a)?
+        {
+            named = fields;
+            params.clear();
+        }
+        if !named.is_empty() {
+            if !params.is_empty() || named.len() != entries.len() {
+                return Err(Refusal::not_yet(
+                    Some(at),
+                    "ksuperpose of a user kernel with positional and keyword arguments",
+                ));
+            }
+            params = entries
+                .iter()
+                .map(|(n, _)| {
+                    named
+                        .iter()
+                        .find(|(k, _)| k == self.name(*n))
+                        .map(|(_, v)| *v)
+                        .ok_or_else(|| {
+                            Refusal::not_yet(
+                                Some(at),
+                                format!(
+                                    "a ksuperpose without the kernel input `{}`",
+                                    self.name(*n)
+                                ),
+                            )
+                        })
+                })
+                .collect::<Result<_>>()?;
+        }
         if entries.len() != params.len() {
             return Err(Refusal::not_yet(Some(at), "ksuperpose with another arity"));
         }
         let mut locals = HashMap::new();
         let mut tys = Vec::new();
-        for ((_, r), &a) in entries.iter().zip(params) {
+        for ((_, r), &a) in entries.iter().zip(&params) {
             let t = self
                 .ty(a)
                 .ok_or_else(|| Refusal::not_yet(Some(a), "an untyped argument"))?;
@@ -1161,7 +1325,7 @@ impl<'m> Emitter<'m> {
                 "a `Dirac` mixture over this variate",
             ));
         }
-        if !(norm && (self.complement(wl, wd) || self.complement(wd, wl))) {
+        if !self.dirac_weights(wl, wd, norm) {
             return Err(Refusal::not_yet(
                 Some(mix),
                 "a `Dirac` mixture with these weights",
@@ -1300,7 +1464,7 @@ impl<'m> Emitter<'m> {
                 "a `Dirac` atom beside a continuous law over this variate",
             ));
         }
-        if !(norm && (self.complement(wl, wd) || self.complement(wd, wl))) {
+        if !self.dirac_weights(wl, wd, norm) {
             return Err(Refusal::not_yet(
                 Some(mix),
                 "a `Dirac` mixture with these weights",
@@ -1417,6 +1581,36 @@ pub(super) fn split_args(inner: &str) -> Vec<String> {
         parts.push(inner[start..].trim().to_string());
     }
     parts
+}
+
+/// `true` when the decimal literals `texts` (`0.3`, `7`, `0.25`) sum to
+/// exactly one, by integer arithmetic at their common scale. Each text is
+/// the literal's shortest round-trip decimal, which is the literal as
+/// written for every literal a user writes at that precision.
+fn decimal_sum_is_one(texts: &[String]) -> bool {
+    let parts: Option<Vec<(i128, u32)>> = texts
+        .iter()
+        .map(|t| {
+            let (int, frac) = t.split_once('.').unwrap_or((t, ""));
+            if frac.len() > 30 || int.starts_with('-') {
+                return None;
+            }
+            let digits = format!("{int}{frac}");
+            Some((digits.parse::<i128>().ok()?, frac.len() as u32))
+        })
+        .collect();
+    let Some(parts) = parts else {
+        return false;
+    };
+    let scale = parts.iter().map(|p| p.1).max().unwrap_or(0);
+    let mut sum: i128 = 0;
+    for (v, s) in parts {
+        let Some(term) = 10i128.checked_pow(scale - s).and_then(|f| v.checked_mul(f)) else {
+            return false;
+        };
+        sum += term;
+    }
+    10i128.checked_pow(scale) == Some(sum)
 }
 
 /// Statements `pre` then `last`, in a block when `pre` declares locals.
