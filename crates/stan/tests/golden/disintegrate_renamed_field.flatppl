@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+theta1 ~ Normal(0, 1)
+theta2 ~ Exponential(1)
+obs ~ iid(Normal(theta1, theta2), 4)
+J = lawof(record(mu = theta1, sigma = theta2, yobs = obs))
+K, prior = disintegrate(["yobs"], J)
+L = likelihoodof(K, record(yobs = [0.3, -0.2, 1.1, 0.6]))
+post = bayesupdate(L, prior)

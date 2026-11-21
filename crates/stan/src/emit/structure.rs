@@ -6,7 +6,9 @@ use crate::ManifestParam;
 use crate::refuse::{Refusal, RefusalKind, Result};
 use crate::stan_type::StanType;
 use crate::tables;
-use flatppl_core::{Dim, Inputs, NamedKind, Node, NodeId, RefNs, Scalar, Symbol, Type, ValueSet};
+use flatppl_core::{
+    Dim, Inputs, NamedKind, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type, ValueSet,
+};
 use std::collections::{HashMap, HashSet};
 
 /// The loop index a per-element argument of a broadcast law is rendered with.
@@ -231,7 +233,9 @@ impl<'m> Emitter<'m> {
                 let c = self.call(rhs).unwrap();
                 let (lik, prior) = (c.args[0], c.args[1]);
                 let fields = self.prior_fields(prior)?;
-                self.declare_params(rhs, &fields)?;
+                // A split's marginal declares its fields on the joint's sets.
+                let declared = self.disintegrate_part(prior, 2).map_or(rhs, |(_, _, j)| j);
+                self.declare_params(declared, &fields)?;
                 for (name, sym) in std::mem::take(&mut self.links) {
                     if let Some(stan) = self.fields.get(&name).cloned() {
                         self.env.insert(sym, stan);
@@ -267,10 +271,10 @@ impl<'m> Emitter<'m> {
                     return Err(Refusal::not_yet(Some(rhs), "logdensityof with this arity"));
                 };
                 let mr = self.resolve(m);
-                if self.head(mr) == Some("restrict") {
-                    return Err(Self::restrict_not_yet(mr));
-                }
-                if matches!(self.head(mr), Some("bayesupdate" | "logweighted")) {
+                if matches!(
+                    self.head(mr),
+                    Some("bayesupdate" | "logweighted" | "restrict")
+                ) {
                     return self.posterior_at_point(mr, x);
                 }
                 if matches!(self.head(mr), Some("likelihoodof" | "joint_likelihood")) {
@@ -302,9 +306,19 @@ impl<'m> Emitter<'m> {
             Some("sub") if self.reads_log_density(rhs) => {
                 Err(Refusal::not_yet(Some(rhs), "a difference of log densities"))
             }
-            // A restricted measure has a density (the joint at the observed
-            // fields); its Stan form is not written yet.
-            Some("restrict") => Err(Self::restrict_not_yet(rhs)),
+            // `restrict(J, x)` along observed leaves is the posterior of the
+            // split (§06 "Measure restriction", selector form).
+            Some("restrict") => {
+                let (split, x) = self.restrict_split(rhs)?;
+                let fields = self.record_prior_fields(split.complement.clone())?;
+                // The fields keep the joint's sets.
+                let joint = self.call(rhs).unwrap().args[0];
+                self.declare_params(joint, &fields)?;
+                self.bind_derived_draws(&fields)?;
+                let obs = self.split_observations(rhs, &split, x, true)?;
+                self.prior_statements(&fields)?;
+                self.observe(obs)
+            }
             Some("tuple") => Err(Refusal::new(
                 RefusalKind::NotADensity,
                 Some(rhs),
@@ -367,13 +381,6 @@ impl<'m> Emitter<'m> {
             },
             _ => "call".to_string(),
         }
-    }
-
-    fn restrict_not_yet(at: NodeId) -> Refusal {
-        Refusal::not_yet(
-            Some(at),
-            "`restrict` of a joint law to observed fields (the posterior density)",
-        )
     }
 
     /// `logdensityof(M, x)` of a measure: the likelihood of M at the point x.
@@ -580,11 +587,17 @@ impl<'m> Emitter<'m> {
     /// inputs the point reads are the program's parameters (§06: the density
     /// of the posterior measure at the point).
     fn posterior_at_point(&mut self, post: NodeId, x: NodeId) -> Result<()> {
+        // `restrict(J, x)`: the split's marginal and kernel at its point.
+        let split = match self.head(post) {
+            Some("restrict") => Some(self.restrict_split(post)?),
+            _ => None,
+        };
         let (lik, prior) = match self.head(post) {
             Some("bayesupdate") => {
                 let c = self.call(post).unwrap();
                 (Some(c.args[0]), c.args[1])
             }
+            Some("restrict") => (None, self.call(post).unwrap().args[0]),
             _ => (None, post),
         };
         let point = self.resolve(x);
@@ -594,7 +607,10 @@ impl<'m> Emitter<'m> {
                 "a posterior at a point that is not a record",
             ));
         }
-        let fields = self.prior_fields(prior)?;
+        let fields = match &split {
+            Some((sp, _)) => self.record_prior_fields(sp.complement.clone())?,
+            None => self.prior_fields(prior)?,
+        };
         // The prior's inputs, the likelihood's outside its kernel boundaries,
         // the point's and the observed values': in one pass. A prior field
         // declared by `elementof` takes the point's value, not a declaration.
@@ -609,6 +625,9 @@ impl<'m> Emitter<'m> {
         let bound = self.point_binding(point, &denotes)?;
         let mut params = self.free_input_syms(prior);
         let mut points = vec![x];
+        if let Some((_, rx)) = &split {
+            points.push(*rx);
+        }
         if let Some(l) = lik {
             params.extend(self.likelihood_signature(l).free);
             self.likelihood_parts(l, &mut Vec::new(), &mut points);
@@ -651,9 +670,10 @@ impl<'m> Emitter<'m> {
             }
         }
         self.bind_derived_draws(&fields)?;
-        let obs = match lik {
-            Some(l) => Some(self.likelihood(l, true)?),
-            None => None,
+        let obs = match (lik, &split) {
+            (Some(l), _) => Some(self.likelihood(l, true)?),
+            (None, Some((sp, rx))) => Some(self.split_observations(post, sp, *rx, true)?),
+            (None, None) => None,
         };
         self.point_fields = fields.iter().map(|f| f.field).collect();
         self.prior_statements(&fields)?;
@@ -725,8 +745,69 @@ impl<'m> Emitter<'m> {
         self.emit_weights()
     }
 
+    /// The prior fields of a record `lawof(record(f = v, …))` or of the
+    /// marginal of one: each field's draw and law.
+    fn record_prior_fields(&mut self, named: Vec<(Symbol, NodeId)>) -> Result<Vec<PriorField>> {
+        let mut out = Vec::new();
+        // A field `v = f(x)` of one draw x has law `pushfwd(f, law(x))`
+        // (§06); x is then no parameter of its own.
+        let mut behind: Vec<(Symbol, Symbol)> = Vec::new();
+        for (field, value) in named {
+            let sym = self
+                .self_ref(value)
+                .map(|s| *self.m.alias_chain(s).last().unwrap());
+            let rhs = sym.map(|s| self.m.binding(self.m.binding_by_name(s).unwrap()).rhs);
+            let (binding, law) = match (sym, rhs) {
+                (Some(s), Some(rhs)) if self.head(rhs) == Some("draw") => {
+                    (Some(s), self.call(rhs).unwrap().args[0])
+                }
+                _ => {
+                    let name = self.name(field).to_string();
+                    let (x, _) = self.derived_field(&name, value, value)?;
+                    behind.push((x, field));
+                    (sym, self.resolve(value))
+                }
+            };
+            out.push(PriorField {
+                field,
+                binding,
+                law: Some(law),
+                node: value,
+                sets: self.law_sets(law),
+            });
+        }
+        for (k, &(x, field)) in behind.iter().enumerate() {
+            let node = out.iter().find(|f| f.field == field).unwrap().node;
+            if out.iter().any(|f| f.binding == Some(x)) {
+                return Err(Refusal::not_yet(
+                    Some(node),
+                    format!(
+                        "a derived prior field of `{}`, which is itself a prior field",
+                        self.name(x)
+                    ),
+                ));
+            }
+            if behind[..k].iter().any(|b| b.0 == x) {
+                return Err(Refusal::not_yet(
+                    Some(node),
+                    format!(
+                        "two derived prior fields of the one draw `{}`",
+                        self.name(x)
+                    ),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     fn prior_fields(&mut self, prior: NodeId) -> Result<Vec<PriorField>> {
         let p = self.resolve(prior);
+        // The marginal of `disintegrate(sel, J)` (§06 "Structural
+        // disintegration"): J's fields outside the selector.
+        if let Some((at, sel, joint)) = self.disintegrate_part(p, 2) {
+            let split = self.leaf_split(at, sel, joint)?;
+            return self.record_prior_fields(split.complement);
+        }
         let mut out = Vec::new();
         match self.head(p) {
             Some("lawof") => {
@@ -741,54 +822,7 @@ impl<'m> Emitter<'m> {
                     .iter()
                     .map(|na| (na.name, na.value))
                     .collect();
-                // A field `v = f(x)` of one draw x has law `pushfwd(f, law(x))`
-                // (§06); x is then no parameter of its own.
-                let mut behind: Vec<(Symbol, Symbol)> = Vec::new();
-                for (field, value) in named {
-                    let sym = self
-                        .self_ref(value)
-                        .map(|s| *self.m.alias_chain(s).last().unwrap());
-                    let rhs = sym.map(|s| self.m.binding(self.m.binding_by_name(s).unwrap()).rhs);
-                    let (binding, law) = match (sym, rhs) {
-                        (Some(s), Some(rhs)) if self.head(rhs) == Some("draw") => {
-                            (Some(s), self.call(rhs).unwrap().args[0])
-                        }
-                        _ => {
-                            let name = self.name(field).to_string();
-                            let (x, _) = self.derived_field(&name, value, value)?;
-                            behind.push((x, field));
-                            (sym, self.resolve(value))
-                        }
-                    };
-                    out.push(PriorField {
-                        field,
-                        binding,
-                        law: Some(law),
-                        node: value,
-                        sets: self.law_sets(law),
-                    });
-                }
-                for (k, &(x, field)) in behind.iter().enumerate() {
-                    let node = out.iter().find(|f| f.field == field).unwrap().node;
-                    if out.iter().any(|f| f.binding == Some(x)) {
-                        return Err(Refusal::not_yet(
-                            Some(node),
-                            format!(
-                                "a derived prior field of `{}`, which is itself a prior field",
-                                self.name(x)
-                            ),
-                        ));
-                    }
-                    if behind[..k].iter().any(|b| b.0 == x) {
-                        return Err(Refusal::not_yet(
-                            Some(node),
-                            format!(
-                                "two derived prior fields of the one draw `{}`",
-                                self.name(x)
-                            ),
-                        ));
-                    }
-                }
+                out.extend(self.record_prior_fields(named)?);
             }
             Some("joint") => {
                 let c = self.call(p).unwrap();
@@ -1068,6 +1102,12 @@ impl<'m> Emitter<'m> {
             self.free_inputs(k)?;
             return self.measure_observations(k, obs);
         }
+        // The kernel of `disintegrate(sel, J)`: the selected fields given the
+        // others (§06 "Structural disintegration").
+        if let Some((at, sel, joint)) = self.disintegrate_part(k, 1) {
+            let split = self.leaf_split(at, sel, joint)?;
+            return self.split_observations(k, &split, obs, has_prior);
+        }
         let c = self
             .call(k)
             .ok_or_else(|| Refusal::not_yet(Some(k), "this kernel"))?;
@@ -1092,47 +1132,7 @@ impl<'m> Emitter<'m> {
                 ));
             }
         };
-        for (name, sym) in inputs {
-            let sym = *self.m.alias_chain(sym).last().unwrap();
-            if let Some(stan) = self.fields.get(&name).cloned() {
-                self.env.insert(sym, stan);
-                continue;
-            }
-            if has_prior {
-                return Err(Refusal::not_yet(
-                    Some(k),
-                    format!("kernel input `{}` with no prior field", self.name(name)),
-                ));
-            }
-            // A likelihood target: the input is a flat parameter.
-            let rhs = self.m.binding(self.m.binding_by_name(sym).unwrap()).rhs;
-            let stan = self.fresh(self.name(name));
-            let vs = self.m.valueset_of(rhs).cloned();
-            let hints = match self.call(rhs) {
-                Some(c) if self.head(rhs) == Some("elementof") => self.set_hints(c.args[0]),
-                _ => vec![],
-            };
-            // An integer or boolean kernel input is data, as a free input is.
-            if self.m.type_of(rhs).is_some_and(ty_is_int) {
-                let t = self.declare_data(rhs, vs.as_ref(), true, &stan, &hints)?;
-                self.data.push(format!("{};", t.render(&stan)));
-                self.record_decl(&stan, t);
-                self.env.insert(sym, stan);
-                continue;
-            }
-            let t = self.declare(rhs, vs.as_ref(), true, &stan, &hints)?;
-            self.params.push(format!("{};", t.render(&stan)));
-            self.record_decl(&stan, t);
-            self.env.insert(sym, stan.clone());
-            self.fields.insert(name, stan.clone());
-            self.manifest_bindings.push(Some(sym));
-            self.manifest.push(ManifestParam {
-                stan,
-                field: self.name(name).to_string(),
-                input: None,
-                index: None,
-            });
-        }
+        self.bind_kernel_inputs(k, inputs, has_prior)?;
         let body = c.args[0];
         match self.head(k) {
             Some("kernelof") => {
@@ -1147,25 +1147,7 @@ impl<'m> Emitter<'m> {
                 } else {
                     vec![(None, body)]
                 };
-                let mut result = Vec::new();
-                for (field, value) in pairs {
-                    let (draw, law) = self.output_law(value)?;
-                    let obs_value = match field {
-                        Some(f) => self.obs_field(obs, f)?,
-                        None => obs,
-                    };
-                    let name = match field {
-                        Some(f) => self.name(f).to_string(),
-                        None => "y".to_string(),
-                    };
-                    result.push(Observation {
-                        draw,
-                        law,
-                        value: obs_value,
-                        name,
-                    });
-                }
-                Ok(result)
+                self.record_observations(pairs, obs)
             }
             // A keyword `joint` body has a record variate: one observation
             // per field, as for a `kernelof` record.
@@ -1215,6 +1197,143 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// Each kernel input bound to its prior field, or, for a likelihood
+    /// target, declared as a flat parameter.
+    fn bind_kernel_inputs(
+        &mut self,
+        k: NodeId,
+        inputs: Vec<(Symbol, Symbol)>,
+        has_prior: bool,
+    ) -> Result<()> {
+        for (name, sym) in inputs {
+            let sym = *self.m.alias_chain(sym).last().unwrap();
+            if let Some(stan) = self.fields.get(&name).cloned() {
+                self.env.insert(sym, stan);
+                continue;
+            }
+            if has_prior {
+                return Err(Refusal::not_yet(
+                    Some(k),
+                    format!("kernel input `{}` with no prior field", self.name(name)),
+                ));
+            }
+            // A likelihood target: the input is a flat parameter.
+            let rhs = self.m.binding(self.m.binding_by_name(sym).unwrap()).rhs;
+            let stan = self.fresh(self.name(name));
+            let vs = self.m.valueset_of(rhs).cloned();
+            let hints = match self.call(rhs) {
+                Some(c) if self.head(rhs) == Some("elementof") => self.set_hints(c.args[0]),
+                _ => vec![],
+            };
+            // An integer or boolean kernel input is data, as a free input is.
+            if self.m.type_of(rhs).is_some_and(ty_is_int) {
+                let t = self.declare_data(rhs, vs.as_ref(), true, &stan, &hints)?;
+                self.data.push(format!("{};", t.render(&stan)));
+                self.record_decl(&stan, t);
+                self.env.insert(sym, stan);
+                continue;
+            }
+            let t = self.declare(rhs, vs.as_ref(), true, &stan, &hints)?;
+            self.params.push(format!("{};", t.render(&stan)));
+            self.record_decl(&stan, t);
+            self.env.insert(sym, stan.clone());
+            self.fields.insert(name, stan.clone());
+            self.manifest_bindings.push(Some(sym));
+            self.manifest.push(ManifestParam {
+                stan,
+                field: self.name(name).to_string(),
+                input: None,
+                index: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// One observation per output field of a kernel's record variate (or
+    /// its one unnamed variate), each at its observed value.
+    fn record_observations(
+        &mut self,
+        pairs: Vec<(Option<Symbol>, NodeId)>,
+        obs: NodeId,
+    ) -> Result<Vec<Observation>> {
+        let mut result = Vec::new();
+        for (field, value) in pairs {
+            let (draw, law) = self.output_law(value)?;
+            let obs_value = match field {
+                Some(f) => self.obs_field(obs, f)?,
+                None => obs,
+            };
+            let name = match field {
+                Some(f) => self.name(f).to_string(),
+                None => "y".to_string(),
+            };
+            // Observed data is data in Stan: a value that reads a draw or a
+            // parameter has no data form.
+            if let Some(d) = self.observed_reads_parameter(obs_value) {
+                return Err(Refusal::not_yet(
+                    Some(obs_value),
+                    format!(
+                        "observed data `{name}` that reads `{}`, a parameter of the target",
+                        self.name(d)
+                    ),
+                ));
+            }
+            result.push(Observation {
+                draw,
+                law,
+                value: obs_value,
+                name,
+            });
+        }
+        Ok(result)
+    }
+
+    /// A draw, or an `elementof` declared as a Stan parameter, that `value`
+    /// reads. A draw counts only when the inferred phase of `value` is
+    /// stochastic, and only outside a reification, which absorbs the draws it
+    /// reifies (§04 "Phase of the reified law").
+    fn observed_reads_parameter(&self, value: NodeId) -> Option<Symbol> {
+        let none = HashSet::new();
+        let found = self.reached(value, &none);
+        let draws = if self.m.phase_of(value) == Some(Phase::Stochastic) {
+            self.reached_unabsorbed(value, &none)
+        } else {
+            HashSet::new()
+        };
+        self.m
+            .bindings()
+            .map(|(_, b)| b)
+            .filter(|b| found.contains(&b.name))
+            .find(|b| match self.head(b.rhs) {
+                Some("draw") => draws.contains(&b.name),
+                Some("elementof") => self
+                    .env
+                    .get(&b.name)
+                    .is_some_and(|s| self.manifest.iter().any(|p| &p.stan == s)),
+                _ => false,
+            })
+            .map(|b| b.name)
+    }
+
+    /// The likelihood of a split's kernel at `obs`: its inputs are the
+    /// complement fields, its variates the selected ones.
+    fn split_observations(
+        &mut self,
+        at: NodeId,
+        split: &super::disintegrate::Split,
+        obs: NodeId,
+        has_prior: bool,
+    ) -> Result<Vec<Observation>> {
+        let inputs = split
+            .complement
+            .iter()
+            .map(|&(f, v)| (f, self.self_ref(v).expect("a field draw")))
+            .collect();
+        self.bind_kernel_inputs(at, inputs, has_prior)?;
+        let pairs = split.selected.iter().map(|&(f, v)| (Some(f), v)).collect();
+        self.record_observations(pairs, obs)
+    }
+
     /// The `elementof` bindings `m` reads, in module order.
     fn free_input_syms(&self, m: NodeId) -> Vec<Symbol> {
         self.free_input_syms_cut(m, &HashSet::new())
@@ -1236,7 +1355,24 @@ impl<'m> Emitter<'m> {
     /// `elementof` and not through a binding in `cut`. A reification
     /// (`functionof`, `kernelof`, their `fn` and named-function forms) is a
     /// boundary: its body does not read its own inputs, a call sets them.
-    fn reached(&self, m: NodeId, cut: &HashSet<Symbol>) -> HashSet<Symbol> {
+    pub(super) fn reached(&self, m: NodeId, cut: &HashSet<Symbol>) -> HashSet<Symbol> {
+        self.walk_reached(m, cut, false)
+    }
+
+    /// As [`Self::reached`], but not into the body of a reification (`lawof`,
+    /// `kernelof`, `functionof`): it absorbs the draws it reifies (§04 "Phase
+    /// of the reified law"; a reified callable has fixed phase). Its free
+    /// inputs stay free, so only a draw query takes this walk.
+    pub(super) fn reached_unabsorbed(&self, m: NodeId, cut: &HashSet<Symbol>) -> HashSet<Symbol> {
+        self.walk_reached(m, cut, true)
+    }
+
+    fn walk_reached(
+        &self,
+        m: NodeId,
+        cut: &HashSet<Symbol>,
+        stop_at_reification: bool,
+    ) -> HashSet<Symbol> {
         let mut found = HashSet::new();
         // Each node is walked once per boundary context.
         let mut cuts = vec![cut.clone()];
@@ -1262,6 +1398,11 @@ impl<'m> Emitter<'m> {
                     continue;
                 }
                 stack.push((rhs, at));
+            }
+            if stop_at_reification
+                && matches!(self.head(id), Some("lawof" | "kernelof" | "functionof"))
+            {
+                continue;
             }
             let inputs = match self.m.node(id) {
                 Node::Call(c) => match &c.inputs {
@@ -1424,6 +1565,18 @@ impl<'m> Emitter<'m> {
         let mut free: Vec<Symbol> = Vec::new();
         for m in measures {
             let r = self.resolve(m);
+            // A split's kernel: the complement fields are its inputs.
+            if let Some((at, sel, joint)) = self.disintegrate_part(r, 1)
+                && let Ok(split) = self.leaf_split(at, sel, joint)
+            {
+                for &(f, v) in &split.complement {
+                    let sym = self
+                        .self_ref(v)
+                        .map(|s| *self.m.alias_chain(s).last().unwrap());
+                    add(f, sym);
+                }
+                continue;
+            }
             let Some(c) = self.call(r) else { continue };
             let list = match &c.inputs {
                 Some(Inputs::Spec(list)) => &list[..],
@@ -1576,16 +1729,7 @@ impl<'m> Emitter<'m> {
                     if let Some(d) = draw
                         && out.iter().any(|o| o.draw == draw)
                     {
-                        let name = self.name(d).to_string();
-                        return Err(Refusal::new(
-                            RefusalKind::SingularJoint,
-                            Some(m),
-                            format!("the joint law of `{name}`"),
-                            format!(
-                                "the joint law holds the draw `{name}` in two fields; it is \
-                                 concentrated on a diagonal and has no density"
-                            ),
-                        ));
+                        return Err(self.singular_joint(m, d));
                     }
                     out.push(Observation {
                         draw,
@@ -1616,8 +1760,22 @@ impl<'m> Emitter<'m> {
         }])
     }
 
+    /// A joint law that holds the draw `d` in two fields.
+    pub(super) fn singular_joint(&self, at: NodeId, d: Symbol) -> Refusal {
+        let name = self.name(d).to_string();
+        Refusal::new(
+            RefusalKind::SingularJoint,
+            Some(at),
+            format!("the joint law of `{name}`"),
+            format!(
+                "the joint law holds the draw `{name}` in two fields; it is \
+                 concentrated on a diagonal and has no density"
+            ),
+        )
+    }
+
     /// The draw binding and law of a kernel output.
-    fn output_law(&self, value: NodeId) -> Result<(Option<Symbol>, NodeId)> {
+    pub(super) fn output_law(&self, value: NodeId) -> Result<(Option<Symbol>, NodeId)> {
         if let Some(sym) = self.self_ref(value) {
             let sym = *self.m.alias_chain(sym).last().unwrap();
             let rhs = self.m.binding(self.m.binding_by_name(sym).unwrap()).rhs;

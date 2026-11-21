@@ -8,6 +8,12 @@ fn refuse(source: &str) -> Refusal {
 }
 
 fn refuse_with(source: &str, target: Option<&str>) -> Refusal {
+    refuse_located(source, target).0
+}
+
+/// The refusal and the binding it is located in. A name the parser made up
+/// (`__0x1` for `K, prior = …`) means nothing to the user.
+fn refuse_located(source: &str, target: Option<&str>) -> (Refusal, Option<String>) {
     let mut module = flatppl_syntax::parse(source).expect("parse");
     let diagnostics = flatppl_infer::infer(&mut module);
     assert!(
@@ -20,7 +26,25 @@ fn refuse_with(source: &str, target: Option<&str>) -> Refusal {
         target: target.map(str::to_string),
         ..Default::default()
     };
-    flatppl_stan::emit(&module, &opts).expect_err("refuses")
+    let r = flatppl_stan::emit(&module, &opts).expect_err("refuses");
+    let located = r.node.and_then(|node| enclosing_binding(&module, node));
+    if let Some(name) = &located {
+        assert!(!name.starts_with("__"), "located in `{name}`: {r}");
+    }
+    (r, located)
+}
+
+fn enclosing_binding(module: &flatppl_core::Module, node: flatppl_core::NodeId) -> Option<String> {
+    for (_, binding) in module.bindings() {
+        let mut queue = vec![binding.rhs];
+        while let Some(id) = queue.pop() {
+            if id == node {
+                return Some(module.resolve(binding.name).to_string());
+            }
+            module.for_each_child(id, |child| queue.push(child));
+        }
+    }
+    None
 }
 
 fn posterior(model: &str, prior: &str, kernel: &str) -> String {
@@ -1809,26 +1833,6 @@ fn a_not_a_density_refusal_names_the_call_as_written() {
 }
 
 #[test]
-fn a_restricted_joint_law_has_a_density_not_yet_written() {
-    // `restrict` conditions the joint on observed fields: a density, so not
-    // `NotADensity`.
-    let src = "theta ~ Normal(0.0, 1.0)\nobs ~ iid(Normal(theta, 1.0), 2)\n\
-               joint_model = lawof(record(theta = theta, obs = obs))\n\
-               post = restrict(joint_model, record(obs = [0.3, -0.2]))\n";
-    let r = refuse_with(src, Some("post"));
-    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("`restrict` of a joint law"), "{r}");
-    let r = refuse_with(
-        &format!(
-            "{src}t = elementof(reals)\ninputs = (t)\noutputs = logdensityof(post, record(theta = t))\n"
-        ),
-        Some("outputs"),
-    );
-    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("`restrict` of a joint law"), "{r}");
-}
-
-#[test]
 fn a_log_density_written_through_densityof_is_not_yet_supported() {
     let r = refuse_with(
         "x = elementof(reals)\ninputs = (x)\noutputs = log(densityof(Normal(0.0, 1.0), x))\n",
@@ -1886,6 +1890,354 @@ fn a_point_value_that_reads_the_input_it_sets_is_refused() {
     assert!(
         r.reason
             .contains("the point value of `mu` reads `mu`, the input it sets"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_disintegrate_along_fields_others_depend_on_is_not_yet() {
+    let r = refuse_with(
+        "theta1 ~ Normal(0, 1)\ntheta2 ~ Exponential(1)\nobs ~ iid(Normal(theta1, theta2), 3)\nJ = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))\nK, prior = disintegrate([\"theta1\", \"theta2\"], J)\npost = bayesupdate(likelihoodof(K, record(theta1 = 0.5, theta2 = 1.0)), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a `disintegrate` along fields that the field `obs` depends on (the marginal integrates them out)"), "{r}");
+}
+
+#[test]
+fn a_disintegrate_refusal_is_located_in_the_name_the_user_wrote() {
+    let (r, located) = refuse_located(
+        "theta1 ~ Normal(0, 1)\ntheta2 ~ Exponential(1)\nobs ~ iid(Normal(theta1, theta2), 3)\nJ = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))\nK, prior = disintegrate([\"theta1\", \"theta2\"], J)\npost = bayesupdate(likelihoodof(K, record(theta1 = 0.5, theta2 = 1.0)), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert_eq!(located.as_deref(), Some("prior"), "{r}");
+}
+
+#[test]
+fn a_disintegrate_with_a_latent_draw_is_not_yet() {
+    let r = refuse_with(
+        "theta1 ~ Normal(0, 1)\na ~ Normal(theta1, 1)\nobs ~ iid(Normal(a, 1.0), 3)\nJ = lawof(record(theta1 = theta1, obs = obs))\nK, prior = disintegrate([\"obs\"], J)\npost = bayesupdate(likelihoodof(K, record(obs = [0.1, 0.2, 0.3])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains(
+            "a `disintegrate` of a joint with the latent draw `a` (the marginal integrates it out)"
+        ),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_disintegrate_of_a_jointchain_is_not_yet() {
+    let r = refuse_with(
+        "theta1 ~ Normal(0, 1)\ntheta2 ~ Exponential(1)\nprior = lawof(record(theta1 = theta1, theta2 = theta2))\nobs_dist = joint(obs = iid(Normal(theta1, theta2), 3))\nk = functionof(obs_dist, theta1 = theta1, theta2 = theta2)\nJ = jointchain(prior, k)\nK, prior2 = disintegrate([\"obs\"], J)\npost = bayesupdate(likelihoodof(K, record(obs = [0.1, 0.2, 0.3])), prior2)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("a `disintegrate` of a `jointchain`"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_bare_string_disintegrate_selector_is_not_yet() {
+    let r = refuse_with(
+        "theta1 ~ Normal(0, 1)\ntheta2 ~ Exponential(1)\nobs ~ iid(Normal(theta1, theta2), 3)\nJ = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))\nK, prior = disintegrate(\"obs\", J)\npost = bayesupdate(likelihoodof(K, record(obs = [0.1, 0.2, 0.3])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a bare-string `disintegrate` selector (a bare kernel variate)"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_positional_disintegrate_selector_is_not_yet() {
+    let r = refuse_with(
+        "theta1 ~ Normal(0, 1)\ntheta2 ~ Exponential(1)\nobs ~ iid(Normal(theta1, theta2), 3)\nJ = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))\nK, prior = disintegrate([3], J)\npost = bayesupdate(likelihoodof(K, record(obs = [0.1, 0.2, 0.3])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("a positional `disintegrate` selector"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_restrict_that_pins_fields_others_depend_on_is_not_yet() {
+    let r = refuse_with(
+        "theta1 ~ Normal(0, 1)\ntheta2 ~ Exponential(1)\nobs ~ iid(Normal(theta1, theta2), 3)\nJ = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))\npost = restrict(J, record(theta1 = 0.5, theta2 = 1.0))\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains(
+            "a `restrict` to fields that the field `obs` depends on (the complement form)"
+        ),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_restrict_to_a_table_point_is_not_yet() {
+    let r = refuse_with(
+        "theta1 ~ Normal(0, 1)\ntheta2 ~ Exponential(1)\nobs ~ iid(Normal(theta1, theta2), 3)\nJ = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))\npost = restrict(J, table(obs = [0.1, 0.2, 0.3]))\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a `restrict` to a table point"), "{r}");
+}
+
+#[test]
+fn a_restrict_of_the_builtin_joint_names_restrict() {
+    let r = refuse_with(
+        "theta1 ~ Normal(0, 1)\ntheta2 ~ Exponential(1)\nobs ~ iid(Normal(theta1, theta2), 3)\npost = restrict(joint, record(theta1 = 0.5, theta2 = 1.0))\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a `restrict` of a measure that is not `lawof(record(…))`"),
+        "{r}"
+    );
+    assert!(!r.reason.contains("disintegrate"), "{r}");
+}
+
+#[test]
+fn a_disintegrate_of_two_fields_of_one_draw_is_never() {
+    let r = refuse_with(
+        "theta1 ~ Normal(0, 1)\nobs ~ iid(Normal(theta1, 1.0), 3)\nJ = lawof(record(theta1 = theta1, obs = obs, copy = obs))\nK, prior = disintegrate([\"obs\"], J)\npost = bayesupdate(likelihoodof(K, record(obs = [0.1, 0.2, 0.3])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::SingularJoint, "{r}");
+    assert!(
+        r.reason.contains("holds the draw `obs` in two fields"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_bayesupdate_and_an_observed_leaf_restrict_are_ambiguous() {
+    let r = refuse(
+        "theta ~ Normal(0, 1)\nobs ~ iid(Normal(theta, 1.0), 2)\nJ = lawof(record(theta = theta, obs = obs))\n\
+         prior = lawof(record(theta = theta))\n\
+         L = likelihoodof(kernelof(record(obs = obs), theta = theta), record(obs = [0.3, -0.2]))\n\
+         a = bayesupdate(L, prior)\nb = restrict(J, record(obs = [0.3, -0.2]))\n",
+    );
+    assert_eq!(r.kind, RefusalKind::AmbiguousTarget, "{r}");
+    assert!(r.reason.contains("a, b"), "{r}");
+}
+
+#[test]
+fn restricts_that_pin_parameters_are_no_default_target() {
+    // A lone restrict that does not split gives its own refusal.
+    let model = "theta ~ Normal(0, 1)\nobs ~ iid(Normal(theta, 1.0), 2)\nJ = lawof(record(theta = theta, obs = obs))\n\
+                 pred = restrict(J, record(theta = 0.5))\n";
+    let (r, located) = refuse_located(model, None);
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains(
+            "a `restrict` to fields that the field `obs` depends on (the complement form)"
+        ),
+        "{r}"
+    );
+    assert_eq!(located.as_deref(), Some("pred"), "{r}");
+    // Two of them: no single one is meant.
+    let r = refuse(&format!(
+        "{model}pred2 = restrict(J, record(theta = 0.7))\n"
+    ));
+    assert_eq!(r.kind, RefusalKind::NoTarget, "{r}");
+    assert!(
+        r.reason
+            .contains("no `bayesupdate` and no `restrict` to observed fields"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_lone_restrict_of_two_fields_of_one_draw_is_its_own_refusal() {
+    let (r, located) = refuse_located(
+        "a ~ Normal(0, 1)\nb ~ Normal(a, 1)\nJ = lawof(record(a = a, b = b, c = b))\n\
+         post = restrict(J, record(c = 1.5))\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::SingularJoint, "{r}");
+    assert!(r.reason.contains("holds the draw `b` in two fields"), "{r}");
+    assert_eq!(located.as_deref(), Some("post"), "{r}");
+}
+
+#[test]
+fn a_lone_restrict_to_a_field_the_joint_lacks_is_its_own_refusal() {
+    let (r, located) = refuse_located(
+        "a ~ Normal(0, 1)\nb ~ Normal(a, 1)\nJ = lawof(record(a = a, b = b))\n\
+         post = restrict(J, record(b = 0.9, z = 2.0))\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a `restrict` point field `z` that is not a field of the joint"),
+        "{r}"
+    );
+    assert_eq!(located.as_deref(), Some("post"), "{r}");
+}
+
+#[test]
+fn a_restrict_point_of_another_shape_is_ill_formed() {
+    let scalar = refuse_with(
+        "a ~ Normal(0, 1)\nb ~ Normal(a, 1)\nJ = lawof(record(a = a, b = b))\n\
+         post = restrict(J, record(b = [0.9, 1.1]))\n",
+        Some("post"),
+    );
+    assert_eq!(scalar.kind, RefusalKind::IllFormedModule, "{scalar}");
+    assert!(
+        scalar.reason.contains(
+            "the `restrict` point sets `b` to array of real [2], but the field `b` of the joint has variates of type real"
+        ),
+        "{scalar}"
+    );
+    let length = refuse_with(
+        "a ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), 3)\nJ = lawof(record(a = a, b = b))\n\
+         post = restrict(J, record(b = [0.9, 1.1]))\n",
+        Some("post"),
+    );
+    assert_eq!(length.kind, RefusalKind::IllFormedModule, "{length}");
+    assert!(
+        length.reason.contains(
+            "the `restrict` point sets `b` to array of real [2], but the field `b` of the joint has variates of type array of real [3]"
+        ),
+        "{length}"
+    );
+}
+
+#[test]
+fn observed_data_that_reads_a_parameter_is_not_yet() {
+    let head = "a ~ Normal(0, 1)\ny ~ Normal(a, 1)\n";
+    let forms = [
+        "prior = lawof(record(a = a))\nK = kernelof(record(y = y), a = a)\n\
+         post = bayesupdate(likelihoodof(K, record(y = 2 * a)), prior)\n",
+        "J = lawof(record(a = a, y = y))\nK, prior = disintegrate([\"y\"], J)\n\
+         post = bayesupdate(likelihoodof(K, record(y = 2 * a)), prior)\n",
+        "J = lawof(record(a = a, y = y))\npost = restrict(J, record(y = 2 * a))\n",
+    ];
+    for form in forms {
+        let r = refuse_with(&format!("{head}{form}"), Some("post"));
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{form}: {r}");
+        assert!(
+            r.reason
+                .contains("observed data `y` that reads `a`, a parameter of the target"),
+            "{form}: {r}"
+        );
+    }
+}
+
+#[test]
+fn a_disintegrate_selector_that_names_a_field_twice_is_ill_formed() {
+    let r = refuse_with(
+        "a ~ Normal(0, 1)\ny ~ Normal(a, 1)\nJ = lawof(record(a = a, y = y))\n\
+         K, prior = disintegrate([\"y\", \"y\"], J)\n\
+         post = bayesupdate(likelihoodof(K, record(y = 0.5)), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason
+            .contains("the `disintegrate` selector names the field `y` twice"),
+        "{r}"
+    );
+}
+
+#[test]
+fn observed_data_sampled_from_a_closed_law_reads_no_parameter() {
+    // `lawof(obs)` absorbs the draw `theta1` (§04), so the sample reads no
+    // parameter. The refusal is `rand`'s, in the binding the user wrote,
+    // not the tuple's parser-made one.
+    let (r, located) = refuse_located(
+        "theta1 = draw(Normal(mu = 0, sigma = 1))\na = 5.0 * theta1\n\
+         obs = draw(iid(Normal(mu = a, sigma = 1), 4))\nrstate = rnginit([1, 2, 3, 4])\n\
+         observed_data, _ = rand(lawof(obs), rstate)\n\
+         forward_kernel = kernelof(record(obs = obs), theta1 = theta1)\n\
+         prior = lawof(record(theta1 = theta1))\n\
+         L = likelihoodof(forward_kernel, record(obs = observed_data))\n\
+         posterior = bayesupdate(L, prior)\n",
+        Some("posterior"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("`rand`"), "{r}");
+    assert!(!r.reason.contains("observed data"), "{r}");
+    assert_eq!(located.as_deref(), Some("observed_data"), "{r}");
+}
+
+#[test]
+fn observed_data_that_reads_an_absorbed_draw_reads_no_parameter() {
+    let r = refuse_with(
+        "z ~ Normal(0, 1)\nM = lawof(z)\na ~ Normal(0, 1)\ny ~ Normal(a, 1)\n\
+         J = lawof(record(a = a, y = y))\npost = restrict(J, record(y = mean(M)))\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("`M` used as a value"), "{r}");
+    assert!(!r.reason.contains("observed data"), "{r}");
+}
+
+#[test]
+fn a_field_law_that_reifies_a_draw_is_no_latent_draw() {
+    // `y ~ M` with `M = lawof(zz)`: the law absorbs `zz` (§04), so the split
+    // holds and the refusal is the law's, as in the explicit form.
+    let split = refuse_with(
+        "zz ~ Normal(0, 1)\nM = lawof(zz)\na ~ Normal(0, 1)\ny ~ M\n\
+         J = lawof(record(a = a, y = y))\npost = restrict(J, record(y = 0.4))\n",
+        Some("post"),
+    );
+    let explicit = refuse_with(
+        "zz ~ Normal(0, 1)\nM = lawof(zz)\na ~ Normal(0, 1)\ny ~ M\n\
+         prior = lawof(record(a = a))\nK = kernelof(record(y = y), a = a)\n\
+         post = bayesupdate(likelihoodof(K, record(y = 0.4)), prior)\n",
+        Some("post"),
+    );
+    assert!(!split.reason.contains("latent draw"), "{split}");
+    assert_eq!(split.kind, explicit.kind, "{split} / {explicit}");
+    assert_eq!(split.reason, explicit.reason, "{split} / {explicit}");
+}
+
+#[test]
+fn a_field_law_from_a_kernel_reads_no_latent_draw() {
+    // `kernelof(z, a = a)` absorbs the draw `z` as `lawof` does (§04), so the
+    // split holds and the refusal is the law's, as in the explicit form.
+    let head = "a ~ Normal(0, 1)\nz ~ Normal(a, 1)\nkk = kernelof(z, a = a)\ny ~ kk(a = a)\n";
+    let split = refuse_with(
+        &format!("{head}J = lawof(record(a = a, y = y))\npost = restrict(J, record(y = 0.4))\n"),
+        Some("post"),
+    );
+    let explicit = refuse_with(
+        &format!(
+            "{head}prior = lawof(record(a = a))\nK = kernelof(record(y = y), a = a)\n\
+             post = bayesupdate(likelihoodof(K, record(y = 0.4)), prior)\n"
+        ),
+        Some("post"),
+    );
+    assert!(!split.reason.contains("latent draw"), "{split}");
+    assert_eq!(split.kind, explicit.kind, "{split} / {explicit}");
+    assert_eq!(split.reason, explicit.reason, "{split} / {explicit}");
+}
+
+#[test]
+fn a_restrict_point_field_that_is_a_table_is_not_yet() {
+    let r = refuse_with(
+        "a ~ Normal(0, 1)\nt ~ iid(joint(u = Normal(a, 1)), 3)\nJ = lawof(record(a = a, t = t))\n\
+         post = restrict(J, record(t = table(u = [0.1, 0.2, 0.3])))\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a `restrict` point field `t` that is a table"),
         "{r}"
     );
 }
