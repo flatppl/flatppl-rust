@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+m_obs = [-0.2, 1.1, 5.0, 5.4]
+mu ~ Normal(0, 1)
+mixture = normalize(superpose(weighted(0.4, Normal(mu, 2.0)), weighted(0.3, hep.Argus(resonance = 5.29, slope = -20.0, power = 0.5)), weighted(0.3, hep.RelativisticBreitWigner(mean = 1.0, width = 0.3))))
+m ~ iid(mixture, 4)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(m = m), mu = mu), record(m = m_obs))
+post = bayesupdate(L, prior)

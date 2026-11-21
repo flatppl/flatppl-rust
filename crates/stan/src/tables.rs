@@ -43,6 +43,12 @@ pub(crate) struct LawRow {
     /// support returned a finite value.
     #[serde(default)]
     pub unchecked_support: bool,
+    /// The Stan function returns -inf outside the `variate` support, at
+    /// every end (a user function that tests its own support): a mixture
+    /// component needs no support test. Set where a BridgeStan probe outside
+    /// each end returned -inf.
+    #[serde(default)]
+    pub total_support: bool,
     pub functions: String,
     pub status: String,
     pub note: String,
@@ -312,5 +318,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// No golden program holds a template placeholder of a law row
+    /// (`{resonance}`) that no `fill` replaced: every row bound or guard
+    /// prints through the law's arguments.
+    #[test]
+    fn goldens_hold_no_unfilled_placeholder() {
+        let mut names: Vec<String> = Vec::new();
+        for r in super::laws() {
+            names.extend(r.vars.iter().cloned());
+            names.extend(r.params.iter().cloned());
+            names.extend(r.sizes.iter().map(|(n, _)| n.clone()));
+        }
+        names.sort();
+        names.dedup();
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
+        let mut seen = 0;
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.extension().is_none_or(|x| x != "stan") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            seen += 1;
+            for n in &names {
+                // A one-element array of a declared variable (`{x}`) is Stan.
+                let declared =
+                    text.contains(&format!(" {n};")) || text.contains(&format!(" {n} ="));
+                assert!(
+                    declared || !text.contains(&format!("{{{n}}}")),
+                    "{}: unfilled placeholder `{{{n}}}`",
+                    path.display()
+                );
+            }
+        }
+        assert!(seen > 100, "goldens read: {seen}");
     }
 }

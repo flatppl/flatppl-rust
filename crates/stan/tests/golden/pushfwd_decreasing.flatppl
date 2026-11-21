@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+lam ~ pushfwd(fn(pow(_, -1)), Gamma(3, 2))
+k ~ Poisson(lam)
+prior = lawof(record(lam = lam))
+L = likelihoodof(kernelof(record(k = k), lam = lam), record(k = 2))
+post = bayesupdate(L, prior)

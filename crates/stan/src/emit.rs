@@ -6,7 +6,8 @@ use crate::stan_type::{StanType, declare};
 use crate::tables;
 use crate::{EmitOptions, ManifestParam, Placement};
 use flatppl_core::{
-    CallHead, Dim, Module, Node, NodeId, Phase, RefNs, Scalar, ScalarType, Symbol, Type, ValueSet,
+    CallHead, Dim, Module, Node, NodeId, Phase, Ref, RefNs, Scalar, ScalarType, Symbol, Type,
+    ValueSet,
 };
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -197,6 +198,9 @@ pub(crate) struct Emitter<'m> {
     decls: HashMap<String, StanType>,
     /// Kernel inputs inside the prior, bound by name to prior fields.
     links: Vec<(Symbol, Symbol)>,
+    /// Derived prior fields `v = f(x)` of one draw x, by f(x)'s node: the
+    /// map's body, x, and x's law (§06: the law is `pushfwd(f, law(x))`).
+    derived: HashMap<NodeId, (NodeId, Ref, NodeId)>,
     /// `functions` block sources, deduplicated.
     functions: Vec<String>,
     /// Stan name → its extents as linear forms, axis by axis.
@@ -344,6 +348,7 @@ impl<'m> Emitter<'m> {
             abi_target: false,
             decls: HashMap::new(),
             links: vec![],
+            derived: HashMap::new(),
             functions: vec![],
             extents: HashMap::new(),
             ext_lin: HashMap::new(),

@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+k_obs = [2, 6, 0, 3]
+lam ~ Exponential(0.5)
+mixture = normalize(superpose(weighted(0.4, Poisson(lam)), weighted(0.6, Binomial(4, 0.3))))
+k ~ iid(mixture, 4)
+prior = lawof(record(lam = lam))
+L = likelihoodof(kernelof(record(k = k), lam = lam), record(k = k_obs))
+post = bayesupdate(L, prior)

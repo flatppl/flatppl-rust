@@ -65,6 +65,8 @@ pub(super) struct Law {
     /// The row's Stan function does not enforce `bounds` (von Mises): a
     /// variate whose declaration does not state them is tested against them.
     pub unchecked_support: bool,
+    /// The row's Stan function returns -inf outside `bounds` (`total_support`).
+    pub total_support: bool,
     /// The constrained Stan type of the row's `variate` (`cholesky_factor_corr`).
     pub support_type: Option<&'static str>,
 }
@@ -235,6 +237,7 @@ impl<'m> Emitter<'m> {
                         self.env.insert(sym, stan);
                     }
                 }
+                self.bind_derived_draws(&fields)?;
                 let obs = self.likelihood(lik, true)?;
                 self.prior_statements(&fields)?;
                 self.observe(obs)
@@ -249,6 +252,7 @@ impl<'m> Emitter<'m> {
                         self.env.insert(sym, stan);
                     }
                 }
+                self.bind_derived_draws(&fields)?;
                 self.prior_statements(&fields)
             }
             Some("likelihoodof" | "joint_likelihood") => {
@@ -646,6 +650,7 @@ impl<'m> Emitter<'m> {
                 self.env.insert(sym, stan);
             }
         }
+        self.bind_derived_draws(&fields)?;
         let obs = match lik {
             Some(l) => Some(self.likelihood(l, true)?),
             None => None,
@@ -656,6 +661,21 @@ impl<'m> Emitter<'m> {
             Some(o) => self.observe(o),
             None => Ok(()),
         }
+    }
+
+    /// Each derived prior field's draw x reads f⁻¹ of the field (§06: x is
+    /// no parameter of its own).
+    fn bind_derived_draws(&mut self, fields: &[PriorField]) -> Result<()> {
+        for f in fields {
+            let Some(law) = f.law else { continue };
+            let Some(&(_, x, _)) = self.derived.get(&law) else {
+                continue;
+            };
+            let stan = self.fields[&f.field].clone();
+            let value = self.derived_draw_value(law, &stan)?;
+            self.env.insert(x.name, value);
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------- prior
@@ -714,29 +734,60 @@ impl<'m> Emitter<'m> {
                 if self.head(rec) != Some("record") {
                     return Err(Refusal::not_yet(Some(p), "a prior `lawof` of a non-record"));
                 }
-                for na in self.call(rec).unwrap().named.iter() {
-                    let Some(sym) = self.self_ref(na.value) else {
-                        return Err(Refusal::not_yet(
-                            Some(na.value),
-                            format!("the derived prior field `{}`", self.name(na.name)),
-                        ));
+                let named: Vec<(Symbol, NodeId)> = self
+                    .call(rec)
+                    .unwrap()
+                    .named
+                    .iter()
+                    .map(|na| (na.name, na.value))
+                    .collect();
+                // A field `v = f(x)` of one draw x has law `pushfwd(f, law(x))`
+                // (§06); x is then no parameter of its own.
+                let mut behind: Vec<(Symbol, Symbol)> = Vec::new();
+                for (field, value) in named {
+                    let sym = self
+                        .self_ref(value)
+                        .map(|s| *self.m.alias_chain(s).last().unwrap());
+                    let rhs = sym.map(|s| self.m.binding(self.m.binding_by_name(s).unwrap()).rhs);
+                    let (binding, law) = match (sym, rhs) {
+                        (Some(s), Some(rhs)) if self.head(rhs) == Some("draw") => {
+                            (Some(s), self.call(rhs).unwrap().args[0])
+                        }
+                        _ => {
+                            let name = self.name(field).to_string();
+                            let (x, _) = self.derived_field(&name, value, value)?;
+                            behind.push((x, field));
+                            (sym, self.resolve(value))
+                        }
                     };
-                    let sym = *self.m.alias_chain(sym).last().unwrap();
-                    let rhs = self.m.binding(self.m.binding_by_name(sym).unwrap()).rhs;
-                    if self.head(rhs) != Some("draw") {
-                        return Err(Refusal::not_yet(
-                            Some(na.value),
-                            format!("the derived prior field `{}`", self.name(na.name)),
-                        ));
-                    }
-                    let law = self.call(rhs).unwrap().args[0];
                     out.push(PriorField {
-                        field: na.name,
-                        binding: Some(sym),
+                        field,
+                        binding,
                         law: Some(law),
-                        node: na.value,
+                        node: value,
                         sets: self.law_sets(law),
                     });
+                }
+                for (k, &(x, field)) in behind.iter().enumerate() {
+                    let node = out.iter().find(|f| f.field == field).unwrap().node;
+                    if out.iter().any(|f| f.binding == Some(x)) {
+                        return Err(Refusal::not_yet(
+                            Some(node),
+                            format!(
+                                "a derived prior field of `{}`, which is itself a prior field",
+                                self.name(x)
+                            ),
+                        ));
+                    }
+                    if behind[..k].iter().any(|b| b.0 == x) {
+                        return Err(Refusal::not_yet(
+                            Some(node),
+                            format!(
+                                "two derived prior fields of the one draw `{}`",
+                                self.name(x)
+                            ),
+                        ));
+                    }
                 }
             }
             Some("joint") => {
@@ -903,6 +954,10 @@ impl<'m> Emitter<'m> {
                 .iter()
                 .find(|(n, _)| *n == f.field)
                 .map(|(_, v)| v.clone());
+            // The bare-name refusal comes before the untyped variate's.
+            if let Some(law) = f.law {
+                self.bare_pushfwd_map(law)?;
+            }
             if ty_is_int(&ty) {
                 return Err(Refusal::new(
                     RefusalKind::DiscreteParameter,
@@ -941,10 +996,16 @@ impl<'m> Emitter<'m> {
             if let Some(law) = f.law
                 && let Some((lo, hi)) = self.support(law)?
             {
-                if t.bounds.lower.is_none() {
+                // A map's image of its base support is exact; the value set
+                // can be wider (`exp(sqrt(t))` is in posreals, its image
+                // starts at 1), and the declaration must not admit points
+                // the map never reaches.
+                let m = self.resolve(law);
+                let image = self.head(m) == Some("pushfwd") || self.derived.contains_key(&m);
+                if t.bounds.lower.is_none() || (image && lo.is_some()) {
                     t.bounds.lower = lo;
                 }
-                if t.bounds.upper.is_none() {
+                if t.bounds.upper.is_none() || (image && hi.is_some()) {
                     t.bounds.upper = hi;
                 }
             }
@@ -1804,7 +1865,7 @@ impl<'m> Emitter<'m> {
                 "an iid of a `kscan` (only an iid of a `markovchain` over data rows)",
             ));
         }
-        if self.head(m) == Some("pushfwd") {
+        if self.head(m) == Some("pushfwd") || self.derived.contains_key(&m) {
             return self.pushfwd_statement(lhs, m, lhs_rank);
         }
         // `iid(Lebesgue(S), n)` is `Lebesgue(S^n)` (§06 "Fundamental
@@ -2632,6 +2693,9 @@ impl<'m> Emitter<'m> {
         law: NodeId,
     ) -> Result<Option<(Option<String>, Option<String>)>> {
         let m = self.resolve(law);
+        if self.derived.contains_key(&m) {
+            return self.pushfwd_support(m);
+        }
         match self.head(m) {
             // A positional joint: vector bounds, one end per component.
             Some("joint") if self.call(m).unwrap().named.is_empty() => {
@@ -3815,6 +3879,7 @@ impl<'m> Emitter<'m> {
             flatppl: row.flatppl.clone(),
             custom: row.kind == "custom_lpdf",
             unchecked_support: row.unchecked_support,
+            total_support: row.total_support,
             support_type: row
                 .variate
                 .split_once('[')
