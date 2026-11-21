@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+t ~ InverseGamma(3, 2)
+u = exp(sqrt(t))
+z ~ Normal(u, 1)
+prior = lawof(record(u = u))
+L = likelihoodof(kernelof(record(z = z), u = u), record(z = 2.1))
+post = bayesupdate(L, prior)

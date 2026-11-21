@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+p ~ pushfwd(fn(invlogit(_)), Normal(0.2, 1.1))
+k ~ Binomial(10, p)
+prior = lawof(record(p = p))
+L = likelihoodof(kernelof(record(k = k), p = p), record(k = 3))
+post = bayesupdate(L, prior)

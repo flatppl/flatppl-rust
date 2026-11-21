@@ -601,14 +601,189 @@ fn broadcast_over_a_boolean_mask_is_no_gather() {
 }
 
 #[test]
-fn pushfwd_exp_is_not_yet() {
+fn pushfwd_outside_the_bijection_registry_is_not_yet() {
     let r = refuse(&posterior(
-        "rho ~ pushfwd(fn(exp(_)), Normal(0, 1))\ny ~ Normal(rho, 1)",
+        "rho ~ pushfwd(fn(sin(_)), Normal(0, 1))\ny ~ Normal(rho, 1)",
         "lawof(record(rho = rho))",
         "kernelof(record(y = y), rho = rho)",
     ));
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("not affine"), "{r}");
+    assert!(
+        r.reason
+            .contains("pushfwd through `sin`, which is not in the §06 bijection registry"),
+        "{r}"
+    );
+}
+
+#[test]
+fn pushfwd_sqrt_of_a_normal_is_outside_its_domain() {
+    let r = refuse(&posterior(
+        "rho ~ pushfwd(fn(sqrt(_)), Normal(0, 1))\ny ~ Normal(rho, 1)",
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains(
+            "pushfwd through `sqrt` of a law whose support is not within its domain (§06)"
+        ),
+        "{r}"
+    );
+}
+
+#[test]
+fn pushfwd_pow_with_a_computed_exponent_is_not_yet() {
+    let r = refuse(&posterior(
+        "ks = [2.0, 3.0]\nrho ~ pushfwd(fn(pow(_, ks[1])), Gamma(2, 2))\ny ~ Normal(rho, 1)",
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("not a finite nonzero literal"), "{r}");
+}
+
+#[test]
+fn pushfwd_through_a_map_that_reads_its_input_twice_is_not_yet() {
+    let r = refuse(&posterior(
+        "f(t) = t + exp(t)\nrho ~ pushfwd(f, Normal(0, 1))\ny ~ Normal(rho, 1)",
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("reads its input more than once"), "{r}");
+}
+
+#[test]
+fn pushfwd_negative_power_of_a_law_around_zero_is_not_yet() {
+    for map in ["fn(pow(_, -1))", "fn(pow(_, -3))", "fn(1 / _)"] {
+        let r = refuse(&posterior(
+            &format!("rho ~ pushfwd({map}, Normal(0, 1))\ny ~ Normal(rho, 1)"),
+            "lawof(record(rho = rho))",
+            "kernelof(record(y = y), rho = rho)",
+        ));
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{map}: {r}");
+        assert!(
+            r.reason.contains(
+                "pushfwd through `pow` with a negative exponent of a law whose support contains 0, where it is not monotone"
+            ),
+            "{map}: {r}"
+        );
+    }
+}
+
+#[test]
+fn pushfwd_of_a_support_with_a_symbolic_end_names_the_end() {
+    let r = refuse(&posterior(
+        "lo_s = [0.5, 1.0]\nrho ~ pushfwd(fn(log(_)), Uniform(interval(lo_s[1], 2.0)))\ny ~ Normal(rho, 1)",
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains(
+            "whose support end `lo_s[1]` is not a literal, so its domain cannot be checked"
+        ),
+        "{r}"
+    );
+}
+
+#[test]
+fn pushfwd_through_a_bare_name_is_not_yet() {
+    for name in ["log", "sqrt"] {
+        let r = refuse(&posterior(
+            &format!("rho ~ pushfwd({name}, Gamma(2, 1))\ny ~ Normal(rho, 1)"),
+            "lawof(record(rho = rho))",
+            "kernelof(record(y = y), rho = rho)",
+        ));
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{name}: {r}");
+        assert!(
+            r.reason.contains(&format!(
+                "pushfwd through the bare name `{name}`; write `fn({name}(_))`"
+            )),
+            "{name}: {r}"
+        );
+    }
+}
+
+#[test]
+fn pushfwd_through_the_input_over_itself_is_not_yet() {
+    let r = refuse(&posterior(
+        "f(t) = t / (1.0 + t)\nrho ~ pushfwd(f, Gamma(2, 1))\ny ~ Normal(rho, 1)",
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("reads its input more than once"), "{r}");
+}
+
+#[test]
+fn pushfwd_of_a_discrete_base_refuses() {
+    // An atom at the boundary of `log`'s domain (Poisson at 0) never reaches
+    // the domain check's null-set reading.
+    let r = refuse(&posterior(
+        "v ~ pushfwd(fn(log(_)), Poisson(2.0))\ny ~ Normal(v, 1)",
+        "lawof(record(v = v))",
+        "kernelof(record(y = y), v = v)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("pushfwd of this law"), "{r}");
+}
+
+#[test]
+fn pushfwd_of_a_mixture_base_with_an_atom_refuses() {
+    let r = refuse(&posterior(
+        "v ~ pushfwd(fn(log(_)), normalize(superpose(weighted(0.3, Dirac(0.0)), \
+         weighted(0.7, Exponential(1.0)))))\ny ~ Normal(v, 1)",
+        "lawof(record(v = v))",
+        "kernelof(record(y = y), v = v)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("normalize of this measure"), "{r}");
+}
+
+#[test]
+fn a_derived_prior_field_of_two_draws_is_not_yet() {
+    let r = refuse(&posterior(
+        "a ~ Exponential(1)\nb ~ Exponential(2)\ns = sqrt(a + b)\ny ~ Normal(0, s)",
+        "lawof(record(s = s))",
+        "kernelof(record(y = y), s = s)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a derived prior field of more than one draw"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_derived_prior_field_of_a_prior_field_is_not_yet() {
+    let r = refuse(&posterior(
+        "v ~ Exponential(1)\ns = sqrt(v)\ny ~ Normal(0, s)",
+        "lawof(record(s = s, v = v))",
+        "kernelof(record(y = y), s = s, v = v)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a derived prior field of `v`, which is itself a prior field"),
+        "{r}"
+    );
+}
+
+#[test]
+fn two_derived_prior_fields_of_one_draw_are_refused() {
+    let r = refuse(&posterior(
+        "x ~ Exponential(1)\na = sqrt(x)\nb = exp(x)\ny ~ Normal(a, b)",
+        "lawof(record(a = a, b = b))",
+        "kernelof(record(y = y), a = a, b = b)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("two derived prior fields of the one draw `x`"),
+        "{r}"
+    );
 }
 
 #[test]

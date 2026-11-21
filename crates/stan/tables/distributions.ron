@@ -143,12 +143,12 @@ real flatppl_generalized_normal_lpdf(vector x, real mu, real alpha, real beta) {
     (id: "categorical", flatppl: "Categorical", module: None, params: ["p"],
      pattern: "Categorical(p)", vars: ["p"], kind: "builtin",
      stan: "categorical", suffix: "lpmf", lhs: "{y}", args: "{p}", variate: "int<lower=1, upper={n}>",
-     sizes: [("n", "lengthof(p)")], vectorized: true, lcdf: false, normalized: true, guard: "", functions: "", status: "verified",
+     sizes: [("n", "lengthof(p)")], vectorized: true, lcdf: false, normalized: true, guard: "{y} > num_elements({p})", functions: "", status: "verified",
      note: "1-based in both languages. p must pass Stan's simplex check."),
     (id: "categorical0", flatppl: "Categorical0", module: None, params: ["p"],
      pattern: "Categorical0(p)", vars: ["p"], kind: "builtin",
      stan: "categorical", suffix: "lpmf", lhs: "{y} + 1", args: "{p}", variate: "int<lower=0, upper={n} - 1>",
-     sizes: [("n", "lengthof(p)")], vectorized: false, lcdf: false, normalized: true, guard: "", functions: "", status: "verified",
+     sizes: [("n", "lengthof(p)")], vectorized: false, lcdf: false, normalized: true, guard: "{y} > num_elements({p}) - 1", functions: "", status: "verified",
      note: "Shift the variate by +1. An array variate needs a loop or an array expression for the shift."),
     (id: "binomial", flatppl: "Binomial", module: None, params: ["n", "p"],
      pattern: "Binomial(n, p)", vars: ["n", "p"], kind: "builtin",
@@ -233,7 +233,7 @@ real flatppl_generalized_normal_lpdf(vector x, real mu, real alpha, real beta) {
     (id: "categorical_logit", flatppl: "Categorical", module: None, params: ["p"],
      pattern: "Categorical(softmax(b))", vars: ["b"], kind: "composition",
      stan: "categorical_logit", suffix: "lpmf", lhs: "{y}", args: "{b}", variate: "int<lower=1, upper={n}>",
-     sizes: [("n", "lengthof(b)")], vectorized: true, lcdf: false, normalized: true, guard: "", functions: "", status: "verified", note: ""),
+     sizes: [("n", "lengthof(b)")], vectorized: true, lcdf: false, normalized: true, guard: "{y} > num_elements({b})", functions: "", status: "verified", note: ""),
     (id: "multinomial_logit", flatppl: "Multinomial", module: None, params: ["n", "p"],
      pattern: "Multinomial(n, softmax(g))", vars: ["g"], kind: "composition",
      stan: "multinomial_logit", suffix: "lpmf", lhs: "{y}", args: "{g}", variate: "array[{k}] int<lower=0>",
@@ -377,7 +377,7 @@ real flatppl_double_sided_crystal_ball_lpdf(vector x, real m0, real sigmaL, real
     (id: "argus", flatppl: "Argus", module: Some("particle-physics 0.1"), params: ["resonance", "slope", "power"],
      pattern: "Argus(resonance, slope, power)", vars: ["resonance", "slope", "power"], kind: "custom_lpdf",
      stan: "flatppl_argus", suffix: "lpdf", lhs: "{y}", args: "{resonance}, {slope}, {power}", variate: "real<lower=0, upper={resonance}>",
-     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", total_support: true,
      functions: "real flatppl_argus_lpdf(real x, real m0, real c, real p) {
   if (x <= 0 || x >= m0) return negative_infinity();
   real u = 1 - square(x / m0);
@@ -420,7 +420,7 @@ real flatppl_argus_lpdf(vector x, real m0, real c, real p) {
     (id: "relativistic_breit_wigner", flatppl: "RelativisticBreitWigner", module: Some("particle-physics 0.1"), params: ["mean", "width"],
      pattern: "RelativisticBreitWigner(mean, width)", vars: ["mean", "width"], kind: "custom_lpdf",
      stan: "flatppl_relativistic_breit_wigner", suffix: "lpdf", lhs: "{y}", args: "{mean}, {width}", variate: "real<lower=0>",
-     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", total_support: true,
      functions: "real flatppl_relativistic_breit_wigner_lpdf(real x, real m, real w) {
   if (x <= 0) return negative_infinity();
   real g = sqrt(square(m) * (square(m) + square(w)));

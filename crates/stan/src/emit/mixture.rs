@@ -17,6 +17,7 @@ use super::Emitter;
 use super::functions::FnCtx;
 use super::structure::Law;
 use crate::refuse::{Refusal, RefusalKind, Result};
+use crate::stan_type::number;
 use flatppl_core::{Node, NodeId, Type, ValueSet};
 use std::collections::HashMap;
 
@@ -763,6 +764,22 @@ impl<'m> Emitter<'m> {
         // The log mass of each unnormalized truncated component: it enters
         // the normalizer `Σ w_i M_i(S_i)` (§06 "Normalization and mass").
         let mut masses: Vec<Option<String>> = Vec::new();
+        // Components on different supports (a Normal beside a Gamma): at a
+        // point outside one component's support its density is 0, where
+        // Stan's lpdf throws, so a component whose effective support is not
+        // the union of all of them tests its own (`MixSupport`).
+        let mut sides = Vec::new();
+        for p in &parts {
+            if let Part::Law(_, law) = *p {
+                let l = self.law_any(law)?;
+                sides.push(MixSupport::of(&l));
+            }
+        }
+        let union = MixSupport::union(&sides);
+        let differ = sides
+            .iter()
+            .any(|s| s.guard != sides[0].guard || s.ends != sides[0].ends);
+        let mut k = 0;
         for p in &parts {
             match *p {
                 Part::Law(w, law) => {
@@ -772,6 +789,37 @@ impl<'m> Emitter<'m> {
                     let mut l = self.law_any(law)?;
                     let support = l.support.take();
                     let mut lp = self.law_lp(law, &l, y, None)?;
+                    if !l.total_support
+                        && !l.unchecked_support
+                        && l.trunc.is_none()
+                        && support.is_none()
+                    {
+                        let array = self.decls.get(y).is_some_and(|d| d.rank() > 0);
+                        let (lo, hi) = sides[k].narrower(&union);
+                        if let Some(out) =
+                            Self::outside_test(y, array, lo.as_deref(), hi.as_deref())
+                        {
+                            lp = format!("({out} ? negative_infinity() : {lp})");
+                        }
+                        // An end that depends on the law's arguments is the
+                        // row guard's (`binomial` at y > n); `law_lp` prints
+                        // it already where it varies per component.
+                        if differ
+                            && let Some((whole, _)) = &l.guard
+                            && !whole.contains(COMP)
+                        {
+                            let yy = if array {
+                                format!("max({y})")
+                            } else {
+                                y.to_string()
+                            };
+                            lp = format!(
+                                "({} ? negative_infinity() : {lp})",
+                                whole.replace("{y}", &yy)
+                            );
+                        }
+                    }
+                    k += 1;
                     let mut mass = None;
                     if let Some((lo, hi)) = support {
                         if let Some(out) = Self::outside_test(
@@ -1563,6 +1611,72 @@ impl<'m> Emitter<'m> {
 }
 
 /// The top-level comma-separated arguments of a call's argument text.
+/// A mixture component's support for the outside test: its literal ends
+/// (a truncation's ends within the law's own, `Law::within`), `None` for an
+/// unbounded end, and its row guard, the argument-dependent end.
+struct MixSupport {
+    /// Each end: `None` unbounded, `Some(None)` not a literal, `Some(Some(x))`.
+    ends: (Option<Option<f64>>, Option<Option<f64>>),
+    guard: Option<String>,
+}
+
+impl MixSupport {
+    fn of(l: &Law) -> Self {
+        let (lo, hi) = match l.trunc.as_ref().or(l.support.as_ref()) {
+            Some((lo, hi)) => l.within(lo.as_deref(), hi.as_deref()),
+            None => l.bounds.clone(),
+        };
+        // A template end (`{resonance}`) is not a literal; the row guard or
+        // `total_support` covers it.
+        let end = |e: Option<String>| e.map(|t| t.parse::<f64>().ok());
+        MixSupport {
+            ends: (end(lo), end(hi)),
+            guard: l.guard.as_ref().map(|g| g.0.clone()),
+        }
+    }
+
+    /// The union's ends: unbounded where any component is, unknown where any
+    /// end is not a literal, else the widest literal.
+    fn union(all: &[MixSupport]) -> (Option<Option<f64>>, Option<Option<f64>>) {
+        let side = |pick: &dyn Fn(&MixSupport) -> Option<Option<f64>>,
+                    wider: fn(f64, f64) -> f64| {
+            let mut out = Some(Some(f64::NAN));
+            for s in all {
+                out = match (out, pick(s)) {
+                    (None, _) | (_, None) => None,
+                    (Some(None), _) | (_, Some(None)) => Some(None),
+                    (Some(Some(a)), Some(Some(b))) => {
+                        Some(Some(if a.is_nan() { b } else { wider(a, b) }))
+                    }
+                };
+            }
+            out
+        };
+        (side(&|s| s.ends.0, f64::min), side(&|s| s.ends.1, f64::max))
+    }
+
+    /// This component's literal ends that lie inside the union's: each one
+    /// needs its test.
+    fn narrower(
+        &self,
+        union: &(Option<Option<f64>>, Option<Option<f64>>),
+    ) -> (Option<String>, Option<String>) {
+        let side = |mine: Option<Option<f64>>,
+                    theirs: Option<Option<f64>>,
+                    inside: fn(f64, f64) -> bool| {
+            match (mine, theirs) {
+                (Some(Some(x)), None | Some(None)) => Some(number(x)),
+                (Some(Some(x)), Some(Some(u))) if inside(x, u) => Some(number(x)),
+                _ => None,
+            }
+        };
+        (
+            side(self.ends.0, union.0, |x, u| x > u),
+            side(self.ends.1, union.1, |x, u| x < u),
+        )
+    }
+}
+
 pub(super) fn split_args(inner: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let (mut depth, mut start) = (0i32, 0);

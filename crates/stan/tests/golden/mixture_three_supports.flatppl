@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+y_obs = [-0.4, 0.6, 1.7, 0.2]
+mu ~ Normal(0, 1)
+mixture = normalize(superpose(weighted(0.3, Normal(mu, 2.0)), weighted(0.3, Gamma(2.0, 1.5)), weighted(0.4, Beta(2.0, 3.0))))
+y ~ iid(mixture, 4)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = y_obs))
+post = bayesupdate(L, prior)
