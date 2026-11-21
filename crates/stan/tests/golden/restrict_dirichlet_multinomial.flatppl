@@ -1,0 +1,5 @@
+flatppl_compat = "0.1"
+p ~ Dirichlet([1.0, 2.0, 3.0])
+n ~ Multinomial(10, p)
+J = lawof(record(p = p, n = n))
+post = restrict(J, record(n = [2, 3, 5]))

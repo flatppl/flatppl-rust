@@ -10,6 +10,9 @@
 //! - `likelihoodof(kernelof(record(o = y), inputs…), obs)`: each observed
 //!   value is a data variable and `o ~ law(...)` its likelihood term. With no
 //!   prior, every kernel input is a flat parameter.
+//! - `restrict(J, record(o = y))` and the parts of `disintegrate(["o"], J)`,
+//!   for `J = lawof(record(…))` with observed leaf fields: the same program as
+//!   the explicit `lawof` prior and `kernelof` kernel.
 //! - Fixed literals and loaded data go to `data`, fixed computed values to
 //!   `transformed data`, and values that depend on parameters to `model`
 //!   locals (see [`Placement`]).
@@ -48,7 +51,8 @@ pub enum Placement {
 
 #[derive(Clone, Debug, Default)]
 pub struct EmitOptions {
-    /// The target binding; `None` picks the module's single `bayesupdate`.
+    /// The target binding; `None` picks the module's single posterior (a
+    /// `bayesupdate`, or a `restrict` to observed fields).
     pub target: Option<String>,
     /// Where values that depend on parameters go (`--derived`).
     pub derived: Placement,

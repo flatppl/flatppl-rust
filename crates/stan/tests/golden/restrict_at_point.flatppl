@@ -1,0 +1,12 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+theta1 ~ Normal(0, 1)
+theta2 ~ Gamma(2, 1)
+obs ~ iid(Normal(theta1, theta2), 5)
+J = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))
+obs_data = [1.2, 0.4, 2.1, 0.8, 1.5]
+post = restrict(J, record(obs = obs_data))
+t1 = elementof(reals)
+t2 = elementof(posreals)
+inputs = (t1, t2)
+outputs = logdensityof(post, record(theta1 = t1, theta2 = t2))

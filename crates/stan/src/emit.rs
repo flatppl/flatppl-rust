@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
 mod aggregate;
+mod disintegrate;
 mod elementwise;
 mod extents;
 mod filter;
@@ -1233,6 +1234,28 @@ impl<'m> Emitter<'m> {
         Ok(Some(format!("{}[{}]", base.at(P_ATOM), parts.join(", "))))
     }
 
+    /// A refusal inside the parser-made binding `name` (the tuple of
+    /// `a, b = f(…)`) moves to `reader`, the reference the user wrote: the
+    /// user never sees a parser-made name.
+    fn out_of_synthetic(&self, mut e: Refusal, name: Symbol, reader: NodeId) -> Refusal {
+        let Some(b) = self.m.binding_by_name(name) else {
+            return e;
+        };
+        let binding = self.m.binding(b);
+        if !binding.synthetic {
+            return e;
+        }
+        let mut stack = vec![binding.rhs];
+        while let Some(id) = stack.pop() {
+            if Some(id) == e.node {
+                e.node = Some(reader);
+                return e;
+            }
+            self.m.for_each_child(id, |k| stack.push(k));
+        }
+        e
+    }
+
     fn expr(&mut self, id: NodeId) -> Result<Ex> {
         if let Some(e) = self.fctx.as_ref().and_then(|c| c.lifted.get(&id)) {
             return Ok(e.clone());
@@ -1259,7 +1282,10 @@ impl<'m> Emitter<'m> {
             Node::Ref(r) => match r.ns {
                 RefNs::SelfMod => match self.boundary_ref(id, r.name)? {
                     Some(e) => Ok(e),
-                    None => Ok(Ex::atom(self.bind(r.name)?)),
+                    None => match self.bind(r.name) {
+                        Ok(s) => Ok(Ex::atom(s)),
+                        Err(e) => Err(self.out_of_synthetic(e, r.name, id)),
+                    },
                 },
                 RefNs::Local => self.local_ref(id, r.name),
                 RefNs::Module(alias) => Err(Refusal::not_yet(
@@ -2546,7 +2572,8 @@ impl Ex {
     }
 }
 
-/// The target binding: the named one, or the module's single `bayesupdate`.
+/// The target binding: the named one, or the module's single posterior (a
+/// `bayesupdate`, or a `restrict` that splits along observed leaves).
 fn select_target(m: &Module, opts: &EmitOptions) -> Result<Symbol> {
     if let Some(name) = &opts.target {
         return m
@@ -2562,18 +2589,36 @@ fn select_target(m: &Module, opts: &EmitOptions) -> Result<Symbol> {
                 )
             });
     }
+    let probe = Emitter::new(m, opts);
     let posts: Vec<Symbol> = m
         .bindings()
-        .filter(|(_, b)| matches!(m.node(b.rhs), Node::Call(c) if matches!(c.head, CallHead::Builtin(h) if m.resolve(h) == "bayesupdate")))
+        .filter(|(_, b)| match probe.head(b.rhs) {
+            Some("bayesupdate") => true,
+            Some("restrict") => probe.restrict_split(b.rhs).is_ok(),
+            _ => false,
+        })
         .map(|(_, b)| b.name)
         .collect();
+    // With no candidate, a lone `restrict` is what the user meant: its own
+    // refusal says why it does not split.
+    let restricts: Vec<NodeId> = m
+        .bindings()
+        .map(|(_, b)| b.rhs)
+        .filter(|&rhs| probe.head(rhs) == Some("restrict"))
+        .collect();
+    if posts.is_empty()
+        && let [r] = restricts[..]
+        && let Err(refusal) = probe.restrict_split(r)
+    {
+        return Err(refusal);
+    }
     match posts.as_slice() {
         [one] => Ok(*one),
         [] => Err(Refusal::new(
             RefusalKind::NoTarget,
             None,
             "the target",
-            "the module has no `bayesupdate`; pass `--target NAME` naming a posterior or likelihood",
+            "the module has no `bayesupdate` and no `restrict` to observed fields; pass `--target NAME` naming a posterior or likelihood",
         )),
         many => {
             let names: Vec<&str> = many.iter().map(|s| m.resolve(*s)).collect();

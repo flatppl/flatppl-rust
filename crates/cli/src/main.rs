@@ -302,7 +302,8 @@ enum Command {
     },
     /// Write a Stan program for one target of a FlatPPL model.
     ///
-    /// The target is `--target NAME`, or the model's single `bayesupdate`.
+    /// The target is `--target NAME`, or the model's single posterior: a
+    /// `bayesupdate`, or a `restrict` to observed fields.
     /// Refuses (exit 3) a construct with no Stan form, or one the emitter
     /// does not write yet; the message says which.
     #[cfg(feature = "stan")]
