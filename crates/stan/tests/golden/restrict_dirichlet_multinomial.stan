@@ -7,5 +7,9 @@ parameters {
 }
 model {
   p ~ dirichlet([1.0, 2.0, 3.0]');
-  n ~ multinomial(p);
+  if (sum(n) != 10) {
+    target += negative_infinity();
+  } else {
+    n ~ multinomial(p);
+  }
 }

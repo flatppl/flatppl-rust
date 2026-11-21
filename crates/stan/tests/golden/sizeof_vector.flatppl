@@ -1,0 +1,7 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+X = [1.0, 2.0, 3.0]
+mu = elementof(reals)
+lp = logdensityof(Normal(sum(sizeof(X)) + sizeof(X)[1] + sum(sizeof(transpose(X))) + mu, 1.0), 0.4)
+inputs = (mu)
+outputs = (lp)

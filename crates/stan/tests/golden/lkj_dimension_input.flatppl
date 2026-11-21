@@ -1,0 +1,9 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+n = elementof(posintegers)
+eta = elementof(posreals)
+c_obs = elementof(cartpow(reals, [3, 3]))
+c = draw(LKJ(n = n, eta = eta))
+lp = logdensityof(lawof(record(c = c)), record(c = c_obs))
+inputs = (n, eta, c_obs)
+outputs = (lp)

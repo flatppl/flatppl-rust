@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+yd = [0.9, 1.1, 0.3]
+n1 = lengthof(yd)
+n2 = n1
+n3 = n2 + 0
+a ~ Normal(0, 1)
+b ~ iid(Normal(a, 1), n3)
+prior = lawof(record(a = a))
+post = bayesupdate(likelihoodof(kernelof(record(b = b), a = a), record(b = yd)), prior)

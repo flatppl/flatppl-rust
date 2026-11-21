@@ -263,7 +263,7 @@ impl<'m> Emitter<'m> {
             }
             let e = self.expr(a)?;
             tys.push(t);
-            locals.insert(r.name, e.at(super::super::P_ATOM));
+            locals.insert(r.name, e.operand());
         }
         let scoped = self.instantiate(s, body, &entries, &tys)?;
         let mut ctx = FnCtx {

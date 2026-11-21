@@ -1,0 +1,3 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+lp = logdensityof(broadcast(fn(Multinomial(_, [0.2, 0.3, 0.5])), [10, 4]), [[2, 3, 5], [1, 1, 2]])

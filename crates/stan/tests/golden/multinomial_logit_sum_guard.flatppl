@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+g ~ iid(Normal(0, 1), 3)
+n ~ Multinomial(10, softmax(g))
+prior = lawof(record(g = g))
+K = kernelof(record(n = n), g = g)
+post = bayesupdate(likelihoodof(K, record(n = [2, 3, 5])), prior)

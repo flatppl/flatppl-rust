@@ -1,0 +1,6 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+q = elementof(cartpow(posreals, 2))
+lp = logdensityof(broadcast(Dirichlet, fill(q, 2)), [[0.3, 0.7], [0.6, 0.4]])
+inputs = (q)
+outputs = (lp)

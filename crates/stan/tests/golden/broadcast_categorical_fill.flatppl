@@ -1,0 +1,6 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+q = elementof(stdsimplex(3))
+lp = logdensityof(broadcast(Categorical, fill(q, 2)), [1, 3])
+inputs = (q)
+outputs = (lp)

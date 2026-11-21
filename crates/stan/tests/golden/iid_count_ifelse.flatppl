@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+a ~ Normal(0, 1)
+b ~ iid(Normal(a, 1), ifelse(true, 3, 2))
+prior = lawof(record(a = a))
+K = kernelof(record(b = b), a = a)
+post = bayesupdate(likelihoodof(K, record(b = [0.9, 1.1, 0.3])), prior)

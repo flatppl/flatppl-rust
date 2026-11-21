@@ -1,0 +1,10 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+mu = elementof(reals)
+nu = elementof(reals)
+a0 = elementof(reals)
+b0 = elementof(reals)
+k = functionof(Normal(a0 - 2.0 * b0, 1.0), a0 = a0, b0 = b0)
+lp = logdensityof(normalize(ksuperpose(k, [0.3, 0.7], [3.0, 4.0], mu - nu)), 0.5)
+inputs = (mu, nu)
+outputs = (lp)

@@ -294,6 +294,13 @@ impl<'m> Emitter<'m> {
                 "a `Dirac` atom whose value is not data",
             ));
         }
+        // The row test compares each element with the atom value.
+        if self.shape(cv).is_none_or(|s| s.rank != 0) {
+            return Err(Refusal::not_yet(
+                Some(mix),
+                "a `Dirac` row atom whose value is not a scalar",
+            ));
+        }
         // The atom is one whole row: `fill(c, n)` or `fill(c, [1, n])` with n
         // the rows' length.
         let len_node = if self.row_fill(atom) {
@@ -967,18 +974,20 @@ impl<'m> Emitter<'m> {
         y: &str,
     ) -> Result<String> {
         // Each argument with an axis is per component; a scalar is shared.
-        let per = |me: &mut Self, a: NodeId| -> Result<String> {
+        let per = |me: &mut Self, a: NodeId| -> Result<super::Ex> {
             let e = me.expr(a)?;
             Ok(if me.shape(a).is_some_and(|s| s.rank >= 1) {
                 // Stan indexes a name or a parenthesized expression, not a
                 // literal (`[3.0, 4.0]'[k]` is a syntax error).
-                if super::structure::is_identifier(&e.s) {
+                super::Ex::atom(if super::structure::is_identifier(&e.s) {
                     format!("{}[{COMP}]", e.s)
                 } else {
                     format!("({})[{COMP}]", e.s)
-                }
+                })
             } else {
-                e.s
+                // A shared scalar (`mu - nu`) keeps its precedence: each
+                // reader parenthesizes it at its own level.
+                e
             })
         };
         if let Node::Const(f) = self.m.node(kernel) {
@@ -1220,9 +1229,11 @@ impl<'m> Emitter<'m> {
         let lp = self.law_density(at, law, y, index)?;
         // A guard matters only where the support varies by component
         // (binomial `n` per component): Stan's lpmf throws outside it.
+        // An `unchecked_support` row's guard is its support test, below.
         let guard = law
             .guard
             .as_ref()
+            .filter(|_| !law.unchecked_support)
             .filter(|(whole, _)| index.is_some() || whole.contains(COMP))
             .map(|(whole, each)| {
                 let t = if index.is_some() { each } else { whole };
@@ -1262,15 +1273,15 @@ impl<'m> Emitter<'m> {
                 "a mixture component on a constrained matrix set",
             ));
         }
-        // An `unchecked_support` row (von Mises) does not test its own
-        // support: outside it the component's density is zero.
+        // An `unchecked_support` row (von Mises, `multinomial`) does not test
+        // its own support: outside it the component's density is zero.
         let outside = if law.unchecked_support {
-            Self::outside_test(
+            self.unchecked_test(
                 y,
                 self.decls.get(y).is_some_and(|d| d.rank() > 0),
-                law.bounds.0.as_deref(),
-                law.bounds.1.as_deref(),
-            )
+                law,
+                index,
+            )?
         } else {
             None
         };

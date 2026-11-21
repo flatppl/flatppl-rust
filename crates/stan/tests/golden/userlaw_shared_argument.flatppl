@@ -1,0 +1,8 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+mu = elementof(reals)
+nu = elementof(reals)
+S = rowstack([[1.0, 0.3], [0.3, 1.0]])
+lp = logdensityof(broadcast((x, q) -> MvNormal([x - q, 2.0 / q], S), [1.0, 2.0], mu - nu), [[0.4, 0.5], [1.0, -0.2]])
+inputs = (mu, nu)
+outputs = (lp)

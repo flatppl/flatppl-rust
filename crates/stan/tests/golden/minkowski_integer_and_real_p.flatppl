@@ -1,0 +1,9 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+dist = standard_module("distances", "0.1")
+u = elementof(cartpow(reals, 3))
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+lp = logdensityof(Normal(dist.minkowski(u, v - w, 3), 1.0), 0.3) + logdensityof(Normal(dist.minkowski(u, w, 1.5), 1.0), 0.2)
+inputs = (u, v, w)
+outputs = (lp)

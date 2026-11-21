@@ -35,6 +35,14 @@ pub(crate) struct ScanOut {
 /// Accumulator field → the accumulator fields its step body reads.
 type FieldReads = HashMap<String, BTreeSet<String>>;
 
+/// Fields bound to Stan names, as record fields.
+fn atoms(names: &HashMap<String, String>) -> HashMap<String, Ex> {
+    names
+        .iter()
+        .map(|(f, n)| (f.clone(), Ex::atom(n.clone())))
+        .collect()
+}
+
 /// How the value of a scan is read after it.
 enum Uses {
     /// Fields read row by row (`""` for a scalar or vector scan).
@@ -245,19 +253,18 @@ impl<'m> Emitter<'m> {
                         let mut m = self.record_map(a)?;
                         for (f, t) in fs.iter() {
                             let f = self.name(*f).to_string();
-                            if let Some(text) = m.get(&f).cloned() {
-                                let local =
-                                    self.inner_local(&format!("{base}_{f}"), callee, t, text);
+                            if let Some(e) = m.get(&f).cloned() {
+                                let local = self.inner_local(&format!("{base}_{f}"), callee, t, e);
                                 m.insert(f, local);
                             }
                         }
                         Err(m)
                     }
                     t => {
-                        let text = self.expr(a)?.at(P_ATOM);
+                        let e = self.expr(a)?;
                         Ok(match t {
-                            Some(t) => self.inner_local(&base, callee, &t, text),
-                            None => text,
+                            Some(t) => self.inner_local(&base, callee, &t, e),
+                            None => e.operand(),
                         })
                     }
                 });
@@ -282,14 +289,15 @@ impl<'m> Emitter<'m> {
     /// or a non-scalar keeps its text.
     // The locals precede the first field assignment: the call reads the
     // accumulator before this step updates it.
-    fn inner_local(&mut self, base: &str, callee: &str, ty: &Type, text: String) -> String {
+    fn inner_local(&mut self, base: &str, callee: &str, ty: &Type, e: Ex) -> Ex {
         let base_ty = match ty {
             Type::Scalar(flatppl_core::ScalarType::Real) => "real",
             Type::Scalar(flatppl_core::ScalarType::Integer) => "int",
-            _ => return text,
+            _ => return e.operand(),
         };
+        let text = e.at(P_ATOM);
         if super::structure::is_identifier(&text) || text.parse::<f64>().is_ok() {
-            return text;
+            return Ex::atom(text);
         }
         // A name in scope (a state field) gets the callee's name, so the local
         // does not read as a second copy of it.
@@ -300,7 +308,7 @@ impl<'m> Emitter<'m> {
         };
         let ctx = self.fctx.as_mut().unwrap();
         ctx.lines.push(format!("{base_ty} {name} = {text};"));
-        name
+        Ex::atom(name)
     }
 
     /// The accumulator fields a step field reads: through each inlined
@@ -799,7 +807,7 @@ impl<'m> Emitter<'m> {
             ctx.records.insert(pr, map);
         } else {
             let e = self.expr(p)?;
-            ctx.locals.insert(pr, e.at(P_ATOM));
+            ctx.locals.insert(pr, e.operand());
         }
         Ok(())
     }
@@ -1009,13 +1017,13 @@ impl<'m> Emitter<'m> {
             scoped: types,
             ..Default::default()
         };
-        ctx.locals.insert(step.entries[1].1.name, x.at(P_ATOM));
+        ctx.locals.insert(step.entries[1].1.name, x.operand());
         self.bind_param(step, &mut ctx)?;
         let acc = step.entries[0].1.name;
         if step.fields.is_some() {
-            ctx.records.insert(acc, names.clone());
+            ctx.records.insert(acc, atoms(names));
         } else {
-            ctx.locals.insert(acc, names[""].clone());
+            ctx.locals.insert(acc, Ex::atom(names[""].clone()));
         }
         let base = self.scan_base(step.at);
         let outer = self.fctx.replace(ctx);
@@ -1259,7 +1267,7 @@ impl<'m> Emitter<'m> {
             inline_only: true,
             ..Default::default()
         };
-        ctx.locals.insert(step.entries[1].1.name, x.at(P_ATOM));
+        ctx.locals.insert(step.entries[1].1.name, x.operand());
         self.bind_param(step, &mut ctx)?;
         let base = self.scan_base(step.at);
         let outer = self.fctx.replace(ctx);
@@ -1369,7 +1377,7 @@ impl<'m> Emitter<'m> {
                 tys.push(row_ty.clone());
                 let map = columns
                     .iter()
-                    .map(|(f, c)| (f.clone(), format!("{c}[{var}]")))
+                    .map(|(f, c)| (f.clone(), Ex::atom(format!("{c}[{var}]"))))
                     .collect();
                 ctx.records.insert(r, map);
                 continue;
@@ -1380,7 +1388,7 @@ impl<'m> Emitter<'m> {
                     tys.push(*elem);
                     match self.elem(a, std::slice::from_ref(&var)) {
                         Ok(e) => {
-                            ctx.locals.insert(r, e.at(P_ATOM));
+                            ctx.locals.insert(r, e.operand());
                         }
                         Err(e) => {
                             failed = Some(e);
@@ -1392,7 +1400,7 @@ impl<'m> Emitter<'m> {
                     tys.push(t);
                     match self.expr(a) {
                         Ok(e) => {
-                            ctx.locals.insert(r, e.at(P_ATOM));
+                            ctx.locals.insert(r, e.operand());
                         }
                         Err(e) => {
                             failed = Some(e);
@@ -1449,10 +1457,10 @@ impl<'m> Emitter<'m> {
 
     // ------------------------------------------------- record arguments
 
-    /// The Stan names of a record value's fields: a record expression, a
-    /// record argument already bound, a log weight's record argument, or
-    /// the last entry of a record scan.
-    pub(super) fn record_map(&mut self, a: NodeId) -> Result<HashMap<String, String>> {
+    /// The Stan expressions of a record value's fields, each with its
+    /// precedence: a record expression, a record argument already bound, a
+    /// log weight's record argument, or the last entry of a record scan.
+    pub(super) fn record_map(&mut self, a: NodeId) -> Result<HashMap<String, Ex>> {
         if let Node::Ref(r) = self.m.node(a)
             && r.ns == RefNs::Local
         {
@@ -1463,7 +1471,7 @@ impl<'m> Emitter<'m> {
                 return Ok(self
                     .fields
                     .iter()
-                    .map(|(k, v)| (self.name(*k).to_string(), v.clone()))
+                    .map(|(k, v)| (self.name(*k).to_string(), Ex::atom(v.clone())))
                     .collect());
             }
         }
@@ -1479,7 +1487,7 @@ impl<'m> Emitter<'m> {
             let mut out = HashMap::new();
             for (f, v) in named {
                 let e = self.expr(v)?;
-                out.insert(f, e.at(P_ATOM));
+                out.insert(f, e.operand());
             }
             return Ok(out);
         }
@@ -1490,7 +1498,7 @@ impl<'m> Emitter<'m> {
             && self.is_last(scan, sel)
             && let Some(m) = self.scan_last(scan)?
         {
-            return Ok(m);
+            return Ok(atoms(&m));
         }
         if let Some((fun, args)) = self.record_call(rec) {
             return self.inline_record_call(rec, fun, &args);
@@ -1519,7 +1527,7 @@ impl<'m> Emitter<'m> {
         id: NodeId,
         fun: NodeId,
         args: &[NodeId],
-    ) -> Result<HashMap<String, String>> {
+    ) -> Result<HashMap<String, Ex>> {
         let (body, entries) = self.callable_parts(fun)?;
         if entries.len() != args.len() {
             return Err(Refusal::not_yet(
@@ -1541,7 +1549,7 @@ impl<'m> Emitter<'m> {
                 ctx.records.insert(r.name, m);
             } else {
                 let e = self.expr(a)?;
-                ctx.locals.insert(r.name, e.at(P_ATOM));
+                ctx.locals.insert(r.name, e.operand());
             }
             tys.push(t);
         }
@@ -1560,7 +1568,7 @@ impl<'m> Emitter<'m> {
         for (f, v) in fields {
             match self.expr(v) {
                 Ok(e) => {
-                    out.insert(f, e.at(P_ATOM));
+                    out.insert(f, e.operand());
                 }
                 Err(e) => {
                     failed = Some(e);
@@ -1609,7 +1617,7 @@ impl<'m> Emitter<'m> {
                 ctx.records.insert(r.name, m);
             } else {
                 let e = self.expr(a)?;
-                ctx.locals.insert(r.name, e.at(P_ATOM));
+                ctx.locals.insert(r.name, e.operand());
             }
             tys.push(t);
         }

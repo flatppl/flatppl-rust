@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+x = filter(fn(_ > 5.0), [1.0, 2.0])
+a ~ Normal(0, 1)
+b ~ iid(Normal(a, 1), lengthof(x))
+prior = lawof(record(a = a))
+post = bayesupdate(likelihoodof(kernelof(record(b = b), a = a), record(b = filter(fn(_ > 5.0), [3.0]))), prior)

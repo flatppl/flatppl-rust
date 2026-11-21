@@ -5,6 +5,9 @@ data {
 }
 transformed data {
   array[N + 3, J] int counts = append_array(append_array(X, rep_array(rep_array(0, J), 2)), {{4, 4, 4}});
+  if (N + 3 != 5) {
+    reject("the size of counts is ", N + 3, ", but its law gives ", 5);
+  }
 }
 parameters {
   real<lower=0> lam;
