@@ -2,9 +2,9 @@
 //! `locscale(StudentT(nu), mu, sigma)`) against FlatPPL law nodes, and filling
 //! the Stan argument templates.
 
-use super::{Emitter, Ex, Flat, P_ATOM};
+use super::{Emitter, Ex, Flat, P_ATOM, P_POSTFIX};
 use crate::refuse::Result;
-use flatppl_core::{Node, NodeId, Scalar};
+use flatppl_core::{Node, NodeId, Scalar, Type};
 use std::collections::HashMap;
 
 /// A parsed table pattern. Operators become their FlatPPL call names.
@@ -245,11 +245,43 @@ impl<'m> Emitter<'m> {
                 }
                 _ => e,
             };
+            // Element i of `fill(x, k)` is `x` itself (§07 `fill`).
+            let filled = match (index.filter(|_| per_element(var)), binds.get(var)) {
+                (Some(_), Some(Bound::Node(n))) if gathered.is_none() => {
+                    let r = self.resolve(*n);
+                    match self.call(r).map(|c| &c.args[..]) {
+                        Some(&[x, k])
+                            if self.head(r) == Some("fill")
+                                && self.shape(x).is_some_and(|s| s.rank >= 1)
+                                && self.shape(k).is_some_and(|s| s.rank == 0) =>
+                        {
+                            let ex = self.expr(x)?;
+                            Some(if whole { ex.s } else { ex.at(P_POSTFIX) })
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            // A row of a real matrix is a `row_vector`; Stan's vector
+            // parameters take a `vector`. A list of vectors has vector rows.
+            let real_rows = match binds.get(var) {
+                Some(Bound::Node(n)) => {
+                    matches!(self.ty(*n), Some(Type::Array { ref shape, .. }) if shape.len() == 2)
+                        && self.shape(*n).is_some_and(|s| !s.int)
+                }
+                _ => false,
+            };
             let text = match index.filter(|_| per_element(var)) {
                 Some(_) if gathered.is_some() => gathered.unwrap(),
+                Some(_) if filled.is_some() => filled.unwrap(),
+                Some(i) if real_rows => format!("to_vector({}[{i}])", e.at(P_ATOM)),
                 Some(i) => format!("{}[{i}]", e.at(P_ATOM)),
                 None if whole => e.s,
-                None => e.at(P_ATOM),
+                // An operand of the template's operators. No template indexes
+                // a placeholder (`get0` prints its own), so a postfix
+                // transpose needs no parentheses here.
+                None => e.at(P_POSTFIX),
             };
             out.push_str(&text);
             rest = after;

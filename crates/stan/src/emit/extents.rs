@@ -8,7 +8,8 @@
 //! elsewhere. So a program stays correct for data of another shape.
 
 use super::Emitter;
-use flatppl_core::{Node, NodeId, Phase, RefNs, Scalar, Symbol, Type};
+use crate::refuse::{Refusal, RefusalKind, Result};
+use flatppl_core::{Dim, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type};
 use std::collections::{HashMap, HashSet};
 
 /// Builtins whose result has the shape of an argument of its rank.
@@ -51,6 +52,40 @@ pub(crate) struct SizeVar {
     n: u32,
     parent: usize,
     bound: Option<Lin>,
+}
+
+/// The variate a size rule ties: its Stan name, its size forms where it has
+/// them, and its inferred type.
+pub(crate) struct Variate<'a> {
+    lhs: &'a str,
+    axes: Option<&'a [Lin]>,
+    domain: Option<&'a Type>,
+}
+
+/// One axis of a law's size argument: an extent node (`n`, an entry of
+/// `[2, n]`), or axis `axis` of `sizeof(of)`, whose node `at` is the whole
+/// `sizeof`.
+#[derive(Clone, Copy)]
+enum SizeEntry {
+    Node(NodeId),
+    Axis { at: NodeId, of: NodeId, axis: usize },
+}
+
+/// A variate axis against the size its law gives, which may differ for some
+/// data. Decided in [`Emitter::resolve_sizes`], on the size forms.
+pub(crate) struct SizeCheck {
+    axis: Lin,
+    law: Lin,
+    /// The variate's Stan name, for the message.
+    var: String,
+    /// The law's size argument, the refusal's location.
+    at: NodeId,
+    /// Neither side reads a `data` value: both are fixed in the program, and
+    /// their static extents from the inferred types decide.
+    fixed: bool,
+    /// The static extent on this axis of the observed value and of the law's
+    /// variate, from the inferred types.
+    statics: (Option<u32>, Option<u32>),
 }
 
 /// An integer `konst + Σ coef · term`: sizes add and cancel symbolically.
@@ -282,7 +317,7 @@ impl<'m> Emitter<'m> {
     /// Name each size class and write the names into the program. A class
     /// that took a sourced size prints it; any other is one `data` size, `N`
     /// first, then `N_<first member>`.
-    pub(super) fn resolve_sizes(&mut self) {
+    pub(super) fn resolve_sizes(&mut self) -> Result<()> {
         let mut text: HashMap<usize, String> = HashMap::new();
         let mut decls: Vec<(usize, String)> = Vec::new();
         // A data size declares a `data` value, so it takes a sourced size
@@ -309,6 +344,28 @@ impl<'m> Emitter<'m> {
                 .iter()
                 .all(|n| data_names.contains(n) && !own.contains(n))
         };
+        // The data each accepted bound reads, by the value it sizes: a bound
+        // that would read back into its own class through other bounds is a
+        // cycle (`x` sized by `y`, `y` by `x`), and keeps its own data size.
+        let mut reads: HashMap<String, Vec<String>> = HashMap::new();
+        let cyclic =
+            |reads: &HashMap<String, Vec<String>>, from: &[String], own: &HashSet<String>| {
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut stack: Vec<String> = from.to_vec();
+                while let Some(n) = stack.pop() {
+                    if own.contains(&n) {
+                        return true;
+                    }
+                    if seen.insert(n.clone())
+                        && let Some(next) = reads.get(&n)
+                    {
+                        stack.extend(next.iter().cloned());
+                    }
+                }
+                false
+            };
+        // The roots that print their bound: the check compares on it.
+        let mut printed_bound: HashMap<usize, Lin> = HashMap::new();
         for k in 0..self.svars.len() {
             let r = self.find(k);
             if text.contains_key(&r) {
@@ -316,8 +373,23 @@ impl<'m> Emitter<'m> {
                 text.insert(k, t);
                 continue;
             }
-            let t = match self.svars[r].bound.clone() {
-                Some(l) if readable(&l, &owners[&r]) => l.print(),
+            let bound = self.svars[r].bound.clone().filter(|l| {
+                readable(l, &owners[&r])
+                    && !cyclic(
+                        &reads,
+                        &super::functions::identifiers(&l.print()),
+                        &owners[&r],
+                    )
+            });
+            let t = match bound {
+                Some(l) => {
+                    let names = super::functions::identifiers(&l.print());
+                    for o in &owners[&r] {
+                        reads.insert(o.clone(), names.clone());
+                    }
+                    printed_bound.insert(r, l.clone());
+                    l.print()
+                }
                 _ => {
                     let v = &self.svars[r];
                     let base = if self.used.contains("N") {
@@ -378,6 +450,61 @@ impl<'m> Emitter<'m> {
                 }
             }
         }
+        // A size the law gives that the variate's declaration does not state
+        // (a static input against a data count, a size only `transformed
+        // data` computes): Stan checks it once the data is read. Decided on
+        // the size forms: each class stands for its printed bound or for
+        // itself.
+        let roots: Vec<usize> = (0..self.svars.len()).map(|k| self.find(k)).collect();
+        let resolved = |l: &Lin| -> Lin {
+            let mut out = Lin::konst(l.konst);
+            for (t, c) in &l.terms {
+                let class = as_var(&Lin::term(t.clone())).map(|k| roots[k]);
+                let part = match class {
+                    Some(r) => match printed_bound.get(&r) {
+                        Some(b) => b.scale(*c),
+                        None => Lin::term(token(r)).scale(*c),
+                    },
+                    None => Lin::term(t.clone()).scale(*c),
+                };
+                out = out.plus(&part);
+            }
+            out
+        };
+        let mut checks: Vec<String> = Vec::new();
+        for c in std::mem::take(&mut self.size_checks) {
+            let (a, b) = (resolved(&c.axis), resolved(&c.law));
+            if a == b {
+                continue;
+            }
+            let var = &c.var;
+            let ill = |p: i64, q: i64| {
+                Refusal::new(
+                    RefusalKind::IllFormedModule,
+                    Some(c.at),
+                    format!("the size of `{var}`"),
+                    format!("`{var}` has size {p}, but its law gives size {q}"),
+                )
+            };
+            // Both sides fixed in the program: their static extents decide.
+            if c.fixed && !has_token(&a) {
+                match c.statics {
+                    (Some(p), Some(q)) if p == q => continue,
+                    (Some(p), Some(q)) => return Err(ill(i64::from(p), i64::from(q))),
+                    _ => {}
+                }
+            }
+            if let (Some(p), Some(q)) = (a.as_const(), b.as_const()) {
+                return Err(ill(p, q));
+            }
+            let (sa, sb) = (replace(&c.axis.print()), replace(&c.law.print()));
+            let line = format!(
+                "if ({sa} != {sb}) {{\n  reject(\"the size of {var} is \", {sa}, \", but its law gives \", {sb});\n}}"
+            );
+            if !checks.contains(&line) {
+                checks.push(line);
+            }
+        }
         // New size declarations lead the data block.
         let mut data: Vec<String> = decls
             .iter()
@@ -388,29 +515,35 @@ impl<'m> Emitter<'m> {
                 .insert(n.clone(), serde_json::Value::from(self.svars[*r].n));
         }
         data.extend(std::mem::take(&mut self.data));
-        // A size a class took can be declared after a line that now reads it:
-        // move its declaration up to the first such line.
-        let mut i = 0;
-        while i < data.len() {
-            let line = &data[i];
-            let name = (line.starts_with("int") && !line.contains('[')).then(|| {
-                line.trim_end_matches(';')
-                    .rsplit(' ')
-                    .next()
-                    .unwrap()
-                    .to_string()
-            });
-            if let Some(name) = name
-                && let Some(j) = data[..i]
+        // A declaration that an earlier line reads moves up to just before its
+        // first reader, repeated until nothing moves: the data block in
+        // dependency order, otherwise as emitted. A text Stan accepts has no
+        // such read, so it does not change. The bound on passes guards a
+        // cycle, which the bound choice above already leaves out.
+        let name_of = |line: &str| -> String {
+            line.trim_end_matches(';')
+                .rsplit(' ')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        };
+        for _ in 0..=data.len() * data.len() {
+            let moved = (0..data.len()).find_map(|i| {
+                let name = name_of(&data[i]);
+                data[..i]
                     .iter()
                     .position(|l| super::functions::identifiers(l).contains(&name))
-            {
-                let moved = data.remove(i);
-                data.insert(j, moved);
-            }
-            i += 1;
+                    .map(|j| (i, j))
+            });
+            let Some((i, j)) = moved else {
+                break;
+            };
+            let line = data.remove(i);
+            data.insert(j, line);
         }
         self.data = data;
+        self.tdata.extend(checks);
+        Ok(())
     }
 
     /// A scalar integer expression as a linear form. Literals fold; a module
@@ -773,53 +906,407 @@ impl<'m> Emitter<'m> {
     }
 
     /// A variate observed or drawn under `m` has the shape the law gives it:
-    /// its `iid` counts, or the array arguments of a broadcast law.
-    pub(super) fn constrain_variate(&mut self, lhs: &str, m: NodeId) {
-        let Some(axes) = self.ext_lin.get(lhs).cloned() else {
-            return;
+    /// its `iid` counts, an LKJ dimension, or the array arguments of a
+    /// broadcast law. A size the Stan function does not take must tie the
+    /// data, so one the program cannot read refuses: data of another size
+    /// would score silently.
+    pub(super) fn constrain_variate(&mut self, lhs: &str, m: NodeId) -> Result<()> {
+        let m = self.resolve(m);
+        let axes = self.ext_lin.get(lhs).cloned();
+        // The whole variate's static extents, from the inferred law type.
+        let domain = match self.m.type_of(m) {
+            Some(Type::Measure { domain, .. }) => Some((**domain).clone()),
+            _ => None,
         };
+        let Some(c) = self.call(m) else {
+            return Ok(());
+        };
+        if self.head(m) == Some("broadcast")
+            && let Some(axes) = &axes
+        {
+            for &v in &c.args.to_vec()[1..] {
+                let Some(r) = self.arank(v) else { continue };
+                for (a, l) in axes.iter().enumerate().take(r) {
+                    if self.dim_at(v, a) == Some(1) {
+                        continue;
+                    }
+                    if let Some(x) = self.sym_extent(v, a, 0) {
+                        self.unify(l, &x);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let shape = Variate {
+            lhs,
+            axes: axes.as_deref(),
+            domain: domain.as_ref(),
+        };
+        self.constrain_law(&shape, m, 0)
+    }
+
+    /// The size rule of the law `m` whose variate axes start at `offset` of
+    /// the whole variate: `iid` counts (then the inner law), an LKJ
+    /// dimension, a `Multinomial` count. One recursion, so a rule holds at
+    /// every `iid` depth.
+    fn constrain_law(&mut self, shape: &Variate<'_>, m: NodeId, offset: usize) -> Result<()> {
         let m = self.resolve(m);
         let Some(c) = self.call(m) else {
-            return;
+            return Ok(());
         };
         let args = c.args.to_vec();
         match self.head(m) {
-            // `iid(iid(D, m), k)`: the outer counts, then the inner ones.
             Some("iid") => {
-                let (mut args, mut offset) = (args, 0);
-                loop {
-                    let ns = self.extent_list(args[1]);
-                    let k = ns.len();
-                    for (a, h) in ns.into_iter().enumerate() {
-                        if let (Some(h), Some(l)) = (h, axes.get(offset + a))
-                            && let Some(x) = self.lin_int(h)
-                        {
-                            self.unify(l, &x);
+                let ns = self.size_entries(args[1]);
+                let k = ns.len();
+                for (a, h) in ns.into_iter().enumerate() {
+                    match h {
+                        None => {}
+                        Some(SizeEntry::Node(h)) => {
+                            let x = self.size_argument(h, "an `iid` count")?;
+                            self.tie_axis(shape, offset + a, &x, h)?;
                         }
-                    }
-                    offset += k;
-                    let inner = self.resolve(args[0]);
-                    if self.head(inner) != Some("iid") {
-                        break;
-                    }
-                    args = self.call(inner).unwrap().args.to_vec();
-                }
-            }
-            Some("broadcast") => {
-                for &v in &args[1..] {
-                    let Some(r) = self.arank(v) else { continue };
-                    for (a, l) in axes.iter().enumerate().take(r) {
-                        if self.dim_at(v, a) == Some(1) {
-                            continue;
-                        }
-                        if let Some(x) = self.sym_extent(v, a, 0) {
-                            self.unify(l, &x);
+                        // Axis j of `sizeof(v)`: v's own extent on this axis
+                        // when v is the observed value.
+                        Some(SizeEntry::Axis { at, of, axis: j }) => {
+                            let x = self.axis_size(at, of, j)?;
+                            let own =
+                                (j == offset + a && self.is_observed(of, shape.lhs)).then_some(0);
+                            self.tie_axis_own(shape, offset + a, &x, at, own)?;
                         }
                     }
                 }
+                self.constrain_law(shape, args[0], offset + k)
             }
-            _ => {}
+            // §08: an n × n matrix. Stan's `lkj_corr` takes no n.
+            Some(h @ ("LKJ" | "LKJCholesky")) => {
+                if let Some(&n) = self.law_args(h, m)?.first() {
+                    let x = self.size_argument(n, &format!("an `{h}` dimension"))?;
+                    self.tie_axis(shape, offset, &x, n)?;
+                    self.tie_axis(shape, offset + 1, &x, n)?;
+                }
+                Ok(())
+            }
+            // §08 `Multinomial`: the support is the vectors summing to n,
+            // which the row guard tests, so n must print. n read as the
+            // observed value's own sum holds by construction: no guard.
+            Some("Multinomial") => {
+                if let Some(&n) = self.law_args("Multinomial", m)?.first() {
+                    self.size_argument(n, "a `Multinomial` count")?;
+                    if offset == 0 && self.own_sum(n, shape.lhs) {
+                        self.own_sum.insert(shape.lhs.to_string());
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
+    }
+
+    /// Axis `axis` of the variate takes the law size `x` (argument node
+    /// `at`). Unify where the variate's size is a data size, and record a
+    /// check where the two can differ for some data.
+    fn tie_axis(&mut self, shape: &Variate<'_>, axis: usize, x: &Lin, at: NodeId) -> Result<()> {
+        let own = self.own_extent_offset(at, shape.lhs, axis);
+        self.tie_axis_own(shape, axis, x, at, own)
+    }
+
+    /// [`Self::tie_axis`] with the own-extent offset (see
+    /// [`Self::own_extent_offset`]) given by the caller.
+    fn tie_axis_own(
+        &mut self,
+        shape: &Variate<'_>,
+        axis: usize,
+        x: &Lin,
+        at: NodeId,
+        own: Option<i64>,
+    ) -> Result<()> {
+        let Some(l) = shape.axes.and_then(|a| a.get(axis)).cloned() else {
+            return Ok(());
+        };
+        self.unify(&l, x);
+        // The law size is the observed value's own extent on this axis,
+        // through any chain of bindings: equal for every data set, or, with
+        // an offset, for none.
+        if let Some(k) = own {
+            if k == 0 {
+                return Ok(());
+            }
+            let var = shape.lhs;
+            return Err(Refusal::new(
+                RefusalKind::IllFormedModule,
+                Some(at),
+                format!("the size of `{var}`"),
+                format!(
+                    "the law gives `{var}` its own extent on axis {} {} {}, so no data fits it",
+                    axis + 1,
+                    if k > 0 { "plus" } else { "minus" },
+                    k.abs()
+                ),
+            ));
+        }
+        // A size inside a function body or a loop reads a local, which no
+        // `transformed data` check can read.
+        let mut stack = vec![at];
+        while let Some(id) = stack.pop() {
+            if matches!(self.m.node(id), Node::Ref(r) if r.ns == RefNs::Local) {
+                return Ok(());
+            }
+            self.m.for_each_child(id, |k| stack.push(k));
+        }
+        if self.function_depth > 0 {
+            return Ok(());
+        }
+        // A size is an integer, never a parameter. The static extent of a
+        // draw (`lengthof(X)` of `X ~ iid(…, 3)`) reads no draw value.
+        if self.m.phase_of(at) == Some(Phase::Stochastic) && x.as_const().is_none() {
+            return Err(Refusal::not_yet(Some(at), "a size that reads a draw"));
+        }
+        // A side is fixed in the program when it is Fixed phase and reaches no
+        // `data` value: its Stan value is computed from the program text alone.
+        let fixed_in_program = |me: &Self, node: NodeId| {
+            me.m.phase_of(node) == Some(Phase::Fixed)
+                && !me
+                    .reached(node, &HashSet::new())
+                    .iter()
+                    .any(|b| me.env.get(b).is_some_and(|s| me.in_data_block(s)))
+        };
+        let observed = self.observing;
+        let fixed = fixed_in_program(self, at)
+            && !self.in_data_block(shape.lhs)
+            && observed.is_some_and(|v| fixed_in_program(self, v));
+        let static_at = |t: Option<&Type>| match t {
+            Some(Type::Array { shape, .. }) => match shape.get(axis) {
+                Some(Dim::Static(n)) => Some(*n),
+                _ => None,
+            },
+            _ => None,
+        };
+        let statics = (
+            static_at(observed.and_then(|v| self.m.type_of(v))),
+            static_at(shape.domain),
+        );
+        self.size_checks.push(SizeCheck {
+            axis: l,
+            law: x.clone(),
+            var: shape.lhs.to_string(),
+            at,
+            fixed,
+            statics,
+        });
+        Ok(())
+    }
+
+    /// `lengthof(v)` or `sizeof(v)[i]` (through fixed bindings) where v's
+    /// inferred type states that extent.
+    fn static_extent(&self, n: NodeId) -> Option<u32> {
+        let r = self.resolve(n);
+        let c = self.call(r)?;
+        let (v, axis) = match (self.head(r)?, &c.args[..]) {
+            // §07 gives a matrix no `lengthof` (its print refuses).
+            ("lengthof", [v]) if !self.is_matrix(*v) => (*v, 0),
+            ("get", [s, i]) => {
+                let s = self.resolve(*s);
+                let (Some("sizeof"), Some([v])) = (self.head(s), self.call(s).map(|c| &c.args[..]))
+                else {
+                    return None;
+                };
+                let Node::Lit(Scalar::Int(i)) = self.m.node(self.resolve(*i)) else {
+                    return None;
+                };
+                // `sizeof` of a vector of vectors gives its outer extents only.
+                let axis = usize::try_from(*i - 1).ok()?;
+                if self.outer_axes(*v).is_some_and(|k| axis >= k) {
+                    return None;
+                }
+                (*v, axis)
+            }
+            _ => return None,
+        };
+        match self.m.type_of(v)? {
+            Type::Array { shape, .. } => match shape.get(axis)? {
+                Dim::Static(k) => Some(*k),
+                Dim::Dynamic => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `true` when the Stan name is a `data` value (literal or loaded).
+    fn in_data_block(&self, name: &str) -> bool {
+        self.json.contains_key(name) || self.deferred.iter().any(|d| d.stan == name)
+    }
+
+    /// `true` when the binding behind `v` is the value observed as `lhs`.
+    fn is_observed(&self, v: NodeId, lhs: &str) -> bool {
+        let field = |me: &Self, n: NodeId| {
+            let r = me.resolve(n);
+            match (me.head(r), me.call(r).map(|c| &c.args[..])) {
+                (Some("get"), Some(&[x, f])) => match (me.self_ref(x), me.m.node(f)) {
+                    (Some(s), Node::Lit(Scalar::Str(f))) => {
+                        Some((*me.m.alias_chain(s).last().unwrap(), f.to_string()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        // The observed value is a record field (`r.u`) the size reads too.
+        let same_field = || {
+            self.observing
+                .and_then(|o| field(self, o))
+                .is_some_and(|f| field(self, v) == Some(f))
+        };
+        self.self_ref(v)
+            .map(|s| *self.m.alias_chain(s).last().unwrap())
+            .and_then(|s| self.env.get(&s))
+            .is_some_and(|stan| stan == lhs)
+            || same_field()
+    }
+
+    /// `Some(k)` when the size `h` is, through fixed bindings and literal
+    /// offsets, the extent on `axis` of the value observed as `lhs` plus k
+    /// (`lengthof(v)` is axis 0, `sizeof(v)[i]` axis i - 1).
+    fn own_extent_offset(&self, h: NodeId, lhs: &str, axis: usize) -> Option<i64> {
+        let lit = |me: &Self, x: NodeId| match me.m.node(me.resolve(x)) {
+            Node::Lit(Scalar::Int(k)) => Some(*k),
+            _ => None,
+        };
+        let r = self.resolve(h);
+        let c = self.call(r)?;
+        match (self.head(r)?, &c.args[..]) {
+            ("lengthof", [v]) => (axis == 0 && self.is_observed(*v, lhs)).then_some(0),
+            ("get", [s, i]) => {
+                let s = self.resolve(*s);
+                let (Some("sizeof"), Some([v])) = (self.head(s), self.call(s).map(|c| &c.args[..]))
+                else {
+                    return None;
+                };
+                let i = lit(self, *i)?;
+                let outer = self.outer_axes(*v).is_none_or(|k| axis < k);
+                (i >= 1 && i - 1 == axis as i64 && outer && self.is_observed(*v, lhs)).then_some(0)
+            }
+            ("add", [a, b]) => match (lit(self, *a), lit(self, *b)) {
+                (_, Some(k)) => Some(self.own_extent_offset(*a, lhs, axis)? + k),
+                (Some(k), _) => Some(self.own_extent_offset(*b, lhs, axis)? + k),
+                _ => None,
+            },
+            ("sub", [a, b]) => Some(self.own_extent_offset(*a, lhs, axis)? - lit(self, *b)?),
+            _ => None,
+        }
+    }
+
+    /// `true` when the `Multinomial` count `n` is, through fixed bindings,
+    /// `sum(v)` of the value observed as `lhs`.
+    fn own_sum(&self, n: NodeId, lhs: &str) -> bool {
+        let r = self.resolve(n);
+        self.head(r) == Some("sum")
+            && matches!(self.call(r).map(|c| &c.args[..]), Some([v]) if self.is_observed(*v, lhs))
+    }
+
+    /// The axes of a size argument (§06 `iid(M, size)`): `sizeof(v)` of a
+    /// value of static rank gives one entry per axis of v; any other size
+    /// its extents ([`Emitter::extent_list`]).
+    fn size_entries(&self, n: NodeId) -> Vec<Option<SizeEntry>> {
+        let r = self.resolve(n);
+        if self.head(r) == Some("sizeof")
+            && let Some(&[of]) = self.call(r).map(|c| &c.args[..])
+            && let Some(k) = self.sizeof_rank(of)
+        {
+            return (0..k)
+                .map(|axis| Some(SizeEntry::Axis { at: r, of, axis }))
+                .collect();
+        }
+        self.extent_list(n)
+            .into_iter()
+            .map(|h| h.map(SizeEntry::Node))
+            .collect()
+    }
+
+    /// Axis `axis` of `sizeof(of)` as a Stan integer: the size
+    /// [`Self::size_argument`] gives the entry `sizeof(of)[axis + 1]`, step
+    /// for step (that node is not in the module, so the steps repeat here on
+    /// the same texts). `at` is the whole `sizeof`.
+    fn axis_size(&mut self, at: NodeId, of: NodeId, axis: usize) -> Result<Lin> {
+        let from = self.sizeof_form(of).map_or(0, |(_, from)| from);
+        // The text the entry prints (see `outer_size_at`), or `None` where
+        // `of` cannot print, as `opaque` gives.
+        let entry = |me: &mut Self| {
+            let v = me.expr(of).ok()?;
+            Some(Lin::term(format!("dims({})[{}]", v.s, from + axis + 1)))
+        };
+        // `lin_int`: a fixed size prints, so data written for it keeps its
+        // check.
+        if self.m.phase_of(at) == Some(Phase::Fixed)
+            && let Some(x) = entry(self)
+        {
+            return Ok(x);
+        }
+        // `static_extent`: the static extent of of's type.
+        let fixed = match self.ty(of) {
+            Some(Type::Array { shape, .. }) => shape.get(axis).cloned(),
+            Some(Type::TVector { len, .. }) if axis == 0 => Some(len),
+            _ => None,
+        };
+        if let Some(Dim::Static(k)) = fixed {
+            return Ok(Lin::konst(i64::from(k)));
+        }
+        // A size that reads a draw: the binder's refusal names it.
+        if self.m.phase_of(at) == Some(Phase::Stochastic) {
+            self.expr(of)?;
+        }
+        // An integer input is a Stan data integer.
+        if let Some(x) = entry(self) {
+            return Ok(x);
+        }
+        Err(Refusal::not_yet(
+            Some(at),
+            "an `iid` count that the Stan program cannot read as an integer",
+        ))
+    }
+
+    /// A law's size argument `n` as a Stan integer, or a refusal that names
+    /// it (`what` is "an `iid` count"): a module member or an untyped
+    /// `load_data` value has no integer the program can read.
+    fn size_argument(&mut self, n: NodeId, what: &str) -> Result<Lin> {
+        if let Some(x) = self.lin_int(n) {
+            return Ok(x);
+        }
+        // The static extent of a value of fixed shape (a parameter in
+        // `cartpow(reals, 3)`), read from its inferred type.
+        if let Some(k) = self.static_extent(n) {
+            return Ok(Lin::konst(i64::from(k)));
+        }
+        // A count that reads a draw: the binder's refusal names the latent
+        // draw the target integrates out.
+        if self.m.phase_of(n) == Some(Phase::Stochastic) {
+            self.expr(n)?;
+        }
+        // A size outside its function's domain (`lengthof` of a matrix) is
+        // ill-formed, not unreadable.
+        if let Err(e) = self.expr(n)
+            && e.kind == RefusalKind::IllFormedModule
+        {
+            return Err(e);
+        }
+        // An integer input or kernel input is a Stan data integer, declared
+        // before the statements that read it.
+        if self.shape(n).is_some_and(|s| s.rank == 0 && s.int)
+            && let Some(x) = self.opaque(n)
+        {
+            return Ok(x);
+        }
+        let name = match self.m.node(n) {
+            Node::Ref(r) => match r.ns {
+                RefNs::Module(alias) => format!(" `{}.{}`", self.name(alias), self.name(r.name)),
+                _ => format!(" `{}`", self.name(r.name)),
+            },
+            _ => String::new(),
+        };
+        Err(Refusal::not_yet(
+            Some(n),
+            format!("{what}{name} that the Stan program cannot read as an integer"),
+        ))
     }
 
     /// Axis `axis` of an elementwise result: its full-rank operands share it.
@@ -979,7 +1466,7 @@ impl<'m> Emitter<'m> {
                         .find(|(k, _)| self.name(**k) == f)
                         .map(|(_, v)| v.clone())?
                 } else {
-                    ctx.records.get(&rf.name)?.get(&f)?.clone()
+                    ctx.records.get(&rf.name)?.get(&f)?.at(super::P_ATOM)
                 };
                 return self.ext_lin.get(&name)?.get(axis).cloned();
             }

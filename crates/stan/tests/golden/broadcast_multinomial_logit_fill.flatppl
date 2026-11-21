@@ -1,0 +1,6 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+q = elementof(cartpow(reals, 3))
+lp = logdensityof(broadcast(Multinomial, [10, 4], softmax.(fill(q, 2))), [[2, 3, 5], [1, 1, 2]])
+inputs = (q)
+outputs = (lp)

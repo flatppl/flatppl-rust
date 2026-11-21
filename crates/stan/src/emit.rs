@@ -36,6 +36,9 @@ const P_ADD: u8 = 4;
 const P_MUL: u8 = 5;
 const P_UNARY: u8 = 6;
 const P_POW: u8 = 7;
+/// A postfix transpose `x'`: an operand of every operator, but Stan parses
+/// no index after it (`(x')[i]`).
+const P_POSTFIX: u8 = 8;
 const P_ATOM: u8 = 9;
 
 #[derive(Clone, Debug)]
@@ -58,11 +61,23 @@ impl Ex {
             format!("({})", self.s)
         }
     }
+    /// The expression as a stored operand that a reader puts in any context:
+    /// an atom or a postfix transpose keeps its precedence, so a product reads
+    /// `x'` and an index `(x')[i]`; anything looser is parenthesized.
+    pub(crate) fn operand(&self) -> Ex {
+        if self.prec >= P_POSTFIX {
+            self.clone()
+        } else {
+            Ex::atom(self.at(P_ATOM))
+        }
+    }
     /// The transpose: an atom `x'` or a literal `[a, b]'` gives back `x` or
     /// `[a, b]`, not `x''`.
     fn transposed(&self) -> String {
         match self.s.strip_suffix('\'') {
-            Some(x) if self.prec == P_ATOM || row_literal(x).is_some() => x.to_string(),
+            Some(x) if matches!(self.prec, P_ATOM | P_POSTFIX) || row_literal(x).is_some() => {
+                x.to_string()
+            }
             _ => format!("{}'", self.at(P_ATOM)),
         }
     }
@@ -212,6 +227,14 @@ pub(crate) struct Emitter<'m> {
     esubst_self: Vec<HashSet<Symbol>>,
     /// Unsourced data sizes, in union-find classes.
     svars: Vec<extents::SizeVar>,
+    /// Each (variate axis, size the law gives) pair that can differ for some
+    /// data: [`Self::resolve_sizes`] decides and prints its check.
+    size_checks: Vec<extents::SizeCheck>,
+    /// Observed values whose `Multinomial` count is their own sum: their
+    /// support guard always holds.
+    own_sum: HashSet<String>,
+    /// The value an observation statement is being written for.
+    observing: Option<NodeId>,
     /// Node types of a user function's body being sized.
     sized_scope: Vec<HashMap<NodeId, Type>>,
     /// Set while declaring a `data` value: an extent with no source becomes
@@ -357,6 +380,9 @@ impl<'m> Emitter<'m> {
             esubst_self: vec![],
             sized_scope: vec![],
             svars: vec![],
+            size_checks: vec![],
+            own_sum: HashSet::new(),
+            observing: None,
             data_sizes: false,
             leaves: HashMap::new(),
             in_progress: HashSet::new(),
@@ -1407,6 +1433,9 @@ impl<'m> Emitter<'m> {
                 })
             }
             ("broadcast", [f, rest @ ..]) => self.broadcast(id, *f, rest),
+            ("get", [s, i]) if let Some(entry) = self.outer_size_entry(*s, *i) => {
+                self.outer_size_at(*i, entry)
+            }
             ("get", [x, sel @ ..]) => self.get(id, *x, sel),
             ("vector", elems) => self.vector(id, elems),
             ("ones" | "zeros", [n])
@@ -1422,7 +1451,19 @@ impl<'m> Emitter<'m> {
             ("ones", [n]) => self.filled(id, "1", *n),
             ("zeros", [n]) => self.filled(id, "0", *n),
             ("fill", [x, n]) => {
+                if matches!(self.ty(*x), Some(Type::TVector { .. })) {
+                    return Err(Refusal::not_yet(Some(id), "a `fill` of a row vector"));
+                }
                 let v = self.expr(*x)?;
+                // `fill(x, k)` of a real vector is k copies of x (§07), typed
+                // as an array of vectors: `rep_matrix(x, k)` would give k
+                // columns of x.
+                if self.shape(*x).is_some_and(|s| s.rank == 1 && !s.int)
+                    && self.shape(*n).is_some_and(|s| s.rank == 0)
+                {
+                    let k = self.expr(*n)?;
+                    return Ok(Ex::atom(format!("rep_array({}, {})", v.s, k.s)));
+                }
                 self.filled(id, &v.at(P_ATOM), *n)
             }
             ("array", [v, size, order]) => self.rank3_array(id, *v, *size, *order),
@@ -1471,13 +1512,37 @@ impl<'m> Emitter<'m> {
                 self.log_density(id, m, x)
             }
             ("indicesof", [_]) if let Some(r) = self.range(id) => Ok(Ex::atom(r.array())),
+            ("sizeof", [x]) if let Some(form) = self.sizeof_form(*x) => {
+                let v = self.expr(*x)?;
+                let (k, from) = form;
+                Ok(Ex::atom(format!(
+                    "dims({})[{}:{}]",
+                    v.s,
+                    from + 1,
+                    from + k
+                )))
+            }
+            ("lengthof" | "indicesof" | "indicesof0", [x])
+                if self.outer_axes(*x).is_some() || head == "lengthof" && self.is_matrix(*x) =>
+            {
+                self.outer_size(id, head, *x)
+            }
             ("transpose" | "adjoint", [a]) => {
                 let e = self.real(*a)?;
                 let transposed = e.transposed();
                 if head == "adjoint" && self.ty(*a).as_ref().is_some_and(is_complex) {
                     return Ok(Ex::atom(format!("conj({transposed})")));
                 }
-                Ok(Ex::atom(transposed))
+                // An index onto `x'` needs `(x')[i]`.
+                let prec = if transposed.ends_with('\'') {
+                    P_POSTFIX
+                } else {
+                    P_ATOM
+                };
+                Ok(Ex {
+                    s: transposed,
+                    prec,
+                })
             }
             // `cat(x)` is x; of one scalar, a vector of length 1 (spec §07).
             ("cat", [x]) if self.shape(*x).is_some_and(|s| s.rank == 0) => self.vector(id, &[*x]),
@@ -1862,6 +1927,147 @@ impl<'m> Emitter<'m> {
         })
     }
 
+    /// The number of outer axes of an array whose elements are arrays (a
+    /// vector of vectors), `None` for any other value.
+    fn outer_axes(&self, x: NodeId) -> Option<usize> {
+        match self.ty(x)? {
+            Type::Array { shape, elem }
+                if matches!(*elem, Type::Array { .. } | Type::TVector { .. }) =>
+            {
+                Some(shape.len())
+            }
+            _ => None,
+        }
+    }
+
+    /// A rank-2 array of scalars.
+    fn is_matrix(&self, x: NodeId) -> bool {
+        matches!(self.ty(x), Some(Type::Array { ref shape, ref elem })
+            if shape.len() == 2 && matches!(**elem, Type::Scalar(_)))
+    }
+
+    /// Where Stan's `dims(x)` is not §07's `sizeof(x)`: the number of
+    /// entries and the first `dims` entry (0-based) they start at. A vector of
+    /// vectors, which §03 does not read as a matrix, has its outer extents
+    /// (`dims` counts through the elements); a `vector[n]` has {n} (`dims`
+    /// gives {n, 1}); a `row_vector[n]` has {n} (`dims` gives {1, n}). An
+    /// integer array, a matrix and a real array keep `dims`.
+    fn sizeof_form(&self, x: NodeId) -> Option<(usize, usize)> {
+        if let Some(k) = self.outer_axes(x) {
+            return Some((k, 0));
+        }
+        match self.ty(x)? {
+            Type::Array { shape, elem }
+                if shape.len() == 1
+                    && matches!(*elem, Type::Scalar(ScalarType::Real | ScalarType::Complex)) =>
+            {
+                Some((1, 0))
+            }
+            Type::TVector { .. } => Some((1, 1)),
+            _ => None,
+        }
+    }
+
+    /// The number of entries of `sizeof(x)` where the type fixes it: one per
+    /// axis of an array of scalars, or of a [`Self::sizeof_form`] value.
+    fn sizeof_rank(&self, x: NodeId) -> Option<usize> {
+        if let Some((k, _)) = self.sizeof_form(x) {
+            return Some(k);
+        }
+        match self.ty(x)? {
+            Type::Array { shape, elem } if matches!(*elem, Type::Scalar(_)) => Some(shape.len()),
+            _ => None,
+        }
+    }
+
+    /// `lengthof`, `indicesof` and `indicesof0` of a vector of vectors, which
+    /// §03 does not read as a matrix: they count its elements, where Stan's
+    /// `num_elements` counts through them. §07 defines `lengthof` for
+    /// vectors and tables only, so a matrix refuses.
+    fn outer_size(&mut self, id: NodeId, head: &str, x: NodeId) -> Result<Ex> {
+        let Some(k) = self.outer_axes(x) else {
+            return Err(Refusal::new(
+                RefusalKind::IllFormedModule,
+                Some(id),
+                "`lengthof` of a matrix".to_string(),
+                "§07 defines `lengthof` for vectors and tables, not for a matrix; \
+                 `sizeof` gives a matrix's dimensions"
+                    .to_string(),
+            ));
+        };
+        let v = self.expr(x)?;
+        let n = format!("size({})", v.s);
+        Ok(Ex::atom(match (head, k) {
+            ("lengthof", 1) => n,
+            ("indicesof", 1) => format!("linspaced_int_array({n}, 1, {n})"),
+            ("indicesof0", 1) => format!("linspaced_int_array({n}, 0, {n} - 1)"),
+            _ => {
+                return Err(Refusal::not_yet(
+                    Some(id),
+                    format!("`{head}` of an array of arrays with more than one outer axis"),
+                ));
+            }
+        }))
+    }
+
+    /// `sizeof(x)[n]` with a literal n, where the type fixes the entries of
+    /// `sizeof(x)`: x, n, their number and the first `dims` entry (see
+    /// [`Self::sizeof_form`]; 0 where `dims` is already `sizeof`). `None` for
+    /// any other `get`.
+    fn outer_size_entry(&self, s: NodeId, i: NodeId) -> Option<(NodeId, i64, (usize, usize))> {
+        let r = self.resolve(s);
+        if self.head(r) != Some("sizeof") {
+            return None;
+        }
+        let &[x] = &self.call(r)?.args[..] else {
+            return None;
+        };
+        let form = self
+            .sizeof_form(x)
+            .or_else(|| self.sizeof_rank(x).map(|k| (k, 0)))?;
+        let Node::Lit(Scalar::Int(n)) = *self.m.node(self.resolve(i)) else {
+            return None;
+        };
+        Some((x, n, form))
+    }
+
+    /// Entry n of `sizeof(x)`, `dims(x)[from + n]`. An n past its entries is
+    /// out of range, which the program can see.
+    fn outer_size_at(
+        &mut self,
+        i: NodeId,
+        (x, n, (k, from)): (NodeId, i64, (usize, usize)),
+    ) -> Result<Ex> {
+        if n < 1 || n > k as i64 {
+            let entries = if k == 1 { "entry" } else { "entries" };
+            let reason = if self.outer_axes(x).is_some() {
+                format!(
+                    "index {n} into `sizeof` of a vector of vectors, which has {k} {entries}: \
+                     §03 does not read a vector of vectors as a matrix, so its `sizeof` gives \
+                     its outer extents only"
+                )
+            } else {
+                let what = if k == 1 {
+                    "a vector".to_string()
+                } else {
+                    format!("a rank-{k} array")
+                };
+                format!(
+                    "index {n} into `sizeof` of {what}, which has {k} {entries}: §07 \
+                     `sizeof` gives one entry per axis"
+                )
+            };
+            return Err(Refusal::new(
+                RefusalKind::IllFormedModule,
+                Some(i),
+                "`sizeof` index".to_string(),
+                reason,
+            ));
+        }
+        let v = self.expr(x)?;
+        Ok(Ex::atom(format!("dims({})[{}]", v.s, from as i64 + n)))
+    }
+
     /// `ones`, `zeros` and `fill`, by the result's rank and element type.
     fn filled(&mut self, id: NodeId, value: &str, n: NodeId) -> Result<Ex> {
         let sh = self
@@ -2011,7 +2217,7 @@ impl<'m> Emitter<'m> {
             {
                 return m
                     .get(&**f)
-                    .map(|s| Ex::atom(s.clone()))
+                    .cloned()
                     .ok_or_else(|| Refusal::not_yet(Some(id), format!("the field access `.{f}`")));
             }
             // A column of the table a record scan returns.
@@ -2083,7 +2289,10 @@ impl<'m> Emitter<'m> {
             && self.shape(sel[0]).is_some_and(|s| s.rank == 0)
             && self.shape(id).is_some_and(|s| s.rank == 1);
         if matrix && row {
-            return Ok(Ex::atom(format!("{s}'")));
+            return Ok(Ex {
+                s: format!("{s}'"),
+                prec: P_POSTFIX,
+            });
         }
         Ok(Ex::atom(s))
     }
@@ -2105,6 +2314,8 @@ impl<'m> Emitter<'m> {
         let int = self.shape(x).is_some_and(|sh| sh.int);
         let matrices = !int;
         let n = kept.iter().filter(|&&k| k).count();
+        // `x[i, j, :]` of an array of matrices is a row transposed.
+        let transposed = matches!(kept.as_slice(), [false, false, true]);
         let text = if n == 0 || n == 3 || !matrices {
             // An integer slice is an integer array, as FlatPPL integer arrays print.
             Some(s)
@@ -2117,7 +2328,12 @@ impl<'m> Emitter<'m> {
                 "`x[:, :, k]` of a rank-3 array of matrices",
             ));
         };
-        Ok(Ex::atom(text))
+        let prec = if transposed && matrices && n == 1 {
+            P_POSTFIX
+        } else {
+            P_ATOM
+        };
+        Ok(Ex { s: text, prec })
     }
 
     /// `f.(args…)` as one Stan expression over the whole arrays, per the
@@ -2661,7 +2877,7 @@ pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgr
     e.emit_target(target)?;
     e.query_inputs(target);
     e.abi_parameters()?;
-    e.resolve_sizes();
+    e.resolve_sizes()?;
     let mut model = e.locals.clone();
     if !model.is_empty() && !(e.prior.is_empty() && e.lik.is_empty()) {
         model.push(String::new());
@@ -2686,4 +2902,45 @@ pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgr
             parameters: e.manifest,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transposed() -> Ex {
+        Ex {
+            s: "x'".into(),
+            prec: P_POSTFIX,
+        }
+    }
+
+    /// Stan 2.39 parses `x'` as an operand of every operator and of a second
+    /// transpose; only an index after it needs `(x')`.
+    #[test]
+    fn a_postfix_transpose_is_parenthesized_only_under_an_index() {
+        let t = transposed();
+        assert_eq!(format!("{} * y", t.at(P_MUL)), "x' * y");
+        assert_eq!(format!("{} ^ 2", t.at(P_POW + 1)), "x' ^ 2");
+        assert_eq!(format!("{} .^ 2", t.at(P_POW + 1)), "x' .^ 2");
+        assert_eq!(format!("-{}", t.at(P_UNARY)), "-x'");
+        assert_eq!(t.transposed(), "x");
+        assert_eq!(format!("{}[i]", t.at(P_ATOM)), "(x')[i]");
+    }
+
+    /// A stored local keeps a postfix transpose, so each reader asks its own
+    /// level; a looser expression is stored parenthesized, as before.
+    #[test]
+    fn a_stored_operand_keeps_a_postfix_transpose() {
+        let t = transposed().operand();
+        assert_eq!(t.at(P_MUL), "x'");
+        assert_eq!(t.at(P_ATOM), "(x')");
+        let sum = Ex {
+            s: "a + b".into(),
+            prec: P_ADD,
+        }
+        .operand();
+        assert_eq!(sum.at(P_MUL), "(a + b)");
+        assert_eq!(sum.at(P_ATOM), "(a + b)");
+    }
 }

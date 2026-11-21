@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+p ~ Dirichlet([1.0, 2.0, 3.0])
+c ~ iid(Multinomial(10, p), 2)
+prior = lawof(record(p = p))
+K = kernelof(record(c = c), p = p)
+post = bayesupdate(likelihoodof(K, record(c = [[2, 3, 5], [1, 4, 5]])), prior)

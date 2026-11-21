@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+p ~ Dirichlet([1.0, 1.0, 1.0])
+n ~ normalize(superpose(weighted(0.4, Multinomial(10, p)), weighted(0.6, Multinomial(10, [0.2, 0.3, 0.5]))))
+prior = lawof(record(p = p))
+K = kernelof(record(n = n), p = p)
+post = bayesupdate(likelihoodof(K, record(n = [2, 3, 5])), prior)

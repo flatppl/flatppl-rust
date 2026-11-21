@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+X = rowstack([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+a ~ Normal(0, 1)
+b ~ iid(Normal(a + sum(X), 1.0), sizeof(transpose(X)))
+prior = lawof(record(a = a))
+K = kernelof(record(b = b), a = a)
+post = bayesupdate(likelihoodof(K, record(b = rowstack([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]))), prior)

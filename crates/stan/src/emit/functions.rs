@@ -22,8 +22,9 @@ pub(crate) struct FnCtx {
     pub plan_arrays: Option<Vec<(NodeId, Ex)>>,
     /// Statements before the `return`.
     pub lines: Vec<String>,
-    /// Input placeholder → its Stan expression.
-    pub locals: HashMap<Symbol, String>,
+    /// Input placeholder → its Stan expression, with its precedence (see
+    /// [`Ex::operand`]).
+    pub locals: HashMap<Symbol, Ex>,
     /// Node types of this instantiation.
     pub scoped: HashMap<NodeId, Type>,
     /// Names declared inside the body (never captured).
@@ -45,7 +46,7 @@ pub(crate) struct FnCtx {
     /// field `f`.
     pub record_local: Option<Symbol>,
     /// Record parameters bound field by field: `get(r, "f")` is the name.
-    pub records: HashMap<Symbol, HashMap<String, String>>,
+    pub records: HashMap<Symbol, HashMap<String, Ex>>,
     /// Scans emitted in this body, by node.
     pub scans: HashMap<NodeId, super::scan::ScanOut>,
     /// Boundary inputs that name module bindings (`functionof(e, a = a0)`):
@@ -338,7 +339,7 @@ impl<'m> Emitter<'m> {
         };
         if ctx.self_inputs.contains(&name) {
             return match ctx.locals.get(&name) {
-                Some(s) => Ok(Some(Ex::atom(s.clone()))),
+                Some(e) => Ok(Some(e.clone())),
                 None => Err(Refusal::not_yet(
                     Some(id),
                     "a record boundary input used whole",
@@ -424,7 +425,7 @@ impl<'m> Emitter<'m> {
             params.push(format!("{} {p}", arg_type(&t)));
             self.record_decl(&p, t);
             let ctx = self.fctx.as_mut().unwrap();
-            ctx.locals.insert(r.name, p.clone());
+            ctx.locals.insert(r.name, Ex::atom(p.clone()));
             ctx.declared.insert(p.clone());
             names.push(p);
         }
@@ -1077,7 +1078,7 @@ impl<'m> Emitter<'m> {
                     shape: vec![shape[1]].into(),
                     elem,
                 });
-                locals.insert(r.name, format!("{}[{index}]", e.at(P_ATOM)));
+                locals.insert(r.name, Ex::atom(format!("{}[{index}]", e.at(P_ATOM))));
                 continue;
             }
             let t = self
@@ -1095,7 +1096,7 @@ impl<'m> Emitter<'m> {
                         let base = self.name(*pname).to_string();
                         super::Ex::atom(self.place(&base, a, Ok(e))?)
                     };
-                    (*elem, format!("{}[{index}]", e.at(P_ATOM)))
+                    (*elem, Ex::atom(format!("{}[{index}]", e.at(P_ATOM))))
                 }
                 Type::Array { .. } => {
                     return Err(Refusal::not_yet(
@@ -1103,7 +1104,9 @@ impl<'m> Emitter<'m> {
                         "a user law broadcast over a matrix",
                     ));
                 }
-                t => (t, e.s),
+                // A shared argument (`mu - nu`) keeps its precedence: each
+                // reader parenthesizes it at its own level.
+                t => (t, e),
             };
             elem_tys.push(et);
             locals.insert(r.name, s);
@@ -1207,7 +1210,7 @@ impl<'m> Emitter<'m> {
         elem_tys: &[Type],
         leaves: HashMap<Symbol, (Symbol, super::aggregate::Lifted)>,
         arg_nodes: HashMap<Symbol, NodeId>,
-        records: HashMap<Symbol, HashMap<String, String>>,
+        records: HashMap<Symbol, HashMap<String, Ex>>,
     ) -> Result<Option<(NodeId, FnCtx)>> {
         let refs: Vec<Ref> = entries.iter().map(|(_, r)| *r).collect();
         let body_r = self.resolve(body);
@@ -1241,7 +1244,7 @@ impl<'m> Emitter<'m> {
         let held = leaves
             .iter()
             .filter(|(_, (_, l))| !l.full)
-            .map(|(k, (_, l))| (*k, l.ex.at(super::P_ATOM)))
+            .map(|(k, (_, l))| (*k, l.ex.operand()))
             .collect();
         let outer_ctx = self.fctx.replace(FnCtx {
             self_inputs: marks.self_inputs,
@@ -1406,7 +1409,7 @@ impl<'m> Emitter<'m> {
     /// The local or bound Stan expression of a `%local` reference.
     pub(super) fn local_ref(&self, id: NodeId, name: Symbol) -> Result<Ex> {
         match self.fctx.as_ref().and_then(|c| c.locals.get(&name)) {
-            Some(s) => Ok(Ex::atom(s.clone())),
+            Some(e) => Ok(e.clone()),
             None => Err(Refusal::not_yet(Some(id), "a function body")),
         }
     }

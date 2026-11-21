@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+yd = [0.9, -1.0, 1.1]
+yo = filter(fn(_ > 0.0), yd)
+a ~ Normal(0, 1)
+b ~ iid(Normal(a, 1), 2)
+prior = lawof(record(a = a))
+K = kernelof(record(b = b), a = a)
+post = bayesupdate(likelihoodof(K, record(b = yo)), prior)

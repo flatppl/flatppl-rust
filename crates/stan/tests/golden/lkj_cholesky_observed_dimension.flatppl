@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+dim = 3
+eta ~ Exponential(1)
+L ~ LKJCholesky(dim, eta)
+prior = lawof(record(eta = eta))
+K = kernelof(record(L = L), eta = eta)
+post = bayesupdate(likelihoodof(K, record(L = rowstack([[1.0, 0.0, 0.0], [0.6, 0.8, 0.0], [0.0, 0.6, 0.8]]))), prior)

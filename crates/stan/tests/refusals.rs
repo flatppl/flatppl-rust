@@ -14,8 +14,36 @@ fn refuse_with(source: &str, target: Option<&str>) -> Refusal {
 /// The refusal and the binding it is located in. A name the parser made up
 /// (`__0x1` for `K, prior = …`) means nothing to the user.
 fn refuse_located(source: &str, target: Option<&str>) -> (Refusal, Option<String>) {
+    refuse_in(source, &flatppl_infer::ModuleBundle::new(), target)
+}
+
+/// [`refuse_located`] for a model that loads `mod.flatppl`, whose source is
+/// `dependency`: inference resolves the module as the CLI does.
+fn refuse_with_module(
+    source: &str,
+    dependency: &str,
+    target: Option<&str>,
+) -> (Refusal, Option<String>) {
+    refuse_in(source, &module_bundle(dependency), target)
+}
+
+/// A bundle holding `dependency` as `mod.flatppl`.
+fn module_bundle(dependency: &str) -> flatppl_infer::ModuleBundle {
+    let mut bundle = flatppl_infer::ModuleBundle::new();
+    bundle.insert(
+        "mod.flatppl",
+        std::sync::Arc::new(flatppl_syntax::parse(dependency).expect("parse dependency")),
+    );
+    bundle
+}
+
+fn refuse_in(
+    source: &str,
+    bundle: &flatppl_infer::ModuleBundle,
+    target: Option<&str>,
+) -> (Refusal, Option<String>) {
     let mut module = flatppl_syntax::parse(source).expect("parse");
-    let diagnostics = flatppl_infer::infer(&mut module);
+    let diagnostics = flatppl_infer::infer_module(&mut module, bundle, flatppl_infer::Level::Shape);
     assert!(
         diagnostics
             .iter()
@@ -2240,4 +2268,356 @@ fn a_restrict_point_field_that_is_a_table_is_not_yet() {
             .contains("a `restrict` point field `t` that is a table"),
         "{r}"
     );
+}
+
+/// The explicit, `disintegrate` and `restrict` forms of one observation of `b`
+/// with data `obs`, after the lines in `head`.
+fn observation_forms(head: &str, obs: &str) -> [String; 3] {
+    [
+        format!(
+            "{head}prior = lawof(record(a = a))\nK = kernelof(record(b = b), a = a)\n\
+             post = bayesupdate(likelihoodof(K, record(b = {obs})), prior)\n"
+        ),
+        format!(
+            "{head}J = lawof(record(a = a, b = b))\nK, prior = disintegrate([\"b\"], J)\n\
+             post = bayesupdate(likelihoodof(K, record(b = {obs})), prior)\n"
+        ),
+        format!("{head}J = lawof(record(a = a, b = b))\npost = restrict(J, record(b = {obs}))\n"),
+    ]
+}
+
+/// The module the module-member tests load as `mod.flatppl`.
+const MODULE_LEN: &str = "flatppl_compat = \"0.1\"\nlen = 3\n";
+
+#[test]
+fn an_iid_count_from_a_module_member_is_not_yet() {
+    // The count's value is not in the module the emitter receives, so data of
+    // another length would score silently. Matching data refuses too.
+    for obs in ["[0.9, 1.1]", "[0.9, 1.1, 0.3]"] {
+        let head =
+            "m = load_module(\"mod.flatppl\")\na ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), m.len)\n";
+        for form in observation_forms(head, obs) {
+            let (r, located) = refuse_with_module(&form, MODULE_LEN, Some("post"));
+            assert_eq!(r.kind, RefusalKind::NotYetSupported, "{form}: {r}");
+            assert!(
+                r.reason.contains(
+                    "an `iid` count `m.len` that the Stan program cannot read as an integer"
+                ),
+                "{form}: {r}"
+            );
+            assert_eq!(located.as_deref(), Some("b"), "{form}: {r}");
+        }
+    }
+}
+
+#[test]
+fn an_iid_count_that_is_the_length_of_a_module_member_emits() {
+    // `lengthof(m.v)` has the static extent inference gives the member: the
+    // data length is declared from it.
+    let bundle = module_bundle("flatppl_compat = \"0.1\"\nv = [1.0, 2.0, 3.0]\n");
+    let mut module = flatppl_syntax::parse(
+        "flatppl_compat = \"0.1\"\nm = load_module(\"mod.flatppl\")\na ~ Normal(0, 1)\n\
+         b ~ iid(Normal(a, 1), lengthof(m.v))\nprior = lawof(record(a = a))\n\
+         K = kernelof(record(b = b), a = a)\n\
+         post = bayesupdate(likelihoodof(K, record(b = [0.9, 1.1, 0.3])), prior)\n",
+    )
+    .expect("parse");
+    let diagnostics =
+        flatppl_infer::infer_module(&mut module, &bundle, flatppl_infer::Level::Shape);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| d.severity != flatppl_infer::Severity::Error),
+        "{diagnostics:?}"
+    );
+    let opts = EmitOptions {
+        target: Some("post".to_string()),
+        ..Default::default()
+    };
+    let program = flatppl_stan::emit(&module, &opts).expect("emits");
+    assert!(
+        program.code.contains("data {\n  vector[3] b;\n}"),
+        "{}",
+        program.code
+    );
+    assert!(!program.code.contains("reject"), "{}", program.code);
+}
+
+#[test]
+fn lengthof_a_matrix_is_ill_formed() {
+    // §07 defines `lengthof` for vectors and tables: a matrix's size is
+    // `sizeof`, as a value and as an `iid` count.
+    for (body, target) in [
+        (
+            "mu = elementof(reals)\nlp = logdensityof(Normal(lengthof(M) + mu, 1.0), 0.4)\n\
+             inputs = (mu)\noutputs = (lp)\n",
+            "lp",
+        ),
+        (
+            "a ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), lengthof(M))\nprior = lawof(record(a = a))\n\
+             post = bayesupdate(likelihoodof(kernelof(record(b = b), a = a), record(b = [0.9, 1.1])), prior)\n",
+            "post",
+        ),
+    ] {
+        let source = format!("M = rowstack([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])\n{body}");
+        let r = refuse_with(&source, Some(target));
+        assert_eq!(r.kind, RefusalKind::IllFormedModule, "{source}: {r}");
+        assert!(
+            r.reason
+                .contains("§07 defines `lengthof` for vectors and tables, not for a matrix"),
+            "{source}: {r}"
+        );
+    }
+}
+
+#[test]
+fn an_index_past_sizeof_of_a_vector_of_vectors_is_ill_formed() {
+    // §03: a vector of vectors is not a matrix, so its `sizeof` has one
+    // entry per outer axis; a literal index past them is known here.
+    for (source, target) in [
+        (
+            "q = [0.1, 0.5, 0.9]\nmu = elementof(reals)\n\
+             lp = logdensityof(Normal(sizeof(fill(q, 2))[2] + mu, 1.0), 0.4)\n\
+             inputs = (mu)\noutputs = (lp)\n",
+            "lp",
+        ),
+        (
+            "eta ~ Exponential(1)\n\
+             Ro = [rowstack([[1.0, 0.2], [0.2, 1.0]]), rowstack([[1.0, -0.3], [-0.3, 1.0]])]\n\
+             R ~ iid(LKJ(sizeof(Ro)[2], eta), 2)\nprior = lawof(record(eta = eta))\n\
+             K = kernelof(record(R = R), eta = eta)\n\
+             post = bayesupdate(likelihoodof(K, record(R = Ro)), prior)\n",
+            "post",
+        ),
+    ] {
+        let r = refuse_with(source, Some(target));
+        assert_eq!(r.kind, RefusalKind::IllFormedModule, "{source}: {r}");
+        assert!(
+            r.reason
+                .contains("index 2 into `sizeof` of a vector of vectors, which has 1 entry"),
+            "{source}: {r}"
+        );
+    }
+}
+
+#[test]
+fn an_index_past_sizeof_of_a_vector_is_ill_formed() {
+    // §07 `sizeof` of a vector has one entry; Stan's `dims` of a `vector[n]`
+    // has two, so the index must not reach it.
+    let r = refuse_with(
+        "X = [1.0, 2.0, 3.0]\nmu = elementof(reals)\n\
+         lp = logdensityof(Normal(sizeof(X)[2] + mu, 1.0), 0.4)\ninputs = (mu)\noutputs = (lp)\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason
+            .contains("index 2 into `sizeof` of a vector, which has 1 entry"),
+        "{r}"
+    );
+}
+
+#[test]
+fn an_index_past_sizeof_of_any_array_is_ill_formed() {
+    // The rank is static for each kind, so a literal index past it refuses
+    // as for a vector, where Stan's `dims` would throw at run time.
+    for (value, index, entries) in [
+        ("[1, 2, 3]", 2, "a vector, which has 1 entry"),
+        (
+            "rowstack([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])",
+            3,
+            "a rank-2 array, which has 2 entries",
+        ),
+        (
+            "fill(0.5, [2, 3])",
+            3,
+            "a rank-2 array, which has 2 entries",
+        ),
+    ] {
+        let source = format!(
+            "X = {value}\nmu = elementof(reals)\n\
+             lp = logdensityof(Normal(sizeof(X)[{index}] + mu, 1.0), 0.4)\n\
+             inputs = (mu)\noutputs = (lp)\n"
+        );
+        let r = refuse_with(&source, Some("lp"));
+        assert_eq!(r.kind, RefusalKind::IllFormedModule, "{source}: {r}");
+        assert!(
+            r.reason
+                .contains(&format!("index {index} into `sizeof` of {entries}")),
+            "{source}: {r}"
+        );
+    }
+    // An input matrix.
+    let r = refuse_with(
+        "X = elementof(cartpow(reals, [2, 3]))\n\
+         lp = logdensityof(Normal(sizeof(X)[3] + X[1, 2], 1.0), 0.4)\n\
+         inputs = (X)\noutputs = (lp)\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason
+            .contains("index 3 into `sizeof` of a rank-2 array, which has 2 entries"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_fill_of_a_row_vector_is_not_yet() {
+    let r = refuse_with(
+        "q = transpose([0.1, 0.5, 0.9])\nF = fill(q, 2)\nmu = elementof(reals)\n\
+         lp = logdensityof(Normal(F[2][3] + mu, 1.0), 0.4)\ninputs = (mu)\noutputs = (lp)\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a `fill` of a row vector"), "{r}");
+}
+
+#[test]
+fn a_dirac_row_atom_of_vectors_is_not_yet() {
+    // `row_fill` reads the size form `[1, T]`; the row test compares each
+    // element with the atom value, so the value must be a scalar.
+    let r = refuse_with(
+        "M = 4\nT = 3\ny_obs = rowstack([[0, 1, 1], [0, 0, 0], [1, 1, 0], [0, 0, 0]])\n\
+         omega ~ Uniform(unitinterval)\nmean_p ~ iid(Uniform(unitinterval), T)\n\
+         sigma ~ Uniform(interval(0, 5))\neps_raw ~ iid(Normal(0, 1), M)\n\
+         lp = addaxes(sigma .* eps_raw, 0, 1) .+ addaxes(logit.(mean_p), 1, 0)\n\
+         capture(row, omega) = normalize(superpose(\n    weighted(omega, Bernoulli.(invlogit.(row))), \
+         weighted(1 - omega, Dirac(fill([false, false, false], [1, T])))))\n\
+         y ~ capture.(splitblocks(lp, [1, T]), omega)\n\
+         prior = lawof(record(omega = omega, mean_p = mean_p, sigma = sigma, eps_raw = eps_raw))\n\
+         L = likelihoodof(kernelof(record(y = y), omega = omega, mean_p = mean_p, sigma = sigma, \
+         eps_raw = eps_raw), record(y = splitblocks(y_obs, [1, T])))\npost = bayesupdate(L, prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a `Dirac` row atom whose value is not a scalar"),
+        "{r}"
+    );
+}
+
+#[test]
+fn an_iid_count_from_an_untyped_load_is_not_yet() {
+    let head = "n = load_data(\"n.json\", anything)\na ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), n)\n";
+    for form in observation_forms(head, "[0.9, 1.1]") {
+        let r = refuse_with(&form, Some("post"));
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{form}: {r}");
+        assert!(
+            r.reason
+                .contains("an `iid` count `n` that the Stan program cannot read as an integer"),
+            "{form}: {r}"
+        );
+    }
+}
+
+#[test]
+fn an_iid_shape_with_a_module_member_is_not_yet() {
+    let head =
+        "m = load_module(\"mod.flatppl\")\na ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), [2, m.len])\n";
+    let [explicit, ..] = observation_forms(head, "rowstack([[1.0, 2.0], [3.0, 4.0]])");
+    let (r, _) = refuse_with_module(&explicit, MODULE_LEN, Some("post"));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("an `iid` count `m.len`"), "{r}");
+}
+
+#[test]
+fn an_lkj_dimension_from_an_untyped_load_is_not_yet() {
+    for law in ["LKJ", "LKJCholesky"] {
+        let r = refuse_with(
+            &format!(
+                "dim = load_data(\"n.json\", anything)\neta ~ Exponential(1)\nR ~ {law}(dim, eta)\n\
+                 prior = lawof(record(eta = eta))\nK = kernelof(record(R = R), eta = eta)\n\
+                 post = bayesupdate(likelihoodof(K, record(R = rowstack([[1.0, 0.0], [0.0, 1.0]]))), prior)\n"
+            ),
+            Some("post"),
+        );
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{law}: {r}");
+        assert!(
+            r.reason.contains(&format!(
+                "an `{law}` dimension `dim` that the Stan program cannot read as an integer"
+            )),
+            "{law}: {r}"
+        );
+    }
+}
+
+#[test]
+fn a_multinomial_count_the_program_cannot_read_is_not_yet() {
+    // The guard `sum(y) != n` needs n: a count with no Stan form refuses by
+    // name, never drops the guard.
+    for (head, count) in [
+        ("m = load_module(\"mod.flatppl\")\n", "m.len"),
+        ("k = load_data(\"n.json\", anything)\n", "k"),
+    ] {
+        let (r, _) = refuse_with_module(
+            &format!(
+                "{head}p ~ Dirichlet([1.0, 1.0, 1.0])\nc ~ Multinomial({count}, p)\n\
+                 prior = lawof(record(p = p))\nK = kernelof(record(c = c), p = p)\n\
+                 post = bayesupdate(likelihoodof(K, record(c = [1, 0, 2])), prior)\n"
+            ),
+            MODULE_LEN,
+            Some("post"),
+        );
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{count}: {r}");
+        assert!(
+            r.reason.contains(&format!(
+                "a `Multinomial` count `{count}` that the Stan program cannot read as an integer"
+            )),
+            "{count}: {r}"
+        );
+    }
+}
+
+#[test]
+fn an_iid_count_that_is_a_draw_is_the_latent_draw() {
+    // The count `k` is a discrete draw the target integrates out; the
+    // refusal names it, not the count.
+    let (r, located) = refuse_located(
+        "k ~ Poisson(3.0)\nmu ~ Normal(0, 1)\nb ~ iid(Normal(mu, 1.0), k)\n\
+         prior = lawof(record(mu = mu))\nK = kernelof(record(b = b), mu = mu)\n\
+         post = bayesupdate(likelihoodof(K, record(b = [0.9, 1.1, 0.3])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("`k` is a discrete draw the target marginalizes"),
+        "{r}"
+    );
+    assert!(!r.reason.contains("cannot read as an integer"), "{r}");
+    assert_eq!(located.as_deref(), Some("k"), "{r}");
+}
+
+#[test]
+fn an_iid_count_that_is_the_observed_length_plus_one_is_ill_formed() {
+    // The data's length is not known to inference here, so the emitter sees
+    // the count `lengthof(yd) + 1` against yd itself: no data fits it.
+    let (r, located) = refuse_located(
+        "n = load_data(\"n.json\", posintegers)\nyd = load_data(\"y.json\", cartpow(reals, n))\n\
+         a ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), lengthof(yd) + 1)\nprior = lawof(record(a = a))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(b = b), a = a), record(b = yd)), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason
+            .contains("the law gives `yd` its own extent on axis 1 plus 1"),
+        "{r}"
+    );
+    assert_eq!(located.as_deref(), Some("b"), "{r}");
+}
+
+#[test]
+fn an_iid_of_an_iid_of_a_multinomial_is_not_yet() {
+    let r = refuse_with(
+        "p ~ Dirichlet([1.0, 2.0, 3.0])\nc ~ iid(iid(Multinomial(10, p), 2), 3)\n\
+         prior = lawof(record(p = p))\nK = kernelof(record(c = c), p = p)\n\
+         post = bayesupdate(likelihoodof(K, record(c = [[[2, 3, 5], [1, 4, 5]], [[2, 3, 5], [1, 4, 5]], \
+         [[2, 3, 5], [1, 4, 5]]])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a nested iid of this law"), "{r}");
 }

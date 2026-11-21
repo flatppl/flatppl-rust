@@ -1,0 +1,7 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+M = elementof(cartpow(reals, [2, 2]))
+step(la, t, p) = la .+ p.Mt * la .+ p.Mt[t, 1]
+lp = logdensityof(Normal(sum(scan(step, [0.1, 0.2], [1, 2], record(Mt = transpose(M)))[2]), 1.0), 0.3)
+inputs = (M)
+outputs = (lp)

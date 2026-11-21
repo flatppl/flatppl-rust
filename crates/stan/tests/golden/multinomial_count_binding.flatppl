@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+trials = 3
+p ~ Dirichlet([1.0, 1.0, 1.0])
+c ~ Multinomial(trials, p)
+prior = lawof(record(p = p))
+K = kernelof(record(c = c), p = p)
+post = bayesupdate(likelihoodof(K, record(c = [1, 0, 2])), prior)

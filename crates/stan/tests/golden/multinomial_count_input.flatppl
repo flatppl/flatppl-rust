@@ -1,0 +1,8 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+n = elementof(posintegers)
+p = elementof(stdsimplex(3))
+a = draw(Multinomial(n = n, p = p))
+lp = logdensityof(lawof(record(a = a)), record(a = [2, 3, 5]))
+inputs = (n, p)
+outputs = (lp)

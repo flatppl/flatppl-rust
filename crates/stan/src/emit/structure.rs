@@ -1832,7 +1832,10 @@ impl<'m> Emitter<'m> {
                 self.env.insert(d, lhs.clone());
             }
             let support = self.truncation_support(o.law)?;
-            let mut lines = self.tilde(&lhs, o.law)?;
+            self.observing = Some(o.value);
+            let lines = self.tilde(&lhs, o.law);
+            self.observing = None;
+            let mut lines = lines?;
             if let Some((lo, hi)) = support
                 && let Some(g) = self.guarded(&lhs, lo.as_deref(), hi.as_deref(), lines.clone())
             {
@@ -1995,7 +1998,7 @@ impl<'m> Emitter<'m> {
 
     /// Sampling statements for `lhs ~ measure`.
     fn tilde(&mut self, lhs: &str, measure: NodeId) -> Result<Vec<String>> {
-        self.constrain_variate(lhs, measure);
+        self.constrain_variate(lhs, measure)?;
         let lhs_rank = self.lhs_rank(lhs);
         let m = self.resolve(measure);
         // A mixture is `target +=` of its log density, per element of an iid
@@ -2100,14 +2103,30 @@ impl<'m> Emitter<'m> {
             let i = self.fresh_index();
             let n = self.extent_of(lhs);
             let index = per_element.then_some(i.as_str());
-            let stmt = format!(
-                "for ({i} in 1:{n}) {{\n  {}\n}}",
-                law.statement(m, &law.lhs(&format!("{lhs}[{i}]")), &law.call_text(index))?
-            );
+            let row = format!("{lhs}[{i}]");
+            let statement = law.statement(m, &law.lhs(&row), &law.call_text(index))?;
+            // A row guard of a vector law (`Multinomial`: each row sums to n)
+            // tests each row, inside the loop.
+            let per_row = law.multivariate && law.guard.is_some();
+            let stmt = if per_row {
+                let body: String = self
+                    .unchecked_guard_at(&row, false, &law, index, vec![statement])?
+                    .iter()
+                    .flat_map(|l| l.lines())
+                    .map(|l| format!("  {l}\n"))
+                    .collect();
+                format!("for ({i} in 1:{n}) {{\n{body}}}")
+            } else {
+                format!("for ({i} in 1:{n}) {{\n  {statement}\n}}")
+            };
             self.used.remove(&i);
             let mut out = vec![stmt];
             out.extend(law.extra.iter().cloned());
-            let out = self.unchecked_guard(lhs, lhs_rank > 0, &law, out)?;
+            let out = if per_row {
+                out
+            } else {
+                self.unchecked_guard(lhs, lhs_rank > 0, &law, out)?
+            };
             return Ok(self.support_guarded(lhs, &law, out));
         }
         let (target, rhs) = match (flat, &law.flat_call) {
@@ -2163,8 +2182,8 @@ impl<'m> Emitter<'m> {
 
     /// `lines` behind a test of `expr` against the law's support, for a row
     /// whose Stan function does not enforce it (`unchecked_support`: von
-    /// Mises, `lkj_corr_cholesky`): outside it the density is zero. A
-    /// variate whose declaration states the support needs no test.
+    /// Mises, `lkj_corr_cholesky`, `multinomial`): outside it the density is
+    /// zero. A variate whose declaration states the support needs no test.
     pub(super) fn unchecked_guard(
         &self,
         expr: &str,
@@ -2172,18 +2191,37 @@ impl<'m> Emitter<'m> {
         law: &Law,
         lines: Vec<String>,
     ) -> Result<Vec<String>> {
+        self.unchecked_guard_at(expr, array, law, None, lines)
+    }
+
+    /// [`Self::unchecked_guard`] for element `index` of a broadcast law.
+    fn unchecked_guard_at(
+        &self,
+        expr: &str,
+        array: bool,
+        law: &Law,
+        index: Option<&str>,
+        lines: Vec<String>,
+    ) -> Result<Vec<String>> {
         // A two-sided `T[L, U]`, its ends clamped into the support, already
         // gives -inf outside it.
         if !law.unchecked_support || matches!(law.trunc, Some((Some(_), Some(_)))) {
             return Ok(lines);
         }
-        let (lo, hi) = &law.bounds;
-        if self.decls.get(expr).is_some_and(|t| {
-            &t.bounds.lower == lo && &t.bounds.upper == hi && t.support == law.support_type
-        }) {
+        // `Multinomial(sum(y), p)` observing y: the guard always holds.
+        if law.guard.is_some() && self.own_sum.contains(expr) {
             return Ok(lines);
         }
-        let Some(test) = self.unchecked_test(expr, array, law)? else {
+        // A row guard (a support the parameters set) is never declared.
+        let (lo, hi) = &law.bounds;
+        if law.guard.is_none()
+            && self.decls.get(expr).is_some_and(|t| {
+                &t.bounds.lower == lo && &t.bounds.upper == hi && t.support == law.support_type
+            })
+        {
+            return Ok(lines);
+        }
+        let Some(test) = self.unchecked_test(expr, array, law, index)? else {
             return Ok(lines);
         };
         let body: String = lines
@@ -2199,8 +2237,15 @@ impl<'m> Emitter<'m> {
     /// The test that `y` lies outside an `unchecked_support` law's support:
     /// its `variate` bounds, or for `cholesky_factor_corr` rows that are not
     /// unit length (`lkj_corr_cholesky_lpdf` checks the triangle and the
-    /// diagonal itself, not the row norms).
-    pub(super) fn unchecked_test(&self, y: &str, array: bool, law: &Law) -> Result<Option<String>> {
+    /// diagonal itself, not the row norms). `index` is the element of a
+    /// broadcast law that `y` is.
+    pub(super) fn unchecked_test(
+        &self,
+        y: &str,
+        array: bool,
+        law: &Law,
+        index: Option<&str>,
+    ) -> Result<Option<String>> {
         if law.support_type == Some("cholesky_factor_corr") {
             // The variate is itself a matrix: an array is one of rank > 2.
             if self.decls.get(y).is_some_and(|t| t.rank() > 2) {
@@ -2212,6 +2257,15 @@ impl<'m> Emitter<'m> {
             // 1e-8 is Stan's own constraint tolerance (`CONSTRAINT_TOLERANCE`),
             // with which it checks a declared `cholesky_factor_corr`.
             return Ok(Some(format!("max(abs(rows_dot_self({y}) - 1)) > 1e-8")));
+        }
+        // A support the parameters set (`Multinomial`: the vectors summing to
+        // n), which no declaration states.
+        if let Some((whole, each)) = &law.guard {
+            let g = match index {
+                Some(i) => each.replace(LOOP, i),
+                None => whole.clone(),
+            };
+            return Ok(Some(g.replace("{y}", y)));
         }
         Ok(Self::outside_test(
             y,
@@ -3861,10 +3915,7 @@ impl<'m> Emitter<'m> {
             let mut binds = HashMap::new();
             let all_vars = pargs.iter().zip(params).all(|(p, name)| match p {
                 pattern::Pat::Var(v) => {
-                    binds.insert(
-                        v.clone(),
-                        pattern::Bound::Expr(Ex::atom(fields[name].clone())),
-                    );
+                    binds.insert(v.clone(), pattern::Bound::Expr(fields[name].clone()));
                     true
                 }
                 _ => false,
@@ -4022,7 +4073,8 @@ impl<'m> Emitter<'m> {
             vectorized: row.vectorized,
             multivariate: !scalar_variate,
             lcdf: row.lcdf,
-            discrete: row.variate.starts_with("int"),
+            // A probability mass function's variate is discrete.
+            discrete: row.suffix == "lpmf",
             support: None,
             guard,
             bounds: variate_bounds(&row.variate),

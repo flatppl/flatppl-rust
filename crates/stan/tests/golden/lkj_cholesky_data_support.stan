@@ -1,8 +1,6 @@
 data {
-  int<lower=0> N;
-  int<lower=0> N_Lobs_2;
   real m;
-  matrix[N, N_Lobs_2] Lobs;
+  matrix[3, 3] Lobs;
 }
 model {
   if (max(abs(rows_dot_self(Lobs) - 1)) > 1e-8) {

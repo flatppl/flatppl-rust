@@ -1,0 +1,6 @@
+# emit: target=L
+flatppl_compat = "0.1"
+n = elementof(posintegers)
+mu = elementof(reals)
+b = draw(iid(Normal(mu, 1.0), n))
+L = likelihoodof(kernelof(record(b = b), n = n, mu = mu), record(b = [0.9, 1.1, 0.3]))

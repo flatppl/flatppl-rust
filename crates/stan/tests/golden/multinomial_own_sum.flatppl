@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+cd = [2, 3, 5]
+p ~ Dirichlet([1.0, 2.0, 3.0])
+c ~ Multinomial(sum(cd), p)
+prior = lawof(record(p = p))
+K = kernelof(record(c = c), p = p)
+post = bayesupdate(likelihoodof(K, record(c = cd)), prior)

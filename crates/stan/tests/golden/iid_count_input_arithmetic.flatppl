@@ -1,0 +1,7 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+k = elementof(posintegers)
+mu = elementof(reals)
+lp = logdensityof(iid(Normal(mu, 1.0), k + 1), [0.9, 1.1, 0.3])
+inputs = (k, mu)
+outputs = (lp)

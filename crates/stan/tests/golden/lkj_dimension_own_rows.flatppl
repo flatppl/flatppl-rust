@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+eta ~ Exponential(1)
+prior = lawof(record(eta = eta))
+R_obs = rowstack([[1.0, 0.2, 0.0], [0.2, 1.0, 0.3], [0.0, 0.3, 1.0]])
+d = sizeof(R_obs)[1]
+R ~ LKJ(d, eta)
+K = kernelof(record(R = R), eta = eta)
+post = bayesupdate(likelihoodof(K, record(R = R_obs)), prior)

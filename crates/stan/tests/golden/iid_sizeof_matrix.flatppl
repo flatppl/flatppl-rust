@@ -1,0 +1,7 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+X = rowstack([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+mu = elementof(reals)
+lp = logdensityof(iid(Normal(mu, 1.0), sizeof(X)), rowstack([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]))
+inputs = (mu)
+outputs = (lp)

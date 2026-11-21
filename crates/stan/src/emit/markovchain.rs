@@ -10,7 +10,7 @@
 
 use super::functions::FnCtx;
 use super::mixture::{ROW, RowArg, RowLaw};
-use super::{Emitter, P_ATOM};
+use super::{Emitter, Ex};
 use crate::refuse::{Refusal, Result};
 use crate::stan_type::StanType;
 use flatppl_core::{Node, NodeId, Phase, Ref, RefNs, ScalarType, Type};
@@ -101,7 +101,7 @@ impl<'m> Emitter<'m> {
             inline_only: true,
             ..Default::default()
         };
-        ctx.locals.insert(state.name, PREV.to_string());
+        ctx.locals.insert(state.name, Ex::atom(PREV));
         if let Some(p) = p {
             let r = entries[1].1.name;
             if matches!(self.ty(p), Some(Type::Record(_))) {
@@ -109,7 +109,7 @@ impl<'m> Emitter<'m> {
                 ctx.records.insert(r, m);
             } else {
                 let e = self.expr(p)?;
-                ctx.locals.insert(r, e.at(P_ATOM));
+                ctx.locals.insert(r, e.operand());
             }
         }
         self.mark_boundary(&mut ctx, mc, body, &entries)?;
@@ -394,33 +394,26 @@ impl<'m> Emitter<'m> {
     fn chain_leaves(
         &mut self,
         ch: &Chain,
-        state: (String, bool, Type),
-        input: Option<(String, bool, Type)>,
+        state: (Ex, bool, Type),
+        input: Option<(Ex, bool, Type)>,
         full: bool,
     ) -> Result<(
         Vec<Type>,
         HashMap<flatppl_core::Symbol, (flatppl_core::Symbol, super::aggregate::Lifted)>,
         HashMap<flatppl_core::Symbol, NodeId>,
-        HashMap<flatppl_core::Symbol, HashMap<String, String>>,
+        HashMap<flatppl_core::Symbol, HashMap<String, Ex>>,
     )> {
         let mut tys = Vec::new();
         let mut leaves = HashMap::new();
         let mut nodes = HashMap::new();
         let mut records = HashMap::new();
         let mut leaf = |e: &(flatppl_core::Symbol, Ref),
-                        (text, array, ty): (String, bool, Type),
+                        (ex, array, ty): (Ex, bool, Type),
                         tys: &mut Vec<Type>| {
             tys.push(ty);
             leaves.insert(
                 e.1.name,
-                (
-                    e.0,
-                    super::aggregate::Lifted {
-                        ex: super::Ex::atom(text),
-                        full,
-                        array,
-                    },
-                ),
+                (e.0, super::aggregate::Lifted { ex, full, array }),
             );
         };
         leaf(&ch.entries[0], state, &mut tys);
@@ -479,12 +472,12 @@ impl<'m> Emitter<'m> {
         // The per-step input has the element type of `xs` (`Binomial(n, …)`
         // takes an integer `n`).
         let input = match ch.xs {
-            Some(xs) => Some((STEP_INPUT.to_string(), false, self.step_input_type(m, xs)?)),
+            Some(xs) => Some((Ex::atom(STEP_INPUT), false, self.step_input_type(m, xs)?)),
             None => None,
         };
         let state_ty = self.ty(ch.init).unwrap_or(real);
         let (tys, leaves, _, records) =
-            self.chain_leaves(&ch, (STATE.to_string(), false, state_ty), input, false)?;
+            self.chain_leaves(&ch, (Ex::atom(STATE), false, state_ty), input, false)?;
         let scoped = self.instantiate(m, ch.body, &ch.entries, &tys)?;
         let mut ctx = FnCtx {
             scoped,
@@ -493,7 +486,7 @@ impl<'m> Emitter<'m> {
             ..Default::default()
         };
         for (k, (_, l)) in &leaves {
-            ctx.locals.insert(*k, l.ex.s.clone());
+            ctx.locals.insert(*k, l.ex.clone());
         }
         self.mark_boundary(&mut ctx, m, ch.body, &ch.entries)?;
         let outer = self.fctx.replace(ctx);
@@ -615,12 +608,12 @@ impl<'m> Emitter<'m> {
             Some(xs) => {
                 let elem_x = self.step_input_type(m, xs)?;
                 let x_int = self.shape(xs).is_some_and(|s| s.int);
-                Some((self.expr(xs)?.s, x_int, elem_x))
+                Some((self.expr(xs)?, x_int, elem_x))
             }
             None => None,
         };
         let (tys, leaves, nodes, records) =
-            self.chain_leaves(&ch, (lag, false, elem), input, true)?;
+            self.chain_leaves(&ch, (Ex::atom(lag), false, elem), input, true)?;
         let Some((body, ctx)) =
             self.vectorized_law_body(m, ch.body, &ch.entries, &tys, leaves, nodes, records)?
         else {
