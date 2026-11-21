@@ -1,0 +1,8 @@
+# emit: target=post
+flatppl_compat = "0.1"
+ns = [5, 8, 10, 6]
+b ~ Normal(0.0, 1.0)
+f(prev, n, b) = Binomial(n, invlogit(0.2 * b * prev - 0.5))
+k ~ kscan(f, 1, ns, b)
+prior = lawof(record(b = b))
+post = bayesupdate(likelihoodof(kernelof(record(k = k), b = b), record(k = [2, 3, 6, 4])), prior)

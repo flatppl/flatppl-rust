@@ -30,6 +30,9 @@ pub(crate) struct FnCtx {
     pub declared: HashSet<String>,
     /// Law arguments lifted over whole arrays, printed as is.
     pub lifted: HashMap<NodeId, Ex>,
+    /// The lifted arguments that are whole arrays: their text keeps its
+    /// elementwise operators.
+    pub lifted_full: HashSet<NodeId>,
     /// Values placed in this body, by node.
     pub placed: HashMap<NodeId, String>,
     /// Non-scalar inlined calls placed in this body: callee, arguments, name.
@@ -1119,10 +1122,7 @@ impl<'m> Emitter<'m> {
 
     /// A broadcast user law as one vectorized law over whole arrays, when
     /// each law argument is a parameter itself or does not depend on one.
-    pub(super) fn vectorized_user_law(
-        &mut self,
-        m: NodeId,
-    ) -> Result<Option<(NodeId, FnCtx, usize)>> {
+    pub(super) fn vectorized_user_law(&mut self, m: NodeId) -> Result<Option<(NodeId, FnCtx)>> {
         let c = self.call(m).unwrap();
         let Some(fun) = self.user_callee(c.args[0]) else {
             return Ok(None);
@@ -1132,31 +1132,9 @@ impl<'m> Emitter<'m> {
         if entries.len() != args.len() {
             return Ok(None);
         }
-        let refs: Vec<Ref> = entries.iter().map(|(_, r)| *r).collect();
-        let body_r = self.resolve(body);
-        if self.call(body_r).is_none() {
+        if self.call(self.resolve(body)).is_none() {
             return Ok(None);
         }
-        let mut marks = FnCtx::default();
-        self.mark_boundary(&mut marks, m, body, &entries)?;
-        let through = marks.through.clone();
-        let mentions = |me: &Self, root: NodeId| {
-            let mut stack = vec![root];
-            while let Some(id) = stack.pop() {
-                match me.m.node(id) {
-                    Node::Ref(r) if refs.contains(r) => return true,
-                    Node::Ref(r) if r.ns == RefNs::SelfMod && through.contains(&r.name) => {
-                        return true;
-                    }
-                    _ => {}
-                }
-                me.m.for_each_child(id, |k| stack.push(k));
-            }
-            false
-        };
-        // The value arguments of the law the body prints, and the R1
-        // conditions that select an `ifelse` branch among them.
-        let (law_args, conds) = self.vector_law_args(body_r);
         let mut elem_tys = Vec::new();
         let mut leaves = HashMap::new();
         let mut nfull = 0;
@@ -1200,12 +1178,70 @@ impl<'m> Emitter<'m> {
                 }
             }
         }
-        let scoped = self.instantiate(m, body, &entries, &elem_tys)?;
-        // Each law argument that reads a parameter lifts over whole arrays.
         let arg_nodes = entries
             .iter()
             .zip(&args)
             .map(|((_, r), &a)| (r.name, a))
+            .collect();
+        self.vectorized_law_body(
+            m,
+            body,
+            &entries,
+            &elem_tys,
+            leaves,
+            arg_nodes,
+            HashMap::new(),
+        )
+    }
+
+    /// A user law's body as one vectorized law: each law argument that
+    /// reads an input lifts over the whole arrays `leaves` binds (a full
+    /// leaf an array, any other held). `records` binds record inputs by
+    /// field. `None` when an argument does not lift.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn vectorized_law_body(
+        &mut self,
+        at: NodeId,
+        body: NodeId,
+        entries: &[(Symbol, Ref)],
+        elem_tys: &[Type],
+        leaves: HashMap<Symbol, (Symbol, super::aggregate::Lifted)>,
+        arg_nodes: HashMap<Symbol, NodeId>,
+        records: HashMap<Symbol, HashMap<String, String>>,
+    ) -> Result<Option<(NodeId, FnCtx)>> {
+        let refs: Vec<Ref> = entries.iter().map(|(_, r)| *r).collect();
+        let body_r = self.resolve(body);
+        if self.call(body_r).is_none() {
+            return Ok(None);
+        }
+        let mut marks = FnCtx::default();
+        self.mark_boundary(&mut marks, at, body, entries)?;
+        let through = marks.through.clone();
+        let mentions = |me: &Self, root: NodeId| {
+            let mut stack = vec![root];
+            while let Some(id) = stack.pop() {
+                match me.m.node(id) {
+                    Node::Ref(r) if refs.contains(r) => return true,
+                    Node::Ref(r) if r.ns == RefNs::SelfMod && through.contains(&r.name) => {
+                        return true;
+                    }
+                    _ => {}
+                }
+                me.m.for_each_child(id, |k| stack.push(k));
+            }
+            false
+        };
+        // The value arguments of the law the body prints, and the R1
+        // conditions that select an `ifelse` branch among them.
+        let (law_args, conds) = self.vector_law_args(body_r);
+        let int_args = self.integer_law_args(body_r);
+        let scoped = self.instantiate(at, body, entries, elem_tys)?;
+        // Each law argument that reads a parameter lifts over whole arrays.
+        // A held input prints as is wherever the lift reaches it (`w[1]`).
+        let held = leaves
+            .iter()
+            .filter(|(_, (_, l))| !l.full)
+            .map(|(k, (_, l))| (*k, l.ex.at(super::P_ATOM)))
             .collect();
         let outer_ctx = self.fctx.replace(FnCtx {
             self_inputs: marks.self_inputs,
@@ -1213,6 +1249,8 @@ impl<'m> Emitter<'m> {
             scoped,
             inline_only: true,
             args: arg_nodes,
+            records,
+            locals: held,
             ..Default::default()
         });
         let outer_v = self
@@ -1220,6 +1258,7 @@ impl<'m> Emitter<'m> {
             .replace(leaves.iter().map(|(k, (_, l))| (*k, l.clone())).collect());
         let frame = vec![entries[0].0];
         let mut lifted = HashMap::new();
+        let mut full = HashSet::new();
         let mut ok = true;
         for &a in &law_args {
             if !mentions(self, a) {
@@ -1237,15 +1276,46 @@ impl<'m> Emitter<'m> {
                 _ => a,
             };
             match self.lift(target, &frame, &HashMap::new(), &HashMap::new()) {
-                Ok(l) if l.array => {
-                    lifted.insert(a, self.to_real(&l.ex, 1));
+                // An integer parameter takes an integer array as is, never a
+                // computed real vector.
+                Ok(l) if int_args.contains(&a) && l.full && !l.array => {
+                    ok = false;
+                    break;
                 }
                 Ok(l) => {
-                    lifted.insert(a, l.ex);
+                    if l.full {
+                        full.insert(a);
+                    }
+                    let keep = !l.array || int_args.contains(&a);
+                    let ex = if keep { l.ex } else { self.to_real(&l.ex, 1) };
+                    lifted.insert(a, ex);
                 }
                 Err(_) => {
                     ok = false;
                     break;
+                }
+            }
+            // A fused row binds an inner node (`Poisson(exp(eta))` binds
+            // `eta`, an input itself, an inner call or a held value): each
+            // inner node that reads an input lifts too.
+            let mut stack = Vec::new();
+            self.m.for_each_child(target, |k| stack.push(k));
+            while let Some(d) = stack.pop() {
+                self.m.for_each_child(d, |k| stack.push(k));
+                let operand = self.call(d).is_some() || matches!(self.m.node(d), Node::Ref(_));
+                if lifted.contains_key(&d) || !operand || !mentions(self, d) {
+                    continue;
+                }
+                if let Ok(l) = self.lift(d, &frame, &HashMap::new(), &HashMap::new()) {
+                    if l.full {
+                        full.insert(d);
+                    }
+                    let ex = if l.array {
+                        self.to_real(&l.ex, 1)
+                    } else {
+                        l.ex
+                    };
+                    lifted.insert(d, ex);
                 }
             }
         }
@@ -1255,7 +1325,40 @@ impl<'m> Emitter<'m> {
             return Ok(None);
         }
         ctx.lifted = lifted;
-        Ok(Some((body, ctx, nfull)))
+        ctx.lifted_full = full;
+        Ok(Some((body, ctx)))
+    }
+
+    /// The arguments of the law call `law` whose parameter takes integers
+    /// (`n` of `Binomial`): Stan wants an `int` there.
+    pub(super) fn integer_law_args(&self, law: NodeId) -> Vec<NodeId> {
+        use flatppl_infer::ParamSet;
+        let law = self.resolve(law);
+        let (Some(head), Some(c)) = (self.head(law), self.call(law)) else {
+            return vec![];
+        };
+        let names = flatppl_infer::distribution_param_names(head).unwrap_or_default();
+        let sets = flatppl_infer::distribution_param_sets(head).unwrap_or_default();
+        let int = |k: usize| {
+            matches!(
+                sets.get(k),
+                Some(ParamSet::Integers | ParamSet::PosIntegers | ParamSet::NonNegIntegers)
+            )
+        };
+        let mut out: Vec<NodeId> = (c.args.iter().enumerate())
+            .filter(|(k, _)| int(*k))
+            .map(|(_, &a)| a)
+            .collect();
+        for na in &c.named {
+            if names
+                .iter()
+                .position(|n| n.as_str() == self.name(na.name))
+                .is_some_and(int)
+            {
+                out.push(na.value);
+            }
+        }
+        out
     }
 
     /// The value arguments of the law that `body` prints: a `locscale`

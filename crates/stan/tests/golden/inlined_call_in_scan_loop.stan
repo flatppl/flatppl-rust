@@ -6,10 +6,7 @@ data {
   vector[N_vs] vs;
 }
 transformed data {
-  vector[N] means;
-  for (i in 1:N) {
-    means[i] = xs[i] * sum(vs * 2.0);
-  }
+  vector[N] means = xs * sum(vs * 2.0);
 }
 parameters {
   real mu;

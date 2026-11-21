@@ -358,6 +358,37 @@ impl<'m> Emitter<'m> {
             .collect()
     }
 
+    /// `true` when `body` reads a lift leaf: an axis, a function parameter
+    /// in `self.vlocals`, or a binding that changes with the inputs.
+    fn reads_leaf(&self, body: NodeId) -> bool {
+        let mut stack = vec![body];
+        while let Some(id) = stack.pop() {
+            match self.m.node(id) {
+                Node::Axis(_) => return true,
+                Node::Ref(r)
+                    if self
+                        .vlocals
+                        .as_ref()
+                        .is_some_and(|v| v.contains_key(&r.name)) =>
+                {
+                    return true;
+                }
+                Node::Ref(r)
+                    if r.ns == flatppl_core::RefNs::SelfMod
+                        && self
+                            .fctx
+                            .as_ref()
+                            .is_some_and(|c| c.through.contains(&r.name)) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+            self.m.for_each_child(id, |k| stack.push(k));
+        }
+        false
+    }
+
     fn indexes_axis(&self, id: NodeId) -> bool {
         matches!(self.head(id), Some("get"))
             && self.call(id).unwrap().args[1..]
@@ -433,6 +464,15 @@ impl<'m> Emitter<'m> {
         if self.indexes_axis(body) {
             return self.lift_site(body, frame, vars, ext);
         }
+        // A subexpression that reads no leaf is held: it prints as written,
+        // whatever its type (`sum(W * v)`, `W[2, 1]`).
+        if !self.reads_leaf(body) {
+            return Ok(Lifted {
+                ex: self.expr(body)?,
+                full: false,
+                array: false,
+            });
+        }
         let scalar = |ex: Ex| Lifted {
             ex,
             full: false,
@@ -465,14 +505,19 @@ impl<'m> Emitter<'m> {
                 "an array inside an aggregate body",
             ));
         };
-        // A scalar field of a record argument (`p.a`).
+        // A scalar field of a record argument (`p.a`), or any field of a
+        // held record (`q.w` of `q.w[1]`).
+        let held_record = c.args.first().is_some_and(|&a| {
+            matches!(self.m.node(a), Node::Ref(r)
+                if self.fctx.as_ref().is_some_and(|x| x.records.contains_key(&r.name)))
+        });
         if self.head(body) == Some("get")
             && c.args.len() == 2
             && matches!(
                 self.m.node(c.args[1]),
                 Node::Lit(flatppl_core::Scalar::Str(_))
             )
-            && self.shape(body).is_some_and(|s| s.rank == 0)
+            && (held_record || self.shape(body).is_some_and(|s| s.rank == 0))
         {
             return Ok(scalar(self.expr(body)?));
         }
@@ -517,6 +562,10 @@ impl<'m> Emitter<'m> {
             parts.push(self.lift(a, frame, vars, ext)?);
         }
         if parts.iter().all(|p| !p.full) {
+            // An element of a held array (`w[1]`) is one scalar.
+            if f == "get" {
+                return Ok(scalar(self.expr(body)?));
+            }
             let parts = parts.into_iter().map(|p| p.ex).collect();
             return Ok(scalar(self.apply(body, f, &args, parts)?));
         }
