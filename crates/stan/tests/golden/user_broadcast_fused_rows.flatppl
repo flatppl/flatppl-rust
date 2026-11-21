@@ -1,0 +1,13 @@
+# emit: target=post
+flatppl_compat = "0.1"
+xs = [0.2, -0.5, 1.0]
+ns = [5, 8, 10]
+b ~ Normal(0.0, 1.0)
+rate(x, b) = Poisson(exp(x))
+trials(n, b) = Binomial(n, invlogit(b))
+coin(x, b) = Bernoulli(invlogit(b))
+k ~ rate.(xs, b)
+m ~ trials.(ns, b)
+c ~ coin.(xs, b)
+prior = lawof(record(b = b))
+post = bayesupdate(likelihoodof(kernelof(record(k = k, m = m, c = c), b = b), record(k = [1, 0, 3], m = [2, 3, 6], c = [1, 0, 1])), prior)

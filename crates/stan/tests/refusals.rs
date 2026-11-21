@@ -435,15 +435,18 @@ fn markovchain_prior_is_not_yet() {
 }
 
 #[test]
-fn markovchain_one_trajectory_is_not_yet() {
-    let r = refuse(
+fn markovchain_with_a_state_free_step_is_one_statement_without_a_lag() {
+    // A step that does not read the state: the chain is the step law per
+    // element, and no lag is built.
+    let code = emit_code(
         "T = 3\np ~ Uniform(unitinterval)\nstep(previous, q) = Bernoulli(q)\n\
          y ~ markovchain(step, 0, T, p)\nprior = lawof(record(p = p))\n\
          L = likelihoodof(kernelof(record(y = y), p = p), record(y = [0, 1, 1]))\n\
          post = bayesupdate(L, prior)\n",
+        "post",
     );
-    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("one trajectory"), "{r}");
+    assert!(code.contains("y ~ bernoulli(p);"), "{code}");
+    assert!(!code.contains("_lag"), "{code}");
 }
 
 #[test]
@@ -1501,6 +1504,108 @@ fn a_negative_literal_mixture_weight_is_ill_formed() {
     );
     assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
     assert!(r.reason.contains("non-negative weight"), "{r}");
+}
+
+#[test]
+fn a_chain_step_whose_argument_does_not_lift_is_not_yet_supported() {
+    // The state inside `ifelse` has no elementwise form over the lag.
+    let r = refuse_with(
+        "x_data = [0.4, 0.9, 1.1]\nd ~ Normal(0.0, 1.0)\n\
+         step(prev, d) = Normal(ifelse(prev > 0.5, d, 0.0), 1.0)\n\
+         x ~ markovchain(step, 0.0, 3, d)\nprior = lawof(record(d = d))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(x = x), d = d), record(x = x_data)), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a chain step"), "{r}");
+}
+
+#[test]
+fn a_chain_step_whose_support_reads_the_state_is_not_yet_supported() {
+    let r = refuse_with(
+        "d ~ Normal(0.0, 1.0)\nstep(prev, d) = Uniform(interval(prev, prev + 1.0))\n\
+         x ~ markovchain(step, 0.0, 3, d)\ny ~ Normal.(x, 0.5)\n\
+         prior = lawof(record(d = d, x = x))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(y = y), d = d, x = x), record(y = [0.3, 0.9, 1.4])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a chain step whose support depends on the state"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_chain_step_whose_support_reads_the_state_refuses_on_data_too() {
+    let r = refuse_with(
+        "d ~ Normal(0.0, 1.0)\nstep(prev, d) = Uniform(interval(prev, prev + 1.0 + d * d))\n\
+         x ~ markovchain(step, 0.0, 3, d)\n\
+         prior = lawof(record(d = d))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(x = x), d = d), record(x = [0.3, 0.9, 1.4])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a chain step whose support depends on the state"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_chain_step_whose_integer_argument_reads_the_state_is_not_yet_supported() {
+    let r = refuse_with(
+        "b ~ Normal(0.0, 1.0)\nstep(prev, b) = Binomial(prev + 2, invlogit(b))\n\
+         k ~ markovchain(step, 3, 4, b)\n\
+         prior = lawof(record(b = b))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(k = k), b = b), record(k = [2, 3, 1, 2])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains(
+            "a chain step whose integer argument is computed from the state or the per-step input"
+        ),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_kscan_step_whose_integer_argument_is_computed_from_the_input_is_not_yet_supported() {
+    let r = refuse_with(
+        "ns = [5, 8, 10, 6]\nb ~ Normal(0.0, 1.0)\nf(prev, n, b) = Binomial(n + 1, invlogit(b))\n\
+         k ~ kscan(f, 1, ns, b)\n\
+         prior = lawof(record(b = b))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(k = k), b = b), record(k = [2, 3, 6, 4])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains(
+            "a chain step whose integer argument is computed from the state or the per-step input"
+        ),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_chain_step_of_a_multivariate_law_names_the_law() {
+    let r = refuse_with(
+        "d ~ Normal(0.0, 1.0)\n\
+         step(prev, d) = MvNormal([prev, d], rowstack([[1.0, 0.0], [0.0, 1.0]]))\n\
+         x ~ markovchain(step, 0.0, 4, d)\n\
+         prior = lawof(record(d = d))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(x = x), d = d), record(x = [0.4, 0.9, 1.1, 1.8])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a chain step of the multivariate law `MvNormal`"),
+        "{r}"
+    );
 }
 
 #[test]

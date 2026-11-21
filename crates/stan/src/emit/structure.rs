@@ -1791,10 +1791,17 @@ impl<'m> Emitter<'m> {
         {
             return self.markovchain_statement(lhs, inner);
         }
-        if self.head(m) == Some("markovchain") {
+        // One trajectory: the step law over the lag, one statement. The two
+        // chain rules dispatch on the shape alone.
+        if matches!(self.head(m), Some("markovchain" | "kscan")) {
+            return self.chain_statement(lhs, m);
+        }
+        if self.head(m) == Some("iid")
+            && self.head(self.resolve(self.call(m).unwrap().args[0])) == Some("kscan")
+        {
             return Err(Refusal::not_yet(
                 Some(m),
-                "a markovchain over one trajectory",
+                "an iid of a `kscan` (only an iid of a `markovchain` over data rows)",
             ));
         }
         if self.head(m) == Some("pushfwd") {
@@ -2335,7 +2342,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// The Stan law of a FlatPPL measure. `broadcast` maps a law over arrays.
-    fn law(&mut self, m: NodeId, broadcast: bool) -> Result<Law> {
+    pub(super) fn law(&mut self, m: NodeId, broadcast: bool) -> Result<Law> {
         let m = self.resolve(m);
         let head = self
             .head(m)
@@ -2461,16 +2468,13 @@ impl<'m> Emitter<'m> {
                 let Node::Const(f) = self.m.node(c.args[0]) else {
                     // A user law: one vectorized statement when it can be,
                     // else its body per element, in a loop.
-                    if let Some((body, ctx, nfull)) = self.vectorized_user_law(m)? {
+                    if let Some((body, ctx)) = self.vectorized_user_law(m)? {
                         let outer = self.fctx.replace(ctx);
                         let law = self.law(body, false);
                         self.fctx = outer;
-                        // A template operator between two whole arrays would
-                        // not be elementwise.
                         if let Ok(law) = law
                             && law.vectorized
                             && !law.multivariate
-                            && (nfull < 2 || !law.call.contains(['*', '/', '^']))
                         {
                             return Ok(law);
                         }
@@ -2696,6 +2700,8 @@ impl<'m> Emitter<'m> {
                 self.interval(s).map(Some)
             }
             Some("pushfwd") => self.pushfwd_support(m),
+            // Each trajectory element ranges over the step law's support.
+            Some("markovchain" | "kscan") => self.chain_support(m),
             Some("%call") => self.module_law_support(m),
             Some("locscale") => Ok(self.locscale_truncation(m)?.map(|(_, lo, hi)| (lo, hi))),
             // `Lebesgue(S)`: its variate ranges over S.
@@ -3734,32 +3740,42 @@ impl<'m> Emitter<'m> {
                 .replace('\u{2}', "{y}");
             Some((whole, each))
         };
+        // A template's elementwise operators become scalar ones when every
+        // operand they can see is a scalar (`1, p ./ (1 - p)` for one `p`).
+        // The rule reads each operand's rank in the printed text: a
+        // whole-array lift has an element shape but a vector text. Only the
+        // template changes: a bound operand prints its own operators
+        // (`sum(vs .* vs)` held in a loop).
+        let rank_of = |me: &Self, b: &pattern::Bound| match b {
+            pattern::Bound::Node(n)
+                if me.fctx.as_ref().is_some_and(|c| c.lifted_full.contains(n)) =>
+            {
+                1
+            }
+            pattern::Bound::Node(n) => me.shape(*n).map(|s| s.rank).unwrap_or(0),
+            _ => 0,
+        };
+        let whole_scalar = binds.values().all(|b| rank_of(self, b) == 0);
+        let each_scalar = binds
+            .iter()
+            .all(|(v, b)| rank_of(self, b) == 0 || (is_per(v) && rank_of(self, b) == 1));
+        let template = |scalar: bool| {
+            if scalar {
+                scalar_operators(&row.args)
+            } else {
+                row.args.clone()
+            }
+        };
         let flat = self.flat.take().filter(|_| scalar_variate);
         let mut flat_args = None;
         if flat.is_some() {
             self.flat = flat;
-            let filled = self.fill(&row.args, &binds, &is_per, None);
+            let filled = self.fill(&template(whole_scalar), &binds, &is_per, None);
             self.flat = None;
             flat_args = Some(filled?);
         }
-        let mut args = self.fill(&row.args, &binds, &is_per, None)?;
-        let mut indexed = self.fill(&row.args, &binds, &is_per, Some(LOOP))?;
-        // A template's elementwise operators become scalar ones when every
-        // operand they can see is a scalar (`1, p ./ (1 - p)` for one `p`).
-        let rank_of = |me: &Self, b: &pattern::Bound| match b {
-            pattern::Bound::Node(n) => me.shape(*n).map(|s| s.rank).unwrap_or(0),
-            _ => 0,
-        };
-        if binds.values().all(|b| rank_of(self, b) == 0) {
-            args = scalar_operators(&args);
-            flat_args = flat_args.map(|a| scalar_operators(&a));
-        }
-        if binds
-            .iter()
-            .all(|(v, b)| rank_of(self, b) == 0 || (is_per(v) && rank_of(self, b) == 1))
-        {
-            indexed = scalar_operators(&indexed);
-        }
+        let args = self.fill(&template(whole_scalar), &binds, &is_per, None)?;
+        let indexed = self.fill(&template(each_scalar), &binds, &is_per, Some(LOOP))?;
         let vector_per_element = per
             .iter()
             .any(|(v, &p)| p && expected.get(v).copied().unwrap_or(0) > 0);

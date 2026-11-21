@@ -1,0 +1,8 @@
+# emit: target=post
+flatppl_compat = "0.1"
+k_data = [2, 1, 3, 2, 4]
+b ~ Normal(0.0, 1.0)
+step(prev, b) = Poisson(exp(b * prev))
+k ~ markovchain(step, 1, 5, b)
+prior = lawof(record(b = b))
+post = bayesupdate(likelihoodof(kernelof(record(k = k), b = b), record(k = k_data)), prior)

@@ -1,0 +1,9 @@
+# emit: target=post
+flatppl_compat = "0.1"
+x_data = [0.4, 0.9, 1.1, 1.8, 2.3]
+drift ~ Normal(0.0, 1.0)
+s ~ normalize(truncate(Cauchy(0, 1), interval(0, inf)))
+step(prev, q) = Normal(prev + q.drift, q.s)
+x ~ markovchain(step, 0.0, 5, (drift = drift, s = s))
+prior = lawof(record(drift = drift, s = s))
+post = bayesupdate(likelihoodof(kernelof(record(x = x), drift = drift, s = s), record(x = x_data)), prior)

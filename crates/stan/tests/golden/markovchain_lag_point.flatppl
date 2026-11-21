@@ -1,0 +1,14 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+drift ~ Normal(0.0, 1.0)
+s ~ Exponential(1.0)
+step(prev, q) = Normal(prev + q.drift, q.s)
+x ~ markovchain(step, 0.0, 4, (drift = drift, s = s))
+y ~ Normal.(x, 0.5)
+prior = lawof(record(drift = drift, s = s, x = x))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), drift = drift, s = s, x = x), record(y = [0.3, 0.1, 0.8, 1.2])), prior)
+d = elementof(reals)
+sv = elementof(posreals)
+xv = elementof(cartpow(reals, 4))
+inputs = (d, sv, xv)
+outputs = logdensityof(post, record(drift = d, s = sv, x = xv))

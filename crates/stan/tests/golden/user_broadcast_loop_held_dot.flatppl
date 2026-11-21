@@ -1,0 +1,12 @@
+# emit: target=post
+flatppl_compat = "0.1"
+vs = [0.3, -0.4, 0.8]
+ns = [5, 8, 10]
+xs = [0.5, 1.5, 2.0]
+b ~ Exponential(1.0)
+trials(n, b) = Binomial(n + 1, invlogit(sum(vs .* vs) * b))
+fold(x, b) = Normal(ifelse(x > 1.0, x, -x), sum(vs .* vs) * b)
+k ~ trials.(ns, b)
+y ~ fold.(xs, b)
+prior = lawof(record(b = b))
+post = bayesupdate(likelihoodof(kernelof(record(k = k, y = y), b = b), record(k = [2, 3, 6], y = [0.1, 0.2, 0.3])), prior)
