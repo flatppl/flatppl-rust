@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+r ~ pushfwd(neg, Exponential(2))
+z ~ Normal(r, 1)
+prior = lawof(record(r = r))
+L = likelihoodof(kernelof(record(z = z), r = r), record(z = -0.6))
+post = bayesupdate(L, prior)

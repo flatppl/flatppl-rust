@@ -988,10 +988,6 @@ impl<'m> Emitter<'m> {
                 .iter()
                 .find(|(n, _)| *n == f.field)
                 .map(|(_, v)| v.clone());
-            // The bare-name refusal comes before the untyped variate's.
-            if let Some(law) = f.law {
-                self.bare_pushfwd_map(law)?;
-            }
             if ty_is_int(&ty) {
                 return Err(Refusal::new(
                     RefusalKind::DiscreteParameter,

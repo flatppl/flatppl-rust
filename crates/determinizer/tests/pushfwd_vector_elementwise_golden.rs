@@ -1,7 +1,7 @@
 //! A bare built-in map over a VECTOR variate is an elementwise map, and its
 //! Jacobian is DIAGONAL. The bare spelling used to take the SCALAR derivation and
-//! emit that op's scalar log-volume against an n-vector, so the two spellings §06
-//! declares equivalent disagreed:
+//! emit that op's scalar log-volume against an n-vector, so the two spellings,
+//! which lower to the same program, disagreed:
 //!
 //! ```text
 //! pushfwd(exp, MvNormal(…))            → sub(builtin_logdensityof(MvNormal, …, log(y)), log(y))
@@ -22,9 +22,14 @@ use flatppl_determinizer::{determinize, is_flatpdl};
 mod common;
 use common::{call_arg, pir_binding, pir_head};
 
+/// A program that lowers must also infer clean: it is what a user reaches.
 fn determinize_src(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
-    let _ = flatppl_infer::infer(&mut m);
+    let errors: Vec<_> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "inference errors in:\n{src}\n{errors:?}");
     determinize(&m).expect("must lower, not refuse")
 }
 
@@ -61,7 +66,7 @@ fn bare_and_broadcast_spellings_are_byte_identical_over_a_vector_base() {
         ));
         assert_eq!(
             bare, broadcast,
-            "`{base}`: §06 makes the bare and broadcast spellings the same map"
+            "`{base}`: the bare and broadcast spellings lower to the same program"
         );
         // And that the shared form is the DIAGONAL log-det, not a scalar Jacobian:
         // the volume term reduces the per-cell terms with `sum`.

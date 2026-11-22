@@ -28,9 +28,14 @@ fn gated_density(out: &str) -> String {
     call_arg(out, "ifelse", 1)
 }
 
+/// A program that lowers must also infer clean: it is what a user reaches.
 fn determinize_src(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
-    let _ = flatppl_infer::infer(&mut m);
+    let errors: Vec<_> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "inference errors in:\n{src}\n{errors:?}");
     determinize(&m).expect("must lower, not refuse")
 }
 
@@ -219,22 +224,30 @@ fn pushfwd_volume_preserving_map_over_discrete_base_is_unaffected() {
 }
 
 #[test]
-fn pushfwd_over_a_base_with_an_unproven_variate_refuses() {
-    // `pushfwd`'s own result type is the CODOMAIN of its forward map, which this
-    // pass does not track (`(%measure (%domain %any))`), so a pushforward OF a
-    // pushforward proves neither reference measure. Fail closed: guessing
-    // continuous here is what rescales a discrete measure's atoms (the base could
-    // be `pushfwd(neg, Poisson(3))`, whose atoms would pick up `exp`'s Jacobian).
-    let mut m = flatppl_syntax::parse(
-        "d = pushfwd(exp, pushfwd(neg, Poisson(rate = 3.0)))\nlp = logdensityof(d, 0.5)",
-    )
-    .unwrap();
-    let _ = flatppl_infer::infer(&mut m);
-    let e = determinize(&m).expect_err("an unproven reference measure must refuse");
+fn pushfwd_of_a_pushfwd_through_builtin_maps_proves_its_discrete_base() {
+    // Inference types a built-in map's codomain at its base's domain (`neg` of
+    // an integer variate is an integer), so the inner pushforward proves a
+    // counting reference and the outer one scores atoms with no volume term.
+    // Two lattice gates: the outer one takes y to an integer through `exp`,
+    // the inner one checks that integer is in `neg`'s image of the Poisson
+    // support (`<= 0`). The density at exp(-2) is log Poisson(3)(2) =
+    // -3 + log(4.5); at 0.5, which is no atom, it is -inf.
+    let discrete =
+        lp("d = pushfwd(exp, pushfwd(neg, Poisson(rate = 3.0)))\nlp = logdensityof(d, 0.5)");
     assert!(
-        e.reason.contains("reference measure"),
-        "must refuse on the reference measure, got: {}",
-        e.reason
+        discrete.contains("builtin_logdensityof Poisson"),
+        "the base pmf is still scored:\n{discrete}"
+    );
+    let inner = gated_density(&discrete);
+    assert_eq!(
+        pir_head(&inner),
+        "ifelse",
+        "the inner pushforward's support gate:\n{discrete}"
+    );
+    assert_eq!(
+        pir_head(&call_arg(&inner, "ifelse", 1)),
+        "builtin_logdensityof",
+        "atoms carry no volume term:\n{discrete}"
     );
 }
 
