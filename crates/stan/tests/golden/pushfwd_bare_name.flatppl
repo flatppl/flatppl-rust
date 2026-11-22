@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+v ~ pushfwd(log, Exponential(1.5))
+w ~ pushfwd(sqrt, InverseGamma(5, 5))
+z ~ Normal(v, w)
+prior = lawof(record(v = v, w = w))
+L = likelihoodof(kernelof(record(z = z), v = v, w = w), record(z = 0.4))
+post = bayesupdate(L, prior)

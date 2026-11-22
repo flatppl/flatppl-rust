@@ -124,18 +124,16 @@ fn an_explicit_bijection_between_kinds_still_lowers() {
 }
 
 #[test]
-fn bare_operator_at_a_record_refuses_when_the_kind_check_cannot_fire() {
-    // `pushfwd`'s own result type is its forward map's CODOMAIN, which this pass does
-    // not track, so a pushforward OF a pushforward has an unproven variate: the kind
-    // check reads `None` and passes. The bare-operator arm is what refuses here, and
-    // it must do so BEFORE the reference-measure refusal that would otherwise report
-    // this program — the inverse is applied first, so the record is what breaks first.
+fn bare_operators_at_a_record_refuse_on_the_variate_kind() {
+    // Inference types each built-in map's codomain (`neg`, then `exp`, of an
+    // integer variate: a real), so the kind check proves the record point does
+    // not match the variate and refuses on that, before any inverse is applied.
     let reason = refusal(
         "b = pushfwd(exp, pushfwd(neg, Poisson(rate = 3.0)))\n\
          lp = logdensityof(b, record(a = 1.0))",
     );
     assert!(
-        reason.contains("bare built-in") && reason.contains("whole record"),
-        "expected the bare-operator record refusal, got: {reason}"
+        reason.contains("the query point's kind does not match the pushforward base variate"),
+        "expected the variate-kind refusal, got: {reason}"
     );
 }

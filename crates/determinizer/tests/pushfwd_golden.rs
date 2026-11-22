@@ -4,7 +4,21 @@
 //! the explicit-bijection form.
 mod common;
 use common::determinize;
+/// A program the tests feed the determinizer infers clean: it is what a user
+/// reaches.
 fn parse_infer(src: &str) -> flatppl_core::Module {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let errors: Vec<_> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "inference errors in:\n{src}\n{errors:?}");
+    m
+}
+
+/// An ill-formed program, for a test that the determinizer still refuses it
+/// when inference has already reported the error.
+fn parse_infer_ill_formed(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
     m
@@ -316,7 +330,7 @@ fn pushfwd_coupled_nonlinear_multivariate_refuses() {
     // term exp(x) depends on the input, so the forward Jacobian is not the
     // constant L and logabsdet(L) would be the wrong log-volume. Refuse rather
     // than mislower (the shift `mu` must not reference the input placeholder).
-    let e = determinize(&parse_infer(
+    let e = determinize(&parse_infer_ill_formed(
         "L = rowstack([[1.0, 0.0], [0.0, 1.0]])\n\
          d = pushfwd(x -> exp(x) + L * x, iid(Normal(0.0, 1.0), 2))\n\
          lp = logdensityof(d, [0.5, 0.5])",
@@ -464,7 +478,7 @@ fn pushfwd_matrix_affine_non_square_refuses() {
     // rank-2 shape rowstack/colstack/lower_cholesky produce. linsolve/logabsdet
     // need a square matrix; the non-square guard must recognise this nested
     // form too, or a genuine non-square L silently lowers instead of refusing.
-    let e = determinize(&parse_infer(
+    let e = determinize(&parse_infer_ill_formed(
         "mu = [0.0, 0.0]\n\
          L = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\n\
          d = pushfwd(x -> mu .+ L * x, iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\

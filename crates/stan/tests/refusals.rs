@@ -741,21 +741,176 @@ fn pushfwd_of_a_support_with_a_symbolic_end_names_the_end() {
 }
 
 #[test]
-fn pushfwd_through_a_bare_name_is_not_yet() {
-    for name in ["log", "sqrt"] {
-        let r = refuse(&posterior(
-            &format!("rho ~ pushfwd({name}, Gamma(2, 1))\ny ~ Normal(rho, 1)"),
+fn pushfwd_through_a_bare_name_outside_the_registry_is_not_yet() {
+    let r = refuse(&posterior(
+        "rho ~ pushfwd(sin, Normal(0, 1))\ny ~ Normal(rho, 1)",
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("pushfwd through `sin`, which is not in the §06 bijection registry"),
+        "{r}"
+    );
+}
+
+/// The emitted program of `post` for a model with a `pushfwd` map spelled
+/// `map`, as a prior field and as an observed law.
+fn bare_and_written(map: &str, base: &str, observed_base: &str) -> [flatppl_stan::StanProgram; 2] {
+    let opts = EmitOptions {
+        target: Some("post".to_string()),
+        ..Default::default()
+    };
+    let field = posterior(
+        &format!("rho ~ pushfwd({map}, {base})\ny ~ Normal(rho, 1)"),
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    );
+    let observed = posterior(
+        &format!("mu ~ Exponential(1)\ny ~ pushfwd({map}, {observed_base})"),
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    );
+    [field, observed].map(|source| {
+        let mut module = flatppl_syntax::parse(&source).expect("parse");
+        let diagnostics = flatppl_infer::infer(&mut module);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.severity != flatppl_infer::Severity::Error),
+            "{source}: {diagnostics:?}"
+        );
+        flatppl_stan::emit(&module, &opts).unwrap_or_else(|r| panic!("{source}: {r}"))
+    })
+}
+
+#[test]
+fn a_bare_registry_name_prints_as_its_written_map() {
+    // §06 recognizes the registry maps by name: `pushfwd(log, M)` is
+    // `pushfwd(fn(log(_)), M)`, as a prior field and as an observed law.
+    let unbounded = ("Normal(0, 1)", "Normal(0, mu)");
+    let positive = ("Gamma(2, 1)", "Gamma(2, mu)");
+    let unit = ("Beta(2, 3)", "Beta(2, mu)");
+    for (name, (base, observed)) in [
+        ("exp", unbounded),
+        ("log", positive),
+        ("log10", positive),
+        ("log1p", positive),
+        ("expm1", unbounded),
+        ("logit", unit),
+        ("invlogit", unbounded),
+        ("probit", unit),
+        ("invprobit", unbounded),
+        ("atan", unbounded),
+        ("sinh", unbounded),
+        ("asinh", unbounded),
+        ("tanh", unbounded),
+        ("sqrt", positive),
+        ("neg", ("Exponential(2)", "Exponential(mu)")),
+    ] {
+        let bare = bare_and_written(name, base, observed);
+        let written = bare_and_written(&format!("fn({name}(_))"), base, observed);
+        for (b, w) in bare.iter().zip(&written) {
+            assert_eq!(b.code, w.code, "{name}");
+            assert_eq!(b.data, w.data, "{name}");
+        }
+    }
+}
+
+#[test]
+fn a_bare_name_outside_its_domain_refuses_as_its_written_map() {
+    let source = |map: &str| {
+        posterior(
+            &format!("rho ~ pushfwd({map}, Normal(0, 1))\ny ~ Normal(rho, 1)"),
             "lawof(record(rho = rho))",
             "kernelof(record(y = y), rho = rho)",
-        ));
-        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{name}: {r}");
-        assert!(
-            r.reason.contains(&format!(
-                "pushfwd through the bare name `{name}`; write `fn({name}(_))`"
-            )),
-            "{name}: {r}"
+        )
+    };
+    let (bare, written) = (refuse(&source("log")), refuse(&source("fn(log(_))")));
+    assert_eq!(
+        (&bare.kind, &bare.reason),
+        (&written.kind, &written.reason),
+        "{bare}"
+    );
+}
+
+#[test]
+fn a_bare_name_over_a_vector_law_is_not_yet_like_its_written_form() {
+    // Over an array variate the name applies per cell; its written form
+    // `fn(broadcast(exp, _))` is not written by the emitter yet either.
+    let source = |map: &str| {
+        posterior(
+            &format!(
+                "mu ~ Normal(0, 1)\nv ~ pushfwd({map}, iid(Normal(mu, 1.0), 3))\ny ~ Normal(mu, 1)"
+            ),
+            "lawof(record(mu = mu))",
+            "kernelof(record(v = v, y = y), mu = mu)",
+        )
+        .replace("record(y = 0.5)", "record(v = [1.2, 0.5, 2.0], y = 0.5)")
+    };
+    let bare = refuse(&source("exp"));
+    assert_eq!(bare.kind, RefusalKind::NotYetSupported, "{bare}");
+    assert!(
+        bare.reason
+            .contains("pushfwd through `exp` applied per cell of a law over arrays"),
+        "{bare}"
+    );
+    let written = refuse(&source("fn(broadcast(exp, _))"));
+    assert_eq!(written.kind, RefusalKind::NotYetSupported, "{written}");
+}
+
+#[test]
+fn a_bare_array_name_over_an_array_law_refuses_as_its_written_map() {
+    // `neg` takes scalars or arrays and `inv` a matrix: over an array law each
+    // bare name takes the path of `fn(name(_))`, with its refusal.
+    for (map, written, law, point) in [
+        (
+            "neg",
+            "fn(neg(_))",
+            "iid(Normal(mu, 1.0), 3)",
+            "[-1.2, -0.5, -2.0]",
+        ),
+        (
+            "inv",
+            "fn(inv(_))",
+            "Wishart(4.0, rowstack([[1.0, 0.2], [0.2, 1.0]]))",
+            "rowstack([[1.0, 0.1], [0.1, 1.0]])",
+        ),
+    ] {
+        let source = |m: &str| {
+            posterior(
+                &format!("mu ~ Normal(0, 1)\nv ~ pushfwd({m}, {law})\ny ~ Normal(mu, 1)"),
+                "lawof(record(mu = mu))",
+                "kernelof(record(v = v, y = y), mu = mu)",
+            )
+            .replace("record(y = 0.5)", &format!("record(v = {point}, y = 0.5)"))
+        };
+        let (bare, written) = (refuse(&source(map)), refuse(&source(written)));
+        assert_eq!(
+            (&bare.kind, &bare.reason),
+            (&written.kind, &written.reason),
+            "{map}: {bare}"
         );
     }
+}
+
+#[test]
+fn a_bare_name_over_a_discrete_base_refuses_as_its_written_map() {
+    let source = |exp: &str, neg: &str| {
+        posterior(
+            &format!("mu ~ Normal(0, 1)\ny ~ pushfwd({exp}, pushfwd({neg}, Poisson(3.0)))"),
+            "lawof(record(mu = mu))",
+            "kernelof(record(y = y), mu = mu)",
+        )
+    };
+    let bare = refuse(&source("exp", "neg"));
+    let written = refuse(&source("fn(exp(_))", "fn(neg(_))"));
+    assert_eq!(
+        (&bare.kind, &bare.reason),
+        (&written.kind, &written.reason),
+        "{bare}"
+    );
 }
 
 #[test]

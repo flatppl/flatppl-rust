@@ -11,7 +11,7 @@ use super::structure::Law;
 use super::{Emitter, Ex, P_ADD, P_ATOM, P_MUL, P_UNARY};
 use crate::refuse::{Refusal, RefusalKind, Result};
 use crate::stan_type::{bounds_of, number};
-use flatppl_core::{Node, NodeId, Phase, Ref, RefNs, Scalar};
+use flatppl_core::{Node, NodeId, Phase, Ref, RefNs, Scalar, Type};
 
 /// A coefficient of the map: its number when it folds, its Stan text, and
 /// whether that text is an integer in Stan. FlatPPL's `/` is real division,
@@ -643,28 +643,10 @@ impl<'m> Emitter<'m> {
 
     /// The map of `pushfwd(f, M)`, or of a derived prior field, as its
     /// body, its input and M.
-    /// A built-in name as the map (`pushfwd(log, M)`) is not supported yet:
-    /// inference leaves its variate untyped.
-    pub(super) fn bare_pushfwd_map(&self, m: NodeId) -> Result<()> {
-        let m = self.resolve(m);
-        if self.head(m) == Some("pushfwd")
-            && let Some(&f) = self.call(m).unwrap().args.first()
-            && let Node::Const(name) = self.m.node(self.resolve(f))
-        {
-            let name = self.name(*name);
-            return Err(Refusal::not_yet(
-                Some(m),
-                format!("pushfwd through the bare name `{name}`; write `fn({name}(_))`"),
-            ));
-        }
-        Ok(())
-    }
-
     fn pushfwd_parts(&mut self, m: NodeId) -> Result<(NodeId, Ref, NodeId)> {
         if let Some(&parts) = self.derived.get(&m) {
             return Ok(parts);
         }
-        self.bare_pushfwd_map(m)?;
         self.pushfwd_projection(m)?;
         let c = self.call(m).unwrap();
         if c.args.len() != 2 || !c.named.is_empty() {
@@ -683,6 +665,49 @@ impl<'m> Emitter<'m> {
 
     /// The bijection of `pushfwd(f, M)` and M.
     fn bijection(&mut self, m: NodeId) -> Result<(Bijection, NodeId)> {
+        // A built-in name as the map (`pushfwd(log, M)`, §06: engines
+        // recognize the maps by name) is the one-step chain of that map.
+        if !self.derived.contains_key(&m)
+            && let Some(c) = self.call(m)
+            && let [f, base] = c.args[..]
+            && c.named.is_empty()
+            && let Node::Const(name) = self.m.node(self.resolve(f))
+        {
+            let name = self.name(*name);
+            // Over an array variate a scalar map applies per cell, as its
+            // written form `fn(broadcast(name, _))` does, which this emitter
+            // does not write yet either. `neg` and a name outside the
+            // registry take the path of `fn(name(_))`.
+            let scalar_map = name == "sqrt" || STEPS.iter().any(|r| r.name == name);
+            if scalar_map
+                && !matches!(self.m.type_of(base), Some(Type::Measure { domain, .. })
+                    if matches!(**domain, Type::Scalar(_)))
+            {
+                return Err(Refusal::not_yet(
+                    Some(m),
+                    format!("pushfwd through `{name}` applied per cell of a law over arrays"),
+                ));
+            }
+            let step = match name {
+                "sqrt" => Step::Pow(0.5),
+                "neg" => Step::Affine(Affine {
+                    a: lit(-1.0),
+                    b: lit(0.0),
+                }),
+                _ => match STEPS.iter().find(|r| r.name == name) {
+                    Some(row) => Step::Row(row),
+                    None => {
+                        return Err(Refusal::not_yet(
+                            Some(m),
+                            format!(
+                                "pushfwd through `{name}`, which is not in the §06 bijection registry"
+                            ),
+                        ));
+                    }
+                },
+            };
+            return Ok((Bijection { steps: vec![step] }, base));
+        }
         let (body, x, base) = self.pushfwd_parts(m)?;
         let Some(steps) = self.steps(body, x, m)? else {
             return Err(Refusal::new(

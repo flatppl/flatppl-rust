@@ -832,7 +832,7 @@ fn op_rule(
         // the codomain; fall back to `f`'s un-substituted body, then to `%any`
         // (honest — never a guess). Mass is filled (mass-preserving) by `fill_mass`.
         "pushfwd" => {
-            return pushfwd_codomain(inf, args).map(inf, move |_, codomain| {
+            return pushfwd_codomain(inf, id, args, joined).map(inf, move |_, codomain| {
                 (
                     Type::Measure {
                         domain: Box::new(codomain.unwrap_or(Type::Any)),
@@ -6770,7 +6770,12 @@ fn reified_body(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<NodeId> {
 /// and `f`'s re-inferred body type is the codomain. Falls back to `f`'s
 /// un-substituted body type, then `None` (caller uses `%any`) when `f` is not a
 /// resolvable reification or its body is `%deferred`.
-fn pushfwd_codomain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<Option<Type>> {
+fn pushfwd_codomain(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    args: &[ArgInfo],
+    joined: Phase,
+) -> RuleStep<Option<Type>> {
     let Some((f_node, _, _)) = args.first() else {
         return Ready(None);
     };
@@ -6792,15 +6797,58 @@ fn pushfwd_codomain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<
         }
         _ => None,
     };
-    let sub = match seed {
-        Some(s) => substituted_result(inf, f_node, &s, &[], None, true),
-        None => Ready(None),
+    // A built-in function as the map (`pushfwd(log, M)`, §06 recognizes the
+    // maps by name) takes the ordinary call checks at M's domain, as a
+    // built-in `weighted` weight does. A one-argument function whose §07
+    // domain is a scalar types over an array variate as its written
+    // elementwise form `f.(_)`, the variate of `broadcast(f, x)`, as the
+    // determinizer reads the bare name per cell; §06 has no sentence for a
+    // bare scalar name over an array law. Any other name (an array domain:
+    // `inv`, `row_gram`, `sum`; both: `neg`; two arguments: `atan2`) takes
+    // the call check with the whole variate. A distribution name is no map
+    // (§06 takes a function) and keeps the rule below, as does a
+    // `bijection(…)` map.
+    use crate::catalogue::{ParamSig, Sig};
+    let builtin = match inf.module.node(resolved) {
+        Node::Const(op)
+            if !matches!(
+                crate::catalogue::builtin().base(inf.module.resolve(*op)),
+                Some(Sig::Distribution { .. })
+            ) =>
+        {
+            Some(*op)
+        }
+        _ => None,
+    };
+    let scalar_domain = builtin.is_some_and(|op| {
+        matches!(
+            crate::catalogue::builtin().base(inf.module.resolve(op)),
+            Some(Sig::Function { params, .. } | Sig::Structural { params, .. })
+                if matches!(params[..], [ParamSig::Scalar(_)])
+        )
+    });
+    let sub = match (seed, builtin) {
+        (Some(s), Some(_)) if scalar_domain && matches!(&s[0].1, Type::Array { .. }) => {
+            let mut cells = vec![args[0].clone()];
+            cells.extend(s.iter().cloned());
+            broadcast_type(inf, id, &cells, &[])
+                .map(inf, |_, ty| Some(first_failed(&ty).unwrap_or(ty)))
+        }
+        (Some(s), Some(op)) => {
+            let application = Call {
+                head: CallHead::Builtin(op),
+                args: s.iter().map(|arg| arg.0).collect(),
+                named: Box::new([]),
+                inputs: None,
+            };
+            call_rule(inf, id, &application, None, &s, &[], joined).map(inf, |_, (ty, _)| Some(ty))
+        }
+        (Some(s), None) => substituted_result(inf, f_node, &s, &[], None, true)
+            .map(inf, |_, sub| sub.map(|(ty, _)| ty)),
+        (None, _) => Ready(None),
     };
     sub.map(inf, move |inf, sub| {
-        match sub
-            .map(|(ty, _)| ty)
-            .or_else(|| reified_result_type(inf, f_node))
-        {
+        match sub.or_else(|| reified_result_type(inf, f_node)) {
             Some(Type::Deferred) | None => None,
             Some(t) => Some(t),
         }
