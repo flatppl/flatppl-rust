@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+priors = load_module("priors.flatppl")
+theta1_dist = priors.theta1_dist
+theta2_dist = priors.theta2_dist
+c = external(reals)
+f_a = par -> c * par
+f_b = fn(abs(_) * _)

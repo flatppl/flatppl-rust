@@ -36,7 +36,9 @@ mod tables;
 pub use data::DataSource;
 pub use refuse::{Refusal, RefusalKind};
 
-use flatppl_core::Module;
+use std::collections::{HashMap, HashSet};
+
+use flatppl_core::{Idx, Module, Symbol};
 use serde_json::{Map, Value};
 
 /// Where values that depend on parameters go.
@@ -181,6 +183,145 @@ pub struct StanProgram {
 /// Emit the Stan program for one target of an inferred module.
 pub fn emit(module: &Module, opts: &EmitOptions) -> Result<StanProgram, Refusal> {
     emit::program(module, opts)
+}
+
+/// [`emit`] for a module that reads `load_module` members: the members are
+/// imported into the module's own graph first (§11: tooling may flatten
+/// modules internally), and the result is inferred again with `bundle`. A
+/// refusal inside an imported member is located at the host node that reads
+/// it. A module with no `load_module` binding is emitted as it is.
+pub fn emit_with_bundle(
+    module: &Module,
+    bundle: &flatppl_infer::ModuleBundle,
+    opts: &EmitOptions,
+) -> Result<StanProgram, Refusal> {
+    if !module
+        .bindings()
+        .any(|(_, b)| is_load_module(module, b.rhs))
+    {
+        return emit(module, opts);
+    }
+    let grafted = flatppl_determinizer::graft_imports(module, bundle)
+        .map_err(|e| Refusal::not_yet(Some(e.node), format!("{}: {}", e.construct, e.reason)))?;
+    let mut work = grafted.module.clone();
+    let diagnostics = flatppl_infer::infer_module(&mut work, bundle, flatppl_infer::Level::Shape);
+    // A static error the first inference could not see, because a size or a
+    // value lay in another module (data of 2 values against an imported
+    // count of 3).
+    if let Some(d) = diagnostics
+        .iter()
+        .find(|d| d.severity == flatppl_infer::Severity::Error)
+    {
+        return Err(Refusal::new(
+            RefusalKind::IllFormedModule,
+            d.node.map(|n| emit::host_node(module, &work, &grafted, n)),
+            "the module with its imported members",
+            d.message.clone(),
+        ));
+    }
+    // A public member that is a positive integer sizes data as in the host.
+    let public: HashSet<Symbol> = grafted
+        .imports
+        .iter()
+        .filter(|i| !i.member.starts_with('_'))
+        .map(|i| work.binding(i.binding).name)
+        .collect();
+    // A first emission records the bindings the program names and the names
+    // it makes. The graft renames a member that clashes with any host
+    // binding, also one the program never prints (an alias
+    // `f_b = common.f_b`), so the graft's names do not decide. A display name
+    // must know every printed import of its member name, so it cannot be
+    // decided at the first `name()` call: two emissions.
+    let first = emit::ImportNames {
+        display: HashMap::new(),
+        public: public.clone(),
+    };
+    let import_syms: HashSet<Symbol> = grafted
+        .imports
+        .iter()
+        .map(|i| work.binding(i.binding).name)
+        .collect();
+    // A name the emitter made from an import's own name (its function name)
+    // is that import's, not something else's.
+    let import_names: HashSet<String> = import_syms
+        .iter()
+        .map(|&s| emit::sanitize(work.resolve(s)))
+        .collect();
+    let (printed, mut taken): (Vec<bool>, HashSet<String>) =
+        match emit::program_printed(&work, opts, &first) {
+            (Ok(_), p) => (
+                grafted
+                    .imports
+                    .iter()
+                    .map(|i| p.named.contains(&work.binding(i.binding).name))
+                    .collect(),
+                p.named
+                    .iter()
+                    .filter(|s| !import_syms.contains(s))
+                    .map(|&s| emit::sanitize(work.resolve(s)))
+                    .chain(p.used.into_iter().filter(|u| !import_names.contains(u)))
+                    .collect(),
+            ),
+            // The emission below refuses the same way; its text names every
+            // import as if printed.
+            (Err(_), p) => (
+                vec![true; grafted.imports.len()],
+                work.bindings()
+                    .filter(|(b, _)| b.index() < grafted.host_bindings)
+                    .map(|(_, b)| emit::sanitize(work.resolve(b.name)))
+                    .chain(p.used.into_iter().filter(|u| !import_names.contains(u)))
+                    .collect(),
+            ),
+        };
+    // A printed import keeps its member name. One whose name the program
+    // prints for something else, or whose member name comes from more than
+    // one printed instance, prints as `{alias}_{member}` (`m_theta`, `m1_c`
+    // and `m2_c`), so the text does not depend on graft order.
+    let shown: Vec<&flatppl_determinizer::Import> = grafted
+        .imports
+        .iter()
+        .zip(&printed)
+        .filter_map(|(i, &p)| p.then_some(i))
+        .collect();
+    let mut count: HashMap<&str, usize> = HashMap::new();
+    for import in &shown {
+        *count.entry(import.member.as_str()).or_default() += 1;
+    }
+    let mut names = emit::ImportNames {
+        display: HashMap::new(),
+        public,
+    };
+    for import in shown {
+        let name = work.binding(import.binding).name;
+        let member = emit::sanitize(&import.member);
+        let display = if count[import.member.as_str()] == 1 && !taken.contains(&member) {
+            member
+        } else {
+            // Two members of one name reached through one alias (a module
+            // and a module it loads) take the emitter's `_2` suffix.
+            let base = emit::sanitize(&format!("{}_{}", import.alias, import.member));
+            let mut display = base.clone();
+            let mut k = 2;
+            while taken.contains(&display) {
+                display = format!("{base}_{k}");
+                k += 1;
+            }
+            display
+        };
+        taken.insert(display.clone());
+        if display != work.resolve(name) {
+            names.display.insert(name, work.intern(&display));
+        }
+    }
+    emit::program_with(&work, opts, &names).map_err(|mut r| {
+        r.node = r.node.map(|n| emit::host_node(module, &work, &grafted, n));
+        r
+    })
+}
+
+fn is_load_module(m: &Module, id: flatppl_core::NodeId) -> bool {
+    matches!(m.node(id), flatppl_core::Node::Call(c)
+        if matches!(c.head, flatppl_core::CallHead::Builtin(s) if m.resolve(s) == "load_module"))
 }
 
 /// Fill the deferred data values from `loaded`: the same module after the host

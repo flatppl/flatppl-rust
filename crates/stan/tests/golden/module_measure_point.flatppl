@@ -1,0 +1,4 @@
+# emit: target=lp module=modules/priors.flatppl
+flatppl_compat = "0.1"
+m = load_module("modules/priors.flatppl")
+lp = logdensityof(m.theta1_dist, 0.5)

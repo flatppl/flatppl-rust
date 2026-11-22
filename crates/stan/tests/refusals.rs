@@ -54,7 +54,8 @@ fn refuse_in(
         target: target.map(str::to_string),
         ..Default::default()
     };
-    let r = flatppl_stan::emit(&module, &opts).expect_err("refuses");
+    // As `flatppl stan` emits: `load_module` members are imported first.
+    let r = flatppl_stan::emit_with_bundle(&module, bundle, &opts).expect_err("refuses");
     let located = r.node.and_then(|node| enclosing_binding(&module, node));
     if let Some(name) = &located {
         assert!(!name.starts_with("__"), "located in `{name}`: {r}");
@@ -2289,25 +2290,125 @@ fn observation_forms(head: &str, obs: &str) -> [String; 3] {
 /// The module the module-member tests load as `mod.flatppl`.
 const MODULE_LEN: &str = "flatppl_compat = \"0.1\"\nlen = 3\n";
 
+/// The Stan text of `source`, with `dependency` loaded as `mod.flatppl`.
+fn emit_with_module(source: &str, dependency: &str, target: Option<&str>) -> String {
+    let bundle = module_bundle(dependency);
+    let mut module = flatppl_syntax::parse(source).expect("parse");
+    let diagnostics =
+        flatppl_infer::infer_module(&mut module, &bundle, flatppl_infer::Level::Shape);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| d.severity != flatppl_infer::Severity::Error),
+        "{diagnostics:?}"
+    );
+    let opts = EmitOptions {
+        target: target.map(str::to_string),
+        ..Default::default()
+    };
+    flatppl_stan::emit_with_bundle(&module, &bundle, &opts)
+        .unwrap_or_else(|r| panic!("{source}: {r}"))
+        .code
+}
+
 #[test]
-fn an_iid_count_from_a_module_member_is_not_yet() {
-    // The count's value is not in the module the emitter receives, so data of
-    // another length would score silently. Matching data refuses too.
-    for obs in ["[0.9, 1.1]", "[0.9, 1.1, 0.3]"] {
-        let head =
-            "m = load_module(\"mod.flatppl\")\na ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), m.len)\n";
-        for form in observation_forms(head, obs) {
-            let (r, located) = refuse_with_module(&form, MODULE_LEN, Some("post"));
-            assert_eq!(r.kind, RefusalKind::NotYetSupported, "{form}: {r}");
-            assert!(
-                r.reason.contains(
-                    "an `iid` count `m.len` that the Stan program cannot read as an integer"
-                ),
-                "{form}: {r}"
-            );
-            assert_eq!(located.as_deref(), Some("b"), "{form}: {r}");
-        }
+fn an_iid_count_from_a_module_member_sizes_the_data() {
+    // The member is imported, so the count is the program's own integer.
+    let head = "m = load_module(\"mod.flatppl\")\na ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), m.len)\n";
+    for form in observation_forms(head, "[0.9, 1.1, 0.3]") {
+        let code = emit_with_module(&form, MODULE_LEN, Some("post"));
+        assert!(code.contains("vector[len] b;"), "{form}:\n{code}");
     }
+    // Observed data of another length than the imported count is a static
+    // mismatch, which inference sees once the member is imported.
+    for form in observation_forms(head, "[0.9, 1.1]") {
+        let (r, _) = refuse_with_module(&form, MODULE_LEN, Some("post"));
+        assert_eq!(r.kind, RefusalKind::IllFormedModule, "{form}: {r}");
+        assert!(r.reason.contains("array of real [2]"), "{form}: {r}");
+    }
+}
+
+#[test]
+fn an_iid_count_from_a_clashing_module_member_keeps_its_bound() {
+    // The host's own `len` renames the import; the bound comes from the
+    // member's name in its module, and the import prints as `m_len`.
+    let head = "m = load_module(\"mod.flatppl\")\nlen = 0.5\na ~ Normal(len, 1)\n\
+                b ~ iid(Normal(a, 1), m.len)\n";
+    for form in observation_forms(head, "[0.9, 1.1, 0.3]") {
+        let code = emit_with_module(&form, MODULE_LEN, Some("post"));
+        assert!(code.contains("int<lower=0> m_len;"), "{form}:\n{code}");
+        assert!(code.contains("vector[m_len] b;"), "{form}:\n{code}");
+        assert!(code.contains("real len;"), "{form}:\n{code}");
+    }
+}
+
+#[test]
+fn a_member_behind_an_unprinted_alias_keeps_its_name() {
+    // `f_b = common.f_b` in the loaded module is an alias the program never
+    // prints, so the function it names keeps `f_b`: no prefix and no suffix.
+    let mut bundle = module_bundle(
+        "flatppl_compat = \"0.1\"\ncommon = load_module(\"common.flatppl\", c = c_scaling)\n\
+         c_scaling = 5\nf_b = common.f_b\ntheta1 ~ Normal(0, 1)\ntheta2 ~ Exponential(1)\n\
+         a = common.f_a(theta2)\nb = f_b(theta1, theta2)\nobs ~ iid(Normal(mu = a, sigma = b), 3)\n\
+         joint_model = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))\n\
+         posterior = restrict(joint_model, record(obs = [1.2, 3.4, 5.1]))\n",
+    );
+    bundle.insert(
+        "common.flatppl",
+        std::sync::Arc::new(
+            flatppl_syntax::parse(
+                "flatppl_compat = \"0.1\"\nc = external(reals)\nf_a = par -> c * par\n\
+                 f_b = fn(abs(_) * _)\n",
+            )
+            .expect("parse common"),
+        ),
+    );
+    let mut module = flatppl_syntax::parse(
+        "flatppl_compat = \"0.1\"\nm = load_module(\"mod.flatppl\")\n\
+         lp = logdensityof(m.posterior, record(theta1 = 0.5, theta2 = 1.0))\n",
+    )
+    .expect("parse");
+    let diagnostics =
+        flatppl_infer::infer_module(&mut module, &bundle, flatppl_infer::Level::Shape);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| d.severity != flatppl_infer::Severity::Error),
+        "{diagnostics:?}"
+    );
+    let opts = EmitOptions {
+        target: Some("lp".to_string()),
+        ..Default::default()
+    };
+    let code = flatppl_stan::emit_with_bundle(&module, &bundle, &opts)
+        .unwrap_or_else(|r| panic!("{r}"))
+        .code;
+    assert!(code.contains("real f_a(real par, int c_scaling)"), "{code}");
+    assert!(code.contains("real f_b(real arg1, real arg2)"), "{code}");
+    assert!(code.contains("real b = f_b(theta1, theta2);"), "{code}");
+    assert!(!code.contains("m_f_b"), "{code}");
+}
+
+#[test]
+fn a_member_from_several_instances_prints_with_each_alias() {
+    // One member name from three instances: every one is prefixed, so the
+    // text does not depend on which instance was imported first.
+    let code = emit_with_module(
+        "flatppl_compat = \"0.1\"\nm1 = load_module(\"mod.flatppl\", c = 1.0)\nm2 = load_module(\"mod.flatppl\", c = 2.0)\n\
+         m3 = load_module(\"mod.flatppl\", c = 3.0)\nx = elementof(reals)\n\
+         lp = logdensityof(m1.M, x) + logdensityof(m2.M, x) + logdensityof(m3.M, x)\n\
+         inputs = x\noutputs = lp\n",
+        "flatppl_compat = \"0.1\"\nc = external(reals)\nM = Normal(c, 1.0)\n",
+        Some("lp"),
+    );
+    for k in 1..=3 {
+        assert!(code.contains(&format!("real m{k}_c;")), "{code}");
+        assert!(
+            code.contains(&format!("x ~ normal(m{k}_c, 1.0);")),
+            "{code}"
+        );
+    }
+    assert!(!code.contains("real c;"), "{code}");
 }
 
 #[test]
@@ -2513,13 +2614,42 @@ fn an_iid_count_from_an_untyped_load_is_not_yet() {
 }
 
 #[test]
-fn an_iid_shape_with_a_module_member_is_not_yet() {
+fn an_iid_shape_with_a_module_member_sizes_the_data() {
     let head =
         "m = load_module(\"mod.flatppl\")\na ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), [2, m.len])\n";
-    let [explicit, ..] = observation_forms(head, "rowstack([[1.0, 2.0], [3.0, 4.0]])");
-    let (r, _) = refuse_with_module(&explicit, MODULE_LEN, Some("post"));
+    let [explicit, ..] = observation_forms(head, "rowstack([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])");
+    let code = emit_with_module(&explicit, MODULE_LEN, Some("post"));
+    assert!(code.contains("matrix[2, len] b;"), "{code}");
+}
+
+#[test]
+fn a_refusal_inside_a_module_member_is_located_at_its_reader() {
+    // The member is imported under its own name; the refusal names the host
+    // binding that reads it, never a binding the user did not write here.
+    let (r, located) = refuse_with_module(
+        "m = load_module(\"mod.flatppl\")\nx = elementof(reals)\n\
+         lp = logdensityof(m.W, x)\ninputs = x\noutputs = lp\n",
+        "flatppl_compat = \"0.1\"\nW = Dirac(0.5)\n",
+        Some("lp"),
+    );
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("an `iid` count `m.len`"), "{r}");
+    assert!(r.reason.contains("the law `Dirac` in this form"), "{r}");
+    assert_eq!(located.as_deref(), Some("lp"), "{r}");
+}
+
+#[test]
+fn an_applied_module_kernel_is_not_yet() {
+    // The imported `functionof` law applied to an argument is the local form
+    // the emitter does not write yet.
+    let (r, located) = refuse_with_module(
+        "m = load_module(\"mod.flatppl\")\nlp = logdensityof(m.obs_kernel(0.0), 0.5)\n",
+        "flatppl_compat = \"0.1\"\ncenter = elementof(reals)\n\
+         obs_kernel = functionof(Normal(mu = center, sigma = 1.0), center = center)\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a law from a user callable"), "{r}");
+    assert_eq!(located.as_deref(), Some("lp"), "{r}");
 }
 
 #[test]
@@ -2547,27 +2677,32 @@ fn an_lkj_dimension_from_an_untyped_load_is_not_yet() {
 fn a_multinomial_count_the_program_cannot_read_is_not_yet() {
     // The guard `sum(y) != n` needs n: a count with no Stan form refuses by
     // name, never drops the guard.
-    for (head, count) in [
-        ("m = load_module(\"mod.flatppl\")\n", "m.len"),
-        ("k = load_data(\"n.json\", anything)\n", "k"),
-    ] {
-        let (r, _) = refuse_with_module(
-            &format!(
-                "{head}p ~ Dirichlet([1.0, 1.0, 1.0])\nc ~ Multinomial({count}, p)\n\
-                 prior = lawof(record(p = p))\nK = kernelof(record(c = c), p = p)\n\
-                 post = bayesupdate(likelihoodof(K, record(c = [1, 0, 2])), prior)\n"
-            ),
-            MODULE_LEN,
-            Some("post"),
-        );
-        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{count}: {r}");
-        assert!(
-            r.reason.contains(&format!(
-                "a `Multinomial` count `{count}` that the Stan program cannot read as an integer"
-            )),
-            "{count}: {r}"
-        );
-    }
+    let r = refuse_with(
+        "k = load_data(\"n.json\", anything)\np ~ Dirichlet([1.0, 1.0, 1.0])\n\
+         c ~ Multinomial(k, p)\nprior = lawof(record(p = p))\n\
+         K = kernelof(record(c = c), p = p)\n\
+         post = bayesupdate(likelihoodof(K, record(c = [1, 0, 2])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a `Multinomial` count `k` that the Stan program cannot read as an integer"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_multinomial_count_from_a_module_member_is_guarded() {
+    let code = emit_with_module(
+        "m = load_module(\"mod.flatppl\")\np ~ Dirichlet([1.0, 1.0, 1.0])\n\
+         c ~ Multinomial(m.len, p)\nprior = lawof(record(p = p))\n\
+         K = kernelof(record(c = c), p = p)\n\
+         post = bayesupdate(likelihoodof(K, record(c = [1, 0, 2])), prior)\n",
+        MODULE_LEN,
+        Some("post"),
+    );
+    assert!(code.contains("if (sum(c) != len)"), "{code}");
 }
 
 #[test]

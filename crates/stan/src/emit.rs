@@ -10,6 +10,7 @@ use flatppl_core::{
     ValueSet,
 };
 use serde_json::{Map, Value};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 mod aggregate;
@@ -287,6 +288,12 @@ pub(crate) struct Emitter<'m> {
     /// Function parameters lifted over whole arrays (see `aggregate::lift`).
     vlocals: Option<HashMap<Symbol, aggregate::Lifted>>,
     sizes: HashMap<u32, Vec<Symbol>>,
+    /// The printed name of a `load_module` import (`m_theta` for
+    /// `__import_theta_0`; see [`ImportNames`]).
+    display: HashMap<Symbol, Symbol>,
+    /// Each binding [`Emitter::name`] named: what the program prints, from
+    /// which `emit_with_bundle` decides import names.
+    named: RefCell<HashSet<Symbol>>,
     data: Vec<String>,
     tdata: Vec<String>,
     params: Vec<String>,
@@ -322,6 +329,75 @@ fn module_names(m: &Module) -> HashSet<String> {
         m.for_each_child(id, |k| stack.push(k));
     }
     out
+}
+
+/// Node `n` of `work`, the host with its `load_module` members imported, as a
+/// node of `host`: a host node is itself; a node of an import is the host
+/// node that reads the import; a host value rebuilt around an import is its
+/// binding's own value. So a refusal names what the user wrote in the host.
+pub(crate) fn host_node(
+    host: &Module,
+    work: &Module,
+    grafted: &flatppl_determinizer::Grafted,
+    n: NodeId,
+) -> NodeId {
+    use flatppl_core::Idx;
+    let mut n = n;
+    // A reader can itself be a rebuilt host node; each step moves to an
+    // older node, and the bound guards the walk.
+    for _ in 0..=grafted.readers.len() {
+        if n.index() < grafted.host_nodes {
+            return n;
+        }
+        let imported = |root: NodeId| {
+            let mut stack = vec![root];
+            let mut seen = HashSet::new();
+            while let Some(id) = stack.pop() {
+                if id == n {
+                    return true;
+                }
+                if !seen.insert(id) {
+                    continue;
+                }
+                if let Node::Ref(r) = work.node(id)
+                    && r.ns == RefNs::SelfMod
+                    && let Some(b) = work.binding_by_name(r.name)
+                    && b.index() >= grafted.host_bindings
+                {
+                    stack.push(work.binding(b).rhs);
+                }
+                work.for_each_child(id, |c| stack.push(c));
+            }
+            false
+        };
+        if let Some(&(_, reader)) = grafted.readers.iter().find(|(root, _)| imported(*root)) {
+            n = reader;
+            continue;
+        }
+        // A host value rebuilt around an import has the shape of the host's
+        // own value: walk both together to the node `n` was rebuilt from.
+        for (b, binding) in work.bindings() {
+            if b.index() >= grafted.host_bindings {
+                continue;
+            }
+            let mut stack = vec![(binding.rhs, host.binding(b).rhs)];
+            let mut seen = HashSet::new();
+            while let Some((w, h)) = stack.pop() {
+                if w == n {
+                    return h;
+                }
+                if !seen.insert(w) {
+                    continue;
+                }
+                let (wc, hc) = (work.node(w).children(), host.node(h).children());
+                if wc.len() == hc.len() {
+                    stack.extend(wc.into_iter().zip(hc));
+                }
+            }
+        }
+        return n;
+    }
+    n
 }
 
 pub(crate) fn sanitize(name: &str) -> String {
@@ -383,6 +459,8 @@ impl<'m> Emitter<'m> {
             size_checks: vec![],
             own_sum: HashSet::new(),
             observing: None,
+            display: HashMap::new(),
+            named: RefCell::new(HashSet::new()),
             data_sizes: false,
             leaves: HashMap::new(),
             in_progress: HashSet::new(),
@@ -436,7 +514,10 @@ impl<'m> Emitter<'m> {
     }
 
     fn name(&self, s: Symbol) -> &'m str {
-        self.m.resolve(s)
+        if self.m.binding_by_name(s).is_some() {
+            self.named.borrow_mut().insert(s);
+        }
+        self.m.resolve(self.display.get(&s).copied().unwrap_or(s))
     }
 
     /// `true` when the Stan name `name` holds data: a `data` entry (literal or
@@ -820,10 +901,11 @@ impl<'m> Emitter<'m> {
     }
 
     fn bind_new(&mut self, sym: Symbol, rhs: NodeId) -> Result<String> {
-        let name = self.name(sym);
+        // An alias prints as what it names, so it is named only after.
         if let Some(other) = self.self_ref(rhs) {
             return self.bind(other);
         }
+        let name = self.name(sym);
         match self.head(rhs) {
             Some("draw") => return Err(self.latent(sym, rhs)),
             Some("elementof") => {
@@ -2871,37 +2953,94 @@ fn block(out: &mut String, name: &str, lines: &[String]) {
     out.push_str("}\n");
 }
 
+/// How the bindings a `load_module` import added print: a renamed one under
+/// its `display` name, and a positive integer member with a public name as a
+/// size (`int<lower=0> len`), as the same binding written in the host does.
+#[derive(Default)]
+pub(crate) struct ImportNames {
+    pub display: HashMap<Symbol, Symbol>,
+    pub public: HashSet<Symbol>,
+}
+
 pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgram> {
-    let target = select_target(m, opts)?;
+    program_with(m, opts, &ImportNames::default())
+}
+
+/// What an emission printed: each binding it named and each name it made.
+#[derive(Default)]
+pub(crate) struct Printed {
+    pub named: HashSet<Symbol>,
+    pub used: HashSet<String>,
+}
+
+pub(crate) fn program_with(
+    m: &Module,
+    opts: &EmitOptions,
+    imports: &ImportNames,
+) -> Result<crate::StanProgram> {
+    program_printed(m, opts, imports).0
+}
+
+/// [`program_with`], with what the emission printed, also when it refuses.
+pub(crate) fn program_printed(
+    m: &Module,
+    opts: &EmitOptions,
+    imports: &ImportNames,
+) -> (Result<crate::StanProgram>, Printed) {
+    let target = match select_target(m, opts) {
+        Ok(t) => t,
+        Err(r) => return (Err(r), Printed::default()),
+    };
     let mut e = Emitter::new(m, opts);
-    e.emit_target(target)?;
-    e.query_inputs(target);
-    e.abi_parameters()?;
-    e.resolve_sizes()?;
-    let mut model = e.locals.clone();
-    if !model.is_empty() && !(e.prior.is_empty() && e.lik.is_empty()) {
-        model.push(String::new());
+    e.display.clone_from(&imports.display);
+    for (_, b) in m.bindings() {
+        if imports.public.contains(&b.name)
+            && let Node::Lit(Scalar::Int(n)) = m.node(b.rhs)
+            && *n > 0
+            && let Ok(n) = u32::try_from(*n)
+        {
+            e.sizes.entry(n).or_default().push(b.name);
+        }
     }
-    model.extend(e.prior.iter().cloned());
-    model.extend(e.lik.iter().cloned());
-    let data_inputs = e.data_inputs();
-    let mut code = String::new();
-    block(&mut code, "functions", &e.functions);
-    block(&mut code, "data", &e.data);
-    block(&mut code, "transformed data", &e.tdata);
-    block(&mut code, "parameters", &e.params);
-    block(&mut code, "transformed parameters", &e.tparams);
-    block(&mut code, "model", &model);
-    Ok(crate::StanProgram {
-        code,
-        data: e.json,
-        deferred_data: e.deferred,
-        manifest: crate::Manifest {
-            target: m.resolve(target).to_string(),
-            data: data_inputs,
-            parameters: e.manifest,
-        },
-    })
+    let out = e.finish(target);
+    let printed = Printed {
+        named: e.named.take(),
+        used: std::mem::take(&mut e.used),
+    };
+    (out, printed)
+}
+
+impl Emitter<'_> {
+    fn finish(&mut self, target: Symbol) -> Result<crate::StanProgram> {
+        self.emit_target(target)?;
+        self.query_inputs(target);
+        self.abi_parameters()?;
+        self.resolve_sizes()?;
+        let mut model = self.locals.clone();
+        if !model.is_empty() && !(self.prior.is_empty() && self.lik.is_empty()) {
+            model.push(String::new());
+        }
+        model.extend(self.prior.iter().cloned());
+        model.extend(self.lik.iter().cloned());
+        let data_inputs = self.data_inputs();
+        let mut code = String::new();
+        block(&mut code, "functions", &self.functions);
+        block(&mut code, "data", &self.data);
+        block(&mut code, "transformed data", &self.tdata);
+        block(&mut code, "parameters", &self.params);
+        block(&mut code, "transformed parameters", &self.tparams);
+        block(&mut code, "model", &model);
+        Ok(crate::StanProgram {
+            code,
+            data: std::mem::take(&mut self.json),
+            deferred_data: std::mem::take(&mut self.deferred),
+            manifest: crate::Manifest {
+                target: self.m.resolve(target).to_string(),
+                data: data_inputs,
+                parameters: std::mem::take(&mut self.manifest),
+            },
+        })
+    }
 }
 
 #[cfg(test)]

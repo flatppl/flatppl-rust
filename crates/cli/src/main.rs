@@ -1509,7 +1509,7 @@ fn stan_cmd(
     output: Option<&Path>,
 ) -> Result<(), Failure> {
     let resolver = CliResolver::cache_only();
-    let (module, _bundle, source) = load_and_infer(input, &resolver)?;
+    let (module, bundle, source) = load_and_infer(input, &resolver)?;
     let refuse = |e: flatppl_stan::Refusal| {
         let mut site = String::new();
         if let Some(node) = e.node {
@@ -1526,7 +1526,7 @@ fn stan_cmd(
         }
         Failure::Refuse(format!("stan: {e}{site}"))
     };
-    let mut program = flatppl_stan::emit(&module, &opts).map_err(refuse)?;
+    let mut program = flatppl_stan::emit_with_bundle(&module, &bundle, &opts).map_err(refuse)?;
     let write = |path: &Path, text: String| {
         fs::write(path, text).map_err(|e| {
             Failure::Plain(format!(

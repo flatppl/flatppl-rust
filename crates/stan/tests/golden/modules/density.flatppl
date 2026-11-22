@@ -1,0 +1,2 @@
+flatppl_compat = "0.1"
+M = Normal(2.0, 3.0)
