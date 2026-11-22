@@ -1,0 +1,5 @@
+# emit: target=post module=modules/equal.flatppl
+flatppl_compat = "0.1"
+m1 = load_module("modules/equal.flatppl")
+m2 = load_module("modules/equal.flatppl")
+post = bayesupdate(m1.L, m2.prior)

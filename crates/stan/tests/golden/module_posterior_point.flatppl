@@ -1,0 +1,7 @@
+# emit: target=lp module=modules/posterior.flatppl
+flatppl_compat = "0.1"
+m = load_module("modules/posterior.flatppl")
+ta = elementof(reals)
+lp = logdensityof(m.post, record(a = ta))
+inputs = ta
+outputs = lp

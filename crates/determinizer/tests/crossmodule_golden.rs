@@ -1755,3 +1755,79 @@ L = likelihoodof(k, 2.0)
         assert!(flatppl_determinizer::is_flatpdl(&lowered).is_ok());
     }
 }
+
+/// §04 Module composition: loads of one source with equal substitutions are
+/// one instance, so the draw `t` behind a module law is one variable however
+/// the law is reached.
+#[test]
+fn equal_loads_share_one_instance() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "plain.flatppl",
+        Arc::new(parse("t ~ Normal(0.0, 1.0)\nprior = lawof(record(t = t))")),
+    );
+    bundle.insert(
+        "mod.flatppl",
+        Arc::new(parse(
+            "c = external(reals)\nt ~ Normal(c, 1.0)\nprior = lawof(record(t = t))",
+        )),
+    );
+    bundle.insert(
+        "wrap.flatppl",
+        Arc::new(parse(
+            "inner = load_module(\"mod.flatppl\", c = 1.0)\np = inner.prior",
+        )),
+    );
+    // How many bindings the graft adds for `member`.
+    let imported = |host: &str, member: &str| {
+        let mut model = parse(&format!("flatppl_compat = \"0.1\"\n{host}"));
+        let (diags, bundle) = flatppl_infer::infer_module_with_inputs(
+            &mut model,
+            bundle.clone(),
+            flatppl_infer::Level::Shape,
+        );
+        assert!(diags.is_empty(), "{host}: {diags:?}");
+        let grafted = flatppl_determinizer::graft_imports(&model, &bundle)
+            .unwrap_or_else(|e| panic!("{host}: {}", e.reason));
+        grafted
+            .imports
+            .iter()
+            .filter(|i| i.member == member)
+            .count()
+    };
+    let lp = |a: &str, b: &str| {
+        format!("lp = logdensityof({a}, record(t = 0.5)) + logdensityof({b}, record(t = 0.5))")
+    };
+    // Equal loads, with no substitution and with equal ones.
+    let none = format!(
+        "m1 = load_module(\"plain.flatppl\")\nm2 = load_module(\"plain.flatppl\")\n{}",
+        lp("m1.prior", "m2.prior")
+    );
+    assert_eq!(imported(&none, "t"), 1);
+    assert_eq!(imported(&none, "prior"), 1);
+    let equal = format!(
+        "m1 = load_module(\"mod.flatppl\", c = 1.0)\nm2 = load_module(\"mod.flatppl\", c = 1.0)\n{}",
+        lp("m1.prior", "m2.prior")
+    );
+    assert_eq!(imported(&equal, "t"), 1);
+    // Different substitutions stay two instances.
+    let different = format!(
+        "m1 = load_module(\"mod.flatppl\", c = 1.0)\nm2 = load_module(\"mod.flatppl\", c = 2.0)\n{}",
+        lp("m1.prior", "m2.prior")
+    );
+    assert_eq!(imported(&different, "t"), 2);
+    // A nested load and a host load of the same module, by two paths.
+    let nested = format!(
+        "w = load_module(\"wrap.flatppl\")\nm = load_module(\"mod.flatppl\", c = 1.0)\n{}",
+        lp("w.p", "m.prior")
+    );
+    assert_eq!(imported(&nested, "t"), 1);
+    // An alias holds the law, and a second equal load reads that alias.
+    let alias = format!(
+        "m1 = load_module(\"plain.flatppl\")\nprior1 = m1.prior\n\
+         m2 = load_module(\"plain.flatppl\")\n{}",
+        lp("prior1", "m2.prior")
+    );
+    assert_eq!(imported(&alias, "t"), 1);
+    assert_eq!(imported(&alias, "prior"), 0);
+}

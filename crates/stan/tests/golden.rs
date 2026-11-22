@@ -1,6 +1,9 @@
 //! Emitted Stan text for each `golden/*.flatppl`, compared with `*.stan` and
 //! `*.data.json`. Set `FLATPPL_BLESS=1` to rewrite the expected files. A first
-//! line `# emit: derived=transformed-parameters target=NAME` sets options.
+//! line `# emit: derived=transformed-parameters target=NAME` sets options;
+//! `module=LITERAL` (repeatable) puts `golden/modules/<file name of
+//! LITERAL>` in the bundle under the literal a `load_module` spells, so a
+//! module the CLI finds by path is the module the test reads.
 //!
 //! These goldens check structural translation with the default options (no
 //! `--reduce`). The statistics tests cover `--reduce sufficient`. The
@@ -22,11 +25,32 @@ fn options(source: &str) -> flatppl_stan::EmitOptions {
                     opts.derived = flatppl_stan::Placement::parse(v).expect("derived value")
                 }
                 Some(("target", v)) => opts.target = Some(v.to_string()),
+                Some(("module", _)) => {}
                 _ => panic!("unknown emit option `{kv}`"),
             }
         }
     }
     opts
+}
+
+/// The `module=` literals of a leading `# emit:` line, as a bundle of the
+/// files in `tests/golden/modules` keyed by those literals.
+fn bundle(source: &str) -> Option<flatppl_infer::ModuleBundle> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/modules");
+    let rest = source.lines().next()?.strip_prefix("# emit: ")?;
+    let mut bundle = flatppl_infer::ModuleBundle::new();
+    let mut any = false;
+    for literal in rest
+        .split_whitespace()
+        .filter_map(|kv| kv.strip_prefix("module="))
+    {
+        let file = Path::new(literal).file_name().expect("module file name");
+        let text = std::fs::read_to_string(dir.join(file)).expect("module file");
+        let module = flatppl_syntax::parse(&text).expect("parse module");
+        bundle.insert(literal, std::sync::Arc::new(module));
+        any = true;
+    }
+    any.then_some(bundle)
 }
 
 fn emit(source: &str) -> flatppl_stan::StanProgram {
@@ -36,6 +60,23 @@ fn emit(source: &str) -> flatppl_stan::StanProgram {
 /// [`emit`] naming the golden in a failure, so a refusal says which file.
 fn emit_named(name: &str, source: &str) -> flatppl_stan::StanProgram {
     let mut module = flatppl_syntax::parse(source).expect("parse");
+    let opts = options(source);
+    if let Some(bundle) = bundle(source) {
+        // As `flatppl stan` infers a model with modules.
+        let (diagnostics, bundle) = flatppl_infer::infer_module_with_inputs(
+            &mut module,
+            bundle,
+            flatppl_infer::Level::Shape,
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.severity != flatppl_infer::Severity::Error),
+            "{name}: {diagnostics:?}"
+        );
+        return flatppl_stan::emit_with_bundle(&module, &bundle, &opts)
+            .unwrap_or_else(|r| panic!("{name}: emit: {r:?}"));
+    }
     let diagnostics = flatppl_infer::infer(&mut module);
     assert!(
         diagnostics
@@ -43,7 +84,7 @@ fn emit_named(name: &str, source: &str) -> flatppl_stan::StanProgram {
             .all(|d| d.severity != flatppl_infer::Severity::Error),
         "{name}: {diagnostics:?}"
     );
-    flatppl_stan::emit(&module, &options(source)).unwrap_or_else(|r| panic!("{name}: emit: {r:?}"))
+    flatppl_stan::emit(&module, &opts).unwrap_or_else(|r| panic!("{name}: emit: {r:?}"))
 }
 
 #[test]

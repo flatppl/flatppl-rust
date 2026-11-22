@@ -784,6 +784,7 @@ name = "flatppl-stan"
 version = "0.1.0"
 dependencies = [
  "flatppl-core",
+ "flatppl-determinizer",
  "flatppl-infer",
  "flatppl-model-analysis",
  "flatppl-syntax",

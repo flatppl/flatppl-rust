@@ -1,0 +1,4 @@
+flatppl_compat = "0.1"
+a ~ Normal(0, 1)
+y ~ Normal(a, 1.0)
+post = bayesupdate(likelihoodof(kernelof(record(y = y), a = a), record(y = 0.4)), lawof(record(a = a)))

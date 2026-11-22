@@ -23,6 +23,7 @@ mod sample;
 mod stdfn;
 pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};
 pub use conformance::{is_flatpdl, is_flatpdl_with_options};
+pub use crossmodule::{Grafted, Import, graft_imports};
 pub use disintegrate::{rewrite_restrict, split_disintegrate};
 pub use driver::{
     SamplingObserver, desugar_restrict_and_disintegrate, determinize, determinize_with,

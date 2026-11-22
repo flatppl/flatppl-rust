@@ -1,0 +1,7 @@
+# emit: target=lp module=modules/density.flatppl
+flatppl_compat = "0.1"
+helpers = load_module("modules/density.flatppl")
+x = elementof(reals)
+lp = logdensityof(helpers.M, x)
+inputs = x
+outputs = lp

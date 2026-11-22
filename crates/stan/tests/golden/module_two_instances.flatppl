@@ -1,0 +1,8 @@
+# emit: target=lp module=modules/shift.flatppl
+flatppl_compat = "0.1"
+m1 = load_module("modules/shift.flatppl", c = 1.0)
+m2 = load_module("modules/shift.flatppl", c = 2.0)
+x = elementof(reals)
+lp = logdensityof(m1.M, x) + logdensityof(m2.M, x)
+inputs = x
+outputs = lp

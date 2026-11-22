@@ -1,0 +1,14 @@
+# emit: module=modules/common.flatppl module=priors.flatppl
+flatppl_compat = "0.1"
+common = load_module("modules/common.flatppl", c = c_scaling)
+theta1 ~ common.theta1_dist
+theta2 ~ common.theta2_dist
+c_scaling = 5
+a = common.f_a(theta2)
+f_b = common.f_b
+b = f_b(theta1, theta2)
+obs ~ iid(Normal(mu = a, sigma = b), 10)
+joint_model = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))
+forward_kernel, prior = disintegrate(["obs"], joint_model)
+L = likelihoodof(forward_kernel, record(obs = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]))
+posterior = bayesupdate(L, prior)

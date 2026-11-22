@@ -1,0 +1,3 @@
+flatppl_compat = "0.1"
+c = external(reals)
+M = Normal(c, 1.0)

@@ -1,0 +1,5 @@
+flatppl_compat = "0.1"
+t ~ Normal(0.0, 1.0)
+prior = lawof(record(t = t))
+y ~ Normal(t, 1.0)
+L = likelihoodof(kernelof(record(y = y), t = t), record(y = 0.3))

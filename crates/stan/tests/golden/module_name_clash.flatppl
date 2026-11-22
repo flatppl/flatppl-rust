@@ -1,0 +1,7 @@
+# emit: target=lp module=modules/clash.flatppl
+flatppl_compat = "0.1"
+m = load_module("modules/clash.flatppl")
+theta = elementof(reals)
+lp = logdensityof(m.M, theta)
+inputs = theta
+outputs = lp

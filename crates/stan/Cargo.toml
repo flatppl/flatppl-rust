@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 flatppl-core = { path = "../core" }
+flatppl-determinizer = { path = "../determinizer" }
 flatppl-infer = { path = "../infer" }
 flatppl-model-analysis = { path = "../model-analysis" }
 serde_json = { workspace = true }
