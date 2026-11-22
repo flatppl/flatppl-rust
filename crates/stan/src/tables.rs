@@ -49,6 +49,13 @@ pub(crate) struct LawRow {
     /// each end returned -inf.
     #[serde(default)]
     pub total_support: bool,
+    /// The template variables, and `y` for the variate, whose Stan argument is
+    /// a real container, `vector` or `matrix`, not `reals` (`normal_id_glm`'s
+    /// y, x and beta, a user `_lpdf` with a `vector` variate): an integer
+    /// array declared there prints as `to_vector(…)` or `to_matrix(…)`, a
+    /// real value as it is.
+    #[serde(default)]
+    pub real_container_args: Vec<String>,
     pub functions: String,
     pub status: String,
     pub note: String,

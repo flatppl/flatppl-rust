@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+reg = standard_module("regression", "0.1")
+x = rowstack([[1, 0], [0, 1], [1, 1]])
+alpha ~ Normal(0, 1)
+beta ~ iid(Normal(0, 1), 2)
+y ~ reg.PoissonLogGLM(x, alpha, beta)
+prior = lawof(record(alpha = alpha, beta = beta))
+L = likelihoodof(kernelof(record(y = y), alpha = alpha, beta = beta), record(y = [0, 3, 1]))
+post = bayesupdate(L, prior)

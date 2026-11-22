@@ -1,0 +1,6 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+eta = elementof(reals)
+lp = logdensityof(iid(Beta(8.0, 8.0), 2), [exp(eta), 0.5])
+inputs = eta
+outputs = lp

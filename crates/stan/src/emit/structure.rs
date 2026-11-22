@@ -61,9 +61,13 @@ pub(super) struct Law {
     pub stan_name: String,
     /// The FlatPPL law the row maps (`Poisson`), for messages.
     pub flatppl: String,
-    /// A user-defined `_lpdf` row (`kind: custom_lpdf`): its overloads take
-    /// `vector` variates, not integer arrays.
-    pub custom: bool,
+    /// The row's Stan function takes a `vector` variate, not `reals` (the row
+    /// lists `y` in `real_container_args`): an integer array observation
+    /// prints as `to_vector(…)`.
+    pub vector_variate: bool,
+    /// A regression GLM (module `regression`): one law over the whole
+    /// response vector, though its `variate` type is the element's.
+    pub glm: bool,
     /// The row's Stan function does not enforce `bounds` (von Mises): a
     /// variate whose declaration does not state them is tested against them.
     pub unchecked_support: bool,
@@ -1810,6 +1814,13 @@ impl<'m> Emitter<'m> {
     fn observe(&mut self, obs: Vec<Observation>) -> Result<()> {
         let mut conditioned = Vec::new();
         let mut factors = Vec::new();
+        // Every law sees each observed draw's declaration source, in any
+        // field order (`declared_int`).
+        for o in &obs {
+            if let Some(d) = o.draw {
+                self.observed_at.insert(d, o.value);
+            }
+        }
         for o in obs {
             let lhs = match self.observed_value(&o) {
                 Ok(lhs) => lhs,
@@ -1985,7 +1996,15 @@ impl<'m> Emitter<'m> {
         }
         let stan = self.fresh(&o.name);
         let t = self.declare(o.value, None, false, &stan, &[])?;
-        self.tdata.push(format!("{} = {};", t.render(&stan), e.s));
+        let line = format!("{} = {};", t.render(&stan), e.s);
+        // A point computed from parameters (`logdensityof(M, exp(eta))` for an
+        // input `eta`) is no data: it goes where values that depend on
+        // parameters go.
+        if self.m.phase_of(o.value) == Some(Phase::Fixed) {
+            self.tdata.push(line);
+        } else {
+            self.put(false, vec![line]);
+        }
         self.record_decl(&stan, t);
         Ok(stan)
     }
@@ -2047,7 +2066,18 @@ impl<'m> Emitter<'m> {
                 return self.nested_iid(lhs, m);
             }
             // An iid product of one law: the law's arguments are shared.
-            Some("iid") => (self.law(self.call(m).unwrap().args[0], false)?, false),
+            Some("iid") => {
+                let law = self.law(self.call(m).unwrap().args[0], false)?;
+                // A GLM is a law over the whole response vector: an iid of it
+                // is one GLM per response row, not the flattened rows.
+                if law.glm {
+                    return Err(Refusal::not_yet(
+                        Some(m),
+                        format!("an iid of the regression law `{}`", law.flatppl),
+                    ));
+                }
+                (law, false)
+            }
             Some("broadcast") => {
                 self.flat = flat;
                 let law = self.law(m, true);
@@ -2100,7 +2130,8 @@ impl<'m> Emitter<'m> {
             let n = self.extent_of(lhs);
             let index = per_element.then_some(i.as_str());
             let row = format!("{lhs}[{i}]");
-            let statement = law.statement(m, &law.lhs(&row), &law.call_text(index))?;
+            let variate = self.variate_text(&law, lhs, &row, 1);
+            let statement = law.statement(m, &law.lhs(&variate), &law.call_text(index))?;
             // A row guard of a vector law (`Multinomial`: each row sums to n)
             // tests each row, inside the loop.
             let per_row = law.multivariate && law.guard.is_some();
@@ -2156,19 +2187,7 @@ impl<'m> Emitter<'m> {
                 };
                 (target, law.call_text(None))
             }
-            // A user-defined `_lpdf` takes real variates: integer observations
-            // of a custom row (ContinuedPoisson counts) as a vector. Stan's
-            // built-in densities take the integer array itself.
-            _ if law.custom
-                && !law.discrete
-                && self
-                    .decls
-                    .get(lhs)
-                    .is_some_and(|t| t.is_int() && t.rank() == 1) =>
-            {
-                (format!("to_vector({lhs})"), law.call_text(None))
-            }
-            _ => (lhs.to_string(), law.call_text(None)),
+            _ => (self.variate_text(&law, lhs, lhs, 0), law.call_text(None)),
         };
         let mut out = vec![law.statement(m, &law.lhs(&target), &rhs)?];
         out.extend(law.extra.iter().cloned());
@@ -2429,6 +2448,26 @@ impl<'m> Emitter<'m> {
 
     /// `D_lpdf(y | args)` (`_lpmf` for a discrete law) for a variate already
     /// printed, per element at `index` when given.
+    /// The text a law's Stan function takes for the variate `expr`, the
+    /// declared `name` with `indices` indices. A function with a `vector`
+    /// variate (a user `_lpdf`, `normal_id_glm`: the row lists `y` in
+    /// `real_container_args`) takes an integer observation (ContinuedPoisson
+    /// counts) as `to_vector(…)`. Stan's other densities take `reals`, so the
+    /// integer array itself.
+    pub(super) fn variate_text(&self, law: &Law, name: &str, expr: &str, indices: usize) -> String {
+        if law.vector_variate
+            && !law.discrete
+            && self
+                .decls
+                .get(name)
+                .is_some_and(|t| t.is_int() && t.rank() == indices + 1)
+        {
+            format!("to_vector({expr})")
+        } else {
+            expr.to_string()
+        }
+    }
+
     pub(super) fn law_density(
         &mut self,
         at: NodeId,
@@ -2445,7 +2484,7 @@ impl<'m> Emitter<'m> {
             .ok_or_else(|| Refusal::not_yet(Some(at), "the log density of this law"))?;
         let (name, args) = (&call[..open], &call[open + 1..call.len() - 1]);
         let suffix = if law.discrete { "_lpmf" } else { "_lpdf" };
-        let y = law.lhs(y);
+        let y = law.lhs(&self.variate_text(law, y, y, 0));
         Ok(if args.is_empty() {
             format!("{name}{suffix}({y})")
         } else {
@@ -3926,6 +3965,28 @@ impl<'m> Emitter<'m> {
         ))
     }
 
+    /// `true` when the value `n` prints as an integer array of `rank`. A data
+    /// name is declared from the node `declare` types: the value itself, or,
+    /// for an observed draw, its observed value (`beta ~ iid(Normal(0, 1), 2)`
+    /// observed at `[1, 2]` is `array[2] int`). It reads no print state, so
+    /// the answer does not depend on what printed first.
+    fn declared_int(&self, n: NodeId, rank: usize) -> bool {
+        let int_at = |id: NodeId| self.shape(id).is_some_and(|s| s.rank == rank && s.int);
+        if rank == 0 || int_at(n) {
+            return rank > 0;
+        }
+        let Node::Ref(r) = self.m.node(self.resolve(n)) else {
+            return false;
+        };
+        r.ns == RefNs::SelfMod
+            && self
+                .m
+                .alias_chain(r.name)
+                .iter()
+                .chain([&r.name])
+                .any(|s| self.observed_at.get(s).is_some_and(|&v| int_at(v)))
+    }
+
     /// The law of a matched `distributions.ron` row with its pattern
     /// variables bound.
     fn law_from_row(
@@ -3934,7 +3995,7 @@ impl<'m> Emitter<'m> {
         name: &str,
         row: &'static tables::LawRow,
         pat: pattern::Pat,
-        binds: HashMap<String, pattern::Bound>,
+        mut binds: HashMap<String, pattern::Bound>,
         broadcast: bool,
     ) -> Result<Law> {
         match row.kind.as_str() {
@@ -3994,6 +4055,26 @@ impl<'m> Emitter<'m> {
                 );
             }
         }
+        // A real container argument (`real_container_args`) takes an integer
+        // array as `to_vector(…)` or `to_matrix(…)`, by its declared rank; a
+        // real one prints as it is, and is not printed here, so its data
+        // declarations keep their order.
+        for v in row.real_container_args.iter().filter(|v| *v != "y") {
+            // A per-element argument prints through `gather_at`, not whole.
+            let Some(&pattern::Bound::Node(n)) = binds.get(v) else {
+                continue;
+            };
+            let rank = expected.get(v).copied().unwrap_or(0);
+            if per.get(v).copied().unwrap_or(false) || !self.declared_int(n, rank) {
+                continue;
+            }
+            let to = if rank == 2 { "to_matrix" } else { "to_vector" };
+            let e = self.expr(n)?;
+            binds.insert(
+                v.clone(),
+                pattern::Bound::Expr(Ex::atom(format!("{to}({})", e.s))),
+            );
+        }
         let is_per = |v: &str| per.get(v).copied().unwrap_or(false);
         let scalar_variate = row.variate.starts_with("real") || row.variate.starts_with("int");
         // `{y}` is the variate, not a template variable: keep it through `fill`.
@@ -4048,15 +4129,21 @@ impl<'m> Emitter<'m> {
         let vector_per_element = per
             .iter()
             .any(|(v, &p)| p && expected.get(v).copied().unwrap_or(0) > 0);
-        // The normalized custom rows have overloads for scalar parameters
-        // only (a vector variate, scalar parameters).
+        // A normalized custom row has overloads for its declared parameter
+        // ranks only (a vector variate; scalars, or a regression GLM's design
+        // matrix and coefficient vector): an argument above its declared rank
+        // has none.
         if row.kind == "custom_lpdf"
             && row.normalized
-            && binds.values().any(|b| rank_of(self, b) > 0)
+            && let Some(v) = row.vars.iter().find(|v| {
+                binds
+                    .get(*v)
+                    .is_some_and(|b| rank_of(self, b) > expected.get(*v).copied().unwrap_or(0))
+            })
         {
             return Err(Refusal::not_yet(
                 Some(m),
-                format!("the law `{name}` with array parameters"),
+                format!("the law `{name}` broadcast over `{v}`"),
             ));
         }
         Ok(Law {
@@ -4083,7 +4170,11 @@ impl<'m> Emitter<'m> {
             unnormalized: !row.normalized,
             stan_name: row.stan.clone(),
             flatppl: row.flatppl.clone(),
-            custom: row.kind == "custom_lpdf",
+            vector_variate: row.real_container_args.iter().any(|a| a == "y"),
+            glm: row
+                .module
+                .as_deref()
+                .is_some_and(|m| m.split(' ').next() == Some("regression")),
             unchecked_support: row.unchecked_support,
             total_support: row.total_support,
             support_type: row

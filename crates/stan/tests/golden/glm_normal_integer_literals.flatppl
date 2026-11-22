@@ -1,0 +1,7 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+reg = standard_module("regression", "0.1")
+a ~ Normal(0, 1)
+beta ~ iid(Normal(0, 1), 2)
+y ~ reg.NormalGLM(rowstack([[1, 0], [0, 1], [1, 1]]), a, beta, 1)
+lp = logdensityof(lawof(record(a = a, beta = beta, y = y)), record(a = 1, beta = [1, 2], y = [1, 2, 5]))

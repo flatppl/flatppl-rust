@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+reg = standard_module("regression", "0.1")
+x = rowstack([[1.0, 0.5], [0.2, -0.3], [0.7, 1.1]])
+alpha ~ Normal(0, 1)
+beta ~ iid(Normal(0, 1), 2)
+sigma ~ Exponential(1)
+y ~ reg.NormalGLM(x, alpha, beta, sigma)
+prior = lawof(record(alpha = alpha, beta = beta, sigma = sigma))
+L = likelihoodof(kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma), record(y = [0.4, -1.2, 2.1]))
+post = bayesupdate(L, prior)
