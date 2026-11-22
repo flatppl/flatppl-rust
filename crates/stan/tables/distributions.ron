@@ -37,8 +37,13 @@
 //               tested against it, -inf outside. A BridgeStan probe outside the support of every
 //               bounded and constrained row found von_mises (bounds) and lkj_cholesky (unit row
 //               norms) only; the others throw or return -inf.
+//   real_container_args: optional; the template variables, and y for the variate, whose Stan argument
+//               is a real container (`vector` or `matrix`), not `reals`: an integer array declared
+//               there prints as to_vector(...) or to_matrix(...). A discrete variate stays an int array.
 //   functions:  Stan functions-block source the row needs ("" if none).
-//   status:     "verified" (verify.py PASS, Stan 2.40.0) | "unverified: <reason>" | "n/a".
+//   status:     "verified" (verify.py PASS, Stan 2.40.0) | "probed: <evidence>" (the emitted program
+//               matched an independent oracle under stanc and BridgeStan, not verify.py; `note` names
+//               the points) | "unverified: <reason>" (the emitter refuses the row) | "n/a".
 //   note:       caveats for the emitter.
 //
 // Template rules: substitute each {name} with an atomic Stan expression (identifier, literal,
@@ -66,6 +71,7 @@
      pattern: "GeneralizedNormal(mean, alpha, beta)", vars: ["mean", "alpha", "beta"], kind: "custom_lpdf",
      stan: "flatppl_generalized_normal", suffix: "lpdf", lhs: "{y}", args: "{mean}, {alpha}, {beta}", variate: "real",
      sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
+     real_container_args: ["y"],
      functions: "real flatppl_generalized_normal_lpdf(real x, real mu, real alpha, real beta) {
   return log(beta) - log2() - log(alpha) - lgamma(1 / beta) - pow(abs(x - mu) / alpha, beta);
 }
@@ -260,33 +266,91 @@ real flatppl_generalized_normal_lpdf(vector x, real mu, real alpha, real beta) {
     // ---------------------------------------------------------------- module regression 0.1
     (id: "bernoulli_logit_glm", flatppl: "BernoulliLogitGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta"],
      pattern: "BernoulliLogitGLM(x, alpha, beta)", vars: ["x", "alpha", "beta"], kind: "builtin",
-     stan: "bernoulli_logit_glm", suffix: "lpmf", lhs: "{y}", args: "to_matrix({x}'), {alpha}, {beta}", variate: "int<lower=0, upper=1>",
-     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", functions: "", status: "verified",
-     note: "Single observation: x (vector) becomes a 1-row matrix. iid observations: y array[N] int, x matrix[N, k] with one row per observation. Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
+     stan: "bernoulli_logit_glm", suffix: "lpmf", lhs: "{y}", args: "{x}, {alpha}, {beta}", variate: "int<lower=0, upper=1>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", real_container_args: ["x", "beta"], functions: "",
+     status: "probed: BridgeStan vs an independent oracle",
+     note: "§09 x is the N x k design matrix, one row per observation, as Stan's x; y array[N] int. Evidence: stanc 2.39 and BridgeStan 2.9.0 lp (propto=false) vs scipy bernoulli at two points, a finite gradient."),
     (id: "binomial_logit_glm", flatppl: "BinomialLogitGLM", module: Some("regression 0.1"), params: ["x", "n", "alpha", "beta"],
      pattern: "BinomialLogitGLM(x, n, alpha, beta)", vars: ["x", "n", "alpha", "beta"], kind: "builtin",
-     stan: "binomial_logit_glm", suffix: "lpmf", lhs: "{y}", args: "{n}, to_matrix({x}'), {alpha}, {beta}", variate: "int<lower=0>",
-     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", functions: "", status: "verified",
-     note: "Argument order: Stan puts n before x. Available since Stan 2.34. Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
+     stan: "binomial_logit_glm", suffix: "lpmf", lhs: "{y}", args: "{n}, {x}, {alpha}, {beta}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", real_container_args: ["x", "beta"], functions: "",
+     status: "probed: BridgeStan vs an independent oracle",
+     note: "Argument order: Stan puts n before x. Available since Stan 2.34. §09 x is the N x k design matrix, as Stan's x. Evidence: stanc 2.39 and BridgeStan 2.9.0 lp (propto=false) vs scipy binom at two points, a finite gradient."),
     (id: "categorical_logit_glm", flatppl: "CategoricalLogitGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta"],
      pattern: "CategoricalLogitGLM(x, alpha, beta)", vars: ["x", "alpha", "beta"], kind: "builtin",
-     stan: "categorical_logit_glm", suffix: "lpmf", lhs: "{y}", args: "{x}', {alpha}, {beta}", variate: "int<lower=1, upper={n}>",
-     sizes: [("n", "lengthof(alpha)")], vectorized: true, lcdf: false, normalized: true, guard: "", functions: "", status: "verified",
-     note: "beta is k x n (features x classes) in both languages. Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace {x}' by {x} in args."),
+     stan: "categorical_logit_glm", suffix: "lpmf", lhs: "{y}", args: "{x}, {alpha}, {beta}", variate: "int<lower=1, upper={n}>",
+     sizes: [("n", "lengthof(alpha)")], vectorized: true, lcdf: false, normalized: true, guard: "", real_container_args: ["x", "alpha", "beta"], functions: "",
+     status: "probed: BridgeStan vs an independent oracle",
+     note: "beta is k x n (features x classes) in both languages; x is the N x k design matrix. Evidence: stanc 2.39 and BridgeStan 2.9.0 lp (propto=false) vs a closed-form softmax oracle at two points, with a real and an integer alpha, a finite gradient."),
     (id: "normal_glm", flatppl: "NormalGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta", "sigma"],
      pattern: "NormalGLM(x, alpha, beta, sigma)", vars: ["x", "alpha", "beta", "sigma"], kind: "builtin",
-     stan: "normal_id_glm", suffix: "lpdf", lhs: "{y}", args: "to_matrix({x}'), {alpha}, {beta}, {sigma}", variate: "real",
-     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", functions: "", status: "verified", note: "Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
+     stan: "normal_id_glm", suffix: "lpdf", lhs: "{y}", args: "{x}, {alpha}, {beta}, {sigma}", variate: "real",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", real_container_args: ["y", "x", "beta"], functions: "",
+     status: "probed: BridgeStan vs an independent oracle",
+     note: "§09 x is the N x k design matrix, as Stan's x. Evidence: stanc 2.39 and BridgeStan 2.9.0 lp (propto=false) vs scipy norm at two points, with integer y, integer literal x, a and beta, and a broadcast over rows, a finite gradient."),
     (id: "poisson_log_glm", flatppl: "PoissonLogGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta"],
      pattern: "PoissonLogGLM(x, alpha, beta)", vars: ["x", "alpha", "beta"], kind: "builtin",
-     stan: "poisson_log_glm", suffix: "lpmf", lhs: "{y}", args: "to_matrix({x}'), {alpha}, {beta}", variate: "int<lower=0>",
-     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", functions: "", status: "verified", note: "Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
+     stan: "poisson_log_glm", suffix: "lpmf", lhs: "{y}", args: "{x}, {alpha}, {beta}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", real_container_args: ["x", "beta"], functions: "",
+     status: "probed: BridgeStan vs an independent oracle",
+     note: "§09 x is the N x k design matrix, as Stan's x. Evidence: stanc 2.39 and BridgeStan 2.9.0 lp (propto=false) vs scipy poisson at two points, with a real and an integer x, a finite gradient."),
+    (id: "neg_binomial_2_log_glm", flatppl: "NegativeBinomial2LogGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta", "psi"],
+     pattern: "NegativeBinomial2LogGLM(x, alpha, beta, psi)", vars: ["x", "alpha", "beta", "psi"], kind: "builtin",
+     stan: "neg_binomial_2_log_glm", suffix: "lpmf", lhs: "{y}", args: "{x}, {alpha}, {beta}, {psi}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", real_container_args: ["x", "beta"], functions: "",
+     status: "probed: BridgeStan vs an independent oracle",
+     note: "psi is Stan's phi, as for NegativeBinomial2. §09 x is the N x k design matrix, as Stan's x. Evidence: stanc 2.39 and BridgeStan 2.9.0 lp (propto=false) vs scipy nbinom at two points, y = 0 and alpha = +-40, a finite gradient."),
+    (id: "student_t_glm", flatppl: "StudentTGLM", module: Some("regression 0.1"), params: ["x", "nu", "alpha", "beta", "sigma"],
+     pattern: "StudentTGLM(x, nu, alpha, beta, sigma)", vars: ["x", "nu", "alpha", "beta", "sigma"], kind: "composition",
+     stan: "student_t", suffix: "lpdf", lhs: "{y}", args: "{nu}, {alpha} + {x} * {beta}, {sigma}", variate: "real",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", real_container_args: ["x", "beta"], functions: "",
+     status: "probed: BridgeStan vs an independent oracle",
+     note: "Stan has no Student t GLM; §09 defines it as locscale.(StudentT(nu), alpha .+ x * beta, sigma). Evidence: stanc 2.39 and BridgeStan 2.9.0 lp (propto=false) vs scipy t at two points, a finite gradient."),
+    (id: "gamma_log_glm", flatppl: "GammaLogGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta", "shape"],
+     pattern: "GammaLogGLM(x, alpha, beta, shape)", vars: ["x", "alpha", "beta", "shape"], kind: "custom_lpdf",
+     stan: "flatppl_gamma_log_glm", suffix: "lpdf", lhs: "{y}", args: "{x}, {alpha}, {beta}, {shape}", variate: "real<lower=0>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", total_support: true,
+     real_container_args: ["y", "x", "beta"],
+     functions: "real flatppl_gamma_log_glm_lpdf(vector y, matrix x, real alpha, vector beta, real shape) {
+  // Gamma(shape, shape * exp(-eta)) in link scale: log rate = log(shape) - eta. lmultiply(0, 0) = 0
+  // gives the right-hand limit at y = 0 for shape = 1; shape < 1 and shape > 1 give +inf and -inf.
+  if (min(y) < 0) return negative_infinity();
+  vector[rows(x)] eta = alpha + x * beta;
+  return rows(x) * (shape * log(shape) - lgamma(shape)) - shape * sum(eta)
+         + sum(lmultiply(shape - 1, y)) - shape * dot_product(exp(-eta), y);
+}",
+     status: "probed: BridgeStan vs an independent oracle",
+     note: "Stan has no Gamma GLM, and gamma_lpdf throws at y = 0, where §09 takes the right-hand limit. Evidence: stanc 2.39 and BridgeStan 2.9.0 lp (propto=false) vs scipy gamma at two points, the y = 0 limits for shape 0.5, 1 and 2, -inf for y < 0, a finite gradient."),
+    (id: "ordered_logistic_glm", flatppl: "OrderedLogitGLM", module: Some("regression 0.1"), params: ["x", "beta", "cutpoints"],
+     pattern: "OrderedLogitGLM(x, beta, cutpoints)", vars: ["x", "beta", "cutpoints"], kind: "builtin",
+     stan: "ordered_logistic_glm", suffix: "lpmf", lhs: "{y}", args: "{x}, {beta}, {cutpoints}", variate: "int<lower=1, upper={n}>",
+     sizes: [("n", "lengthof(cutpoints) + 1")], vectorized: true, lcdf: false, normalized: true, guard: "", real_container_args: ["x", "beta", "cutpoints"], functions: "",
+     status: "probed: BridgeStan vs an independent oracle",
+     note: "No intercept in either language: eta = x * beta. §09 x is the N x k design matrix, as Stan's x. Evidence: stanc 2.39 and BridgeStan 2.9.0 lp (propto=false) vs a closed-form logistic oracle at two points and eta = +-40, a finite gradient."),
+    (id: "beta_logit_glm", flatppl: "BetaLogitGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta", "precision"],
+     pattern: "BetaLogitGLM(x, alpha, beta, precision)", vars: ["x", "alpha", "beta", "precision"], kind: "custom_lpdf",
+     stan: "flatppl_beta_logit_glm", suffix: "lpdf", lhs: "{y}", args: "{x}, {alpha}, {beta}, {precision}", variate: "real<lower=0, upper=1>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", total_support: true,
+     real_container_args: ["y", "x", "beta"],
+     functions: "real flatppl_beta_logit_glm_lpdf(vector y, matrix x, real alpha, vector beta, real precision) {
+  // Beta(precision * invlogit(eta), precision * invlogit(-eta)): each shape keeps its digits in its own
+  // tail. lmultiply(0, 0) = 0 gives the limit at y = 0 or 1 for a shape of 1; a shape below or above 1
+  // gives +inf or -inf there.
+  if (min(y) < 0 || max(y) > 1) return negative_infinity();
+  vector[rows(x)] eta = alpha + x * beta;
+  vector[rows(x)] a = precision * inv_logit(eta);
+  vector[rows(x)] b = precision * inv_logit(-eta);
+  return sum(lmultiply(a - 1, y) + lmultiply(b - 1, 1 - y) - lbeta(a, b));
+}",
+     status: "probed: BridgeStan vs an independent oracle",
+     note: "Stan has no Beta GLM; beta_proportion gives NaN at y = 0 or 1 for a shape of 1 and loses the second shape for large eta. Evidence: stanc 2.39 and BridgeStan 2.9.0 lp (propto=false) vs scipy beta at two points, the y = 0 and 1 limits, -inf below 0 and above 1, a finite gradient."),
 
     // ---------------------------------------------------------------- module particle-physics 0.1
     (id: "continued_poisson", flatppl: "ContinuedPoisson", module: Some("particle-physics 0.1"), params: ["rate"],
      pattern: "ContinuedPoisson(rate)", vars: ["rate"], kind: "custom_lpdf",
      stan: "flatppl_continued_poisson", suffix: "lpdf", lhs: "{y}", args: "{rate}", variate: "real",
      sizes: [], vectorized: true, lcdf: false, normalized: false, guard: "",
+     real_container_args: ["y"],
      functions: "real flatppl_continued_poisson_lpdf(real x, real rate) {
   if (x < 0) return negative_infinity();
   return lmultiply(x, rate) - rate - lgamma(x + 1);
@@ -305,6 +369,7 @@ real flatppl_continued_poisson_lpdf(vector x, real rate) {
      pattern: "CrystalBall(m0, sigma, alpha, n)", vars: ["m0", "sigma", "alpha", "n"], kind: "custom_lpdf",
      stan: "flatppl_crystal_ball", suffix: "lpdf", lhs: "{y}", args: "{m0}, {sigma}, {alpha}, {n}", variate: "real",
      sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
+     real_container_args: ["y"],
      functions: "real flatppl_crystal_ball_lpdf(real x, real m0, real sigma, real alpha, real n) {
   real a = abs(alpha);
   real t = (x - m0) / sigma;
@@ -334,6 +399,7 @@ real flatppl_crystal_ball_lpdf(vector x, real m0, real sigma, real alpha, real n
      stan: "flatppl_double_sided_crystal_ball", suffix: "lpdf", lhs: "{y}",
      args: "{m0}, {sigmaL}, {sigmaR}, {alphaL}, {alphaR}, {nL}, {nR}", variate: "real",
      sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
+     real_container_args: ["y"],
      functions: "real flatppl_double_sided_crystal_ball_lpdf(real x, real m0, real sigmaL, real sigmaR,
                                               real alphaL, real alphaR, real nL, real nR) {
   real aL = abs(alphaL);
@@ -378,6 +444,7 @@ real flatppl_double_sided_crystal_ball_lpdf(vector x, real m0, real sigmaL, real
      pattern: "Argus(resonance, slope, power)", vars: ["resonance", "slope", "power"], kind: "custom_lpdf",
      stan: "flatppl_argus", suffix: "lpdf", lhs: "{y}", args: "{resonance}, {slope}, {power}", variate: "real<lower=0, upper={resonance}>",
      sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", total_support: true,
+     real_container_args: ["y"],
      functions: "real flatppl_argus_lpdf(real x, real m0, real c, real p) {
   if (x <= 0 || x >= m0) return negative_infinity();
   real u = 1 - square(x / m0);
@@ -421,6 +488,7 @@ real flatppl_argus_lpdf(vector x, real m0, real c, real p) {
      pattern: "RelativisticBreitWigner(mean, width)", vars: ["mean", "width"], kind: "custom_lpdf",
      stan: "flatppl_relativistic_breit_wigner", suffix: "lpdf", lhs: "{y}", args: "{mean}, {width}", variate: "real<lower=0>",
      sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "", total_support: true,
+     real_container_args: ["y"],
      functions: "real flatppl_relativistic_breit_wigner_lpdf(real x, real m, real w) {
   if (x <= 0) return negative_infinity();
   real g = sqrt(square(m) * (square(m) + square(w)));
@@ -438,6 +506,7 @@ real flatppl_relativistic_breit_wigner_lpdf(vector x, real m, real w) {
      pattern: "BifurcatedNormal(mean, sigmaL, sigmaR)", vars: ["mean", "sigmaL", "sigmaR"], kind: "custom_lpdf",
      stan: "flatppl_bifurcated_normal", suffix: "lpdf", lhs: "{y}", args: "{mean}, {sigmaL}, {sigmaR}", variate: "real",
      sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
+     real_container_args: ["y"],
      functions: "real flatppl_bifurcated_normal_lpdf(real x, real mu, real sigmaL, real sigmaR) {
   real s = x < mu ? sigmaL : sigmaR;
   return 0.5 * log(2 / pi()) - log(sigmaL + sigmaR) - 0.5 * square((x - mu) / s);

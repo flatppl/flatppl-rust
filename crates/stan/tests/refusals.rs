@@ -1418,7 +1418,53 @@ fn custom_density_with_array_parameters_is_not_yet() {
         None,
     );
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("array parameters"), "{r}");
+    assert!(
+        r.reason
+            .contains("the law `CrystalBall` broadcast over `m0`"),
+        "{r}"
+    );
+}
+
+/// A GLM custom row has no overload for an argument above its declared rank.
+#[test]
+fn custom_glm_broadcast_is_not_yet() {
+    let r = refuse_with(
+        "reg = standard_module(\"regression\", \"0.1\")\n\
+         x = rowstack([[1.0, 0.5], [0.2, -0.3], [0.7, 1.1]])\n\
+         a ~ iid(Normal(0, 1), 2)\nbeta ~ iid(Normal(0, 1), 2)\n\
+         y ~ reg.GammaLogGLM.([x, x], a, [beta, beta], 2.0)\n\
+         L = likelihoodof(kernelof(record(y = y), a = a, beta = beta), \
+         record(y = [[0.5, 1.3, 2.2], [0.5, 1.3, 2.2]]))\n\
+         post = bayesupdate(L, lawof(record(a = a, beta = beta)))\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("the law `GammaLogGLM` broadcast over `x`"),
+        "{r}"
+    );
+}
+
+/// An iid of a GLM would flatten the response matrix into one GLM call.
+#[test]
+fn iid_of_a_glm_is_not_yet() {
+    let r = refuse_with(
+        "reg = standard_module(\"regression\", \"0.1\")\n\
+         x = rowstack([[1.0, 0.5], [0.2, -0.3], [0.7, 1.1]])\n\
+         beta ~ iid(Normal(0, 1), 2)\n\
+         y ~ iid(reg.NormalGLM(x, 0.0, beta, 1.0), 2)\n\
+         L = likelihoodof(kernelof(record(y = y), beta = beta), \
+         record(y = [[0.0, 1.0, 2.0], [1.0, 0.0, 3.0]]))\n\
+         post = bayesupdate(L, lawof(record(beta = beta)))\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("an iid of the regression law `NormalGLM`"),
+        "{r}"
+    );
 }
 
 #[test]

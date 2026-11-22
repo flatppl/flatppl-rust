@@ -213,6 +213,9 @@ pub(crate) struct Emitter<'m> {
     abi_target: bool,
     /// Stan name → its declaration.
     decls: HashMap<String, StanType>,
+    /// Each observed draw → its observed value, the node its data name is
+    /// declared from, filled before any observation's statement.
+    observed_at: HashMap<Symbol, NodeId>,
     /// Kernel inputs inside the prior, bound by name to prior fields.
     links: Vec<(Symbol, Symbol)>,
     /// Derived prior fields `v = f(x)` of one draw x, by f(x)'s node: the
@@ -447,6 +450,7 @@ impl<'m> Emitter<'m> {
             relies_on_bounds: false,
             abi_target: false,
             decls: HashMap::new(),
+            observed_at: HashMap::new(),
             links: vec![],
             derived: HashMap::new(),
             functions: vec![],
