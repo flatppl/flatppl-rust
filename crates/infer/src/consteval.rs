@@ -25,7 +25,7 @@
 //! diagnostic at the demand site, never a silent `%dynamic`. `Dynamic` dominates
 //! `Gap`: a value that is dynamic anyway is not worth nagging about.
 
-use std::collections::HashSet;
+use std::{cmp::Ordering, collections::HashSet};
 
 use flatppl_core::query::promoted_input_names;
 use flatppl_core::{
@@ -559,7 +559,7 @@ impl Filter<'_, '_, '_> {
                 .map(|&a| {
                     let value = self.number(a, None, depth + 1)?;
                     if real {
-                        Some(FixedValue::Real(exact_real(&value)?))
+                        Some(FixedValue::Real(as_real(&value)?))
                     } else {
                         Some(value)
                     }
@@ -821,8 +821,8 @@ impl Filter<'_, '_, '_> {
             return None;
         };
         Some((
-            exact_real(&self.number(lo, None, depth + 1)?)?,
-            exact_real(&self.number(hi, None, depth + 1)?)?,
+            as_real(&self.number(lo, None, depth + 1)?)?,
+            as_real(&self.number(hi, None, depth + 1)?)?,
         ))
     }
 
@@ -852,9 +852,12 @@ impl Filter<'_, '_, '_> {
                 Some(value)
             }
             ("in", [a, set]) => {
-                let x = exact_real(&self.number(*a, Some(param), depth + 1)?)?;
+                let x = as_real(&self.number(*a, Some(param), depth + 1)?)?;
                 let (lo, hi) = self.interval(*set, depth + 1)?;
-                Some(lo <= x && x <= hi)
+                Some(
+                    shared_real_comparison(lo, x, Ordering::is_le)?
+                        && shared_real_comparison(x, hi, Ordering::is_le)?,
+                )
             }
             (cmp @ ("lt" | "le" | "gt" | "ge" | "equal" | "unequal"), [a, b]) => {
                 let lhs = self.number(*a, Some(param), depth + 1)?;
@@ -882,37 +885,46 @@ fn scalar_number(value: Scalar) -> Option<FixedValue> {
 }
 
 fn fixed_comparison(op: &str, lhs: &FixedValue, rhs: &FixedValue) -> Option<bool> {
-    let order = match (lhs, rhs) {
-        (FixedValue::Int(a), FixedValue::Int(b)) => Some(a.cmp(b)),
-        _ if matches!(op, "equal" | "unequal") => return None,
-        _ => exact_real(lhs)?.partial_cmp(&exact_real(rhs)?),
-    };
-    Some(match op {
-        "lt" => order.is_some_and(|o| o.is_lt()),
-        "le" => order.is_some_and(|o| o.is_le()),
-        "gt" => order.is_some_and(|o| o.is_gt()),
-        "ge" => order.is_some_and(|o| o.is_ge()),
-        "equal" => order.is_some_and(|o| o.is_eq()),
-        "unequal" => !order.is_some_and(|o| o.is_eq()),
+    let test = match op {
+        "lt" => Ordering::is_lt,
+        "le" => Ordering::is_le,
+        "gt" => Ordering::is_gt,
+        "ge" => Ordering::is_ge,
+        "equal" => Ordering::is_eq,
+        "unequal" => Ordering::is_ne,
         _ => return None,
-    })
+    };
+    match (lhs, rhs) {
+        (FixedValue::Int(a), FixedValue::Int(b)) => Some(test(a.cmp(b))),
+        _ if matches!(op, "equal" | "unequal") => None,
+        _ => shared_real_comparison(as_real(lhs)?, as_real(rhs)?, test),
+    }
 }
 
 fn exact_filter_int(value: i64) -> Option<FixedValue> {
     i32::try_from(value).ok().map(|_| FixedValue::Int(value))
 }
 
-// Shape inference runs before a target precision is selected. A real
-// comparison only proves a mask element if its operands survive conversion
-// to f32 exactly. Decline subnormals as targets may flush them to zero.
-fn exact_real(value: &FixedValue) -> Option<f64> {
-    let real = match value {
-        FixedValue::Int(x) => *x as f64,
-        FixedValue::Real(x) => *x,
-        FixedValue::Vec(_) => return None,
-    };
-    let narrow = real as f32;
-    (f64::from(narrow) == real && (narrow.is_normal() || narrow == 0.0)).then_some(real)
+fn as_real(value: &FixedValue) -> Option<f64> {
+    match value {
+        FixedValue::Int(x) => Some(*x as f64),
+        FixedValue::Real(x) => Some(*x),
+        FixedValue::Vec(_) => None,
+    }
+}
+
+// Shape inference runs before a target precision is selected. Both supported
+// precisions must prove the same result for each real comparison. Decline
+// subnormals and underflow since a backend can flush subnormals to zero.
+fn shared_real_comparison(lhs: f64, rhs: f64, test: fn(Ordering) -> bool) -> Option<bool> {
+    fn narrow(value: f64) -> Option<f32> {
+        let rounded = value as f32;
+        (rounded.is_normal() || value == 0.0).then_some(rounded)
+    }
+
+    let wide = test(lhs.partial_cmp(&rhs)?);
+    let narrow = test(narrow(lhs)?.partial_cmp(&narrow(rhs)?)?);
+    (wide == narrow).then_some(wide)
 }
 
 fn is_builtin(inf: &Inferencer<'_, '_>, c: &Call, name: &str) -> bool {

@@ -1433,6 +1433,15 @@ fn fixed_filter_leaves_precision_dependent_lengths_dynamic() {
 }
 
 #[test]
+fn fixed_filter_leaves_precision_dependent_interval_membership_dynamic() {
+    let out = ir("kept = filter(x -> x in interval(1.0, 2.0), [0.99999999, 1.5, 3.0])");
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (%dynamic) (%scalar real))"),
+        "{out}"
+    );
+}
+
+#[test]
 fn fixed_filter_does_not_prove_masks_with_narrow_integer_overflow() {
     let out = ir("kept = filter(i -> i * 1073741824 > 0, [1, 2, 3])");
     assert!(
