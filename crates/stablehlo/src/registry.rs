@@ -2424,6 +2424,22 @@ pub(crate) fn horner(e: &mut Emitter, t: &Value, coeffs: &[f64]) -> Value {
 fn binary_logit_terms(e: &mut Emitter, z: &Value) -> (Value, Value) {
     let magnitude = e.abs(z);
     let log_odds = e.neg(&magnitude);
+    if e.target() == crate::Target::Cpu && matches!(e.dtype(), Dtype::F64) {
+        // x = exp(-|z|) lies in [0, 1]. Correct the rounding in 1+x before
+        // using the vectorizable CPU log: log1p(x) = log(u) + log1p(error/u).
+        // |error/u| <= eps, so replacing its log1p by error/u loses O(eps^2).
+        // Keep u rounded; algebraic cancellation would discard small tails.
+        let x = e.exp(&log_odds);
+        let one = e.scalar(1.0);
+        let sum = e.add(&one, &x);
+        let sum = e.unary("stablehlo.optimization_barrier", &sum);
+        let increment = e.sub(&sum, &one);
+        let error = e.sub(&x, &increment);
+        let correction = e.div(&error, &sum);
+        let logarithm = e.log(&sum);
+        let common = e.add(&logarithm, &correction);
+        return (e.neg(&common), log_odds);
+    }
     let small = e.invlogit(&log_odds);
     let minus_small = e.neg(&small);
     (e.log1p(&minus_small), log_odds)
