@@ -191,6 +191,17 @@ fn aliased_fixed_input() {
     }
 }
 
+#[test]
+fn target_optimisation_preserves_promoted_fixed_inputs() {
+    let source = "raw = rowstack([[1.0]])\npromoted = transpose(transpose(raw))\n\
+                  inputs = (raw, promoted)\noutputs = (transpose(promoted), raw)\n";
+    for emit in [emit_flatpdl, emit_model] {
+        let hlo = emit(source);
+        assert!(!hlo.contains("stablehlo.transpose"), "{hlo}");
+        assert!(hlo.contains("return %arg1, %arg0"), "{hlo}");
+    }
+}
+
 /// An alias and its target are one object, so listing both is listing one
 /// binding twice.
 #[test]

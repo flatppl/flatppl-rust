@@ -1,0 +1,24 @@
+; Opaque nodes retain their FlatPDL identity. Real literals carry their IEEE bits.
+(datatype Expr
+  (Leaf i64)
+  (Boolean bool)
+  (Integer i64)
+  (Real i64)
+  (U String Expr)
+  (B String Expr Expr)
+  (T String Expr Expr Expr))
+
+; A type id denotes the complete concrete FlatPPL type, including orientation
+; and array layers. Erasing an expression must preserve errors and pullbacks.
+(relation type-id (Expr i64))
+(relation bool-value (Expr))
+(relation int-value (Expr))
+(relation real-value (Expr))
+(relation real-vector (Expr i64))
+(relation real-matrix (Expr i64 i64))
+(relation erasable (Expr))
+
+(ruleset analysis)
+(rule ((= x (Boolean b))) ((bool-value x) (erasable x)) :ruleset analysis)
+(rule ((= x (Integer i))) ((int-value x)) :ruleset analysis)
+(rule ((= x (Real bits))) ((real-value x) (erasable x)) :ruleset analysis)

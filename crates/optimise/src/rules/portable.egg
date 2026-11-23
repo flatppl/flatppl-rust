@@ -1,0 +1,194 @@
+(ruleset portable)
+
+; FlatPPL §06: a closed probability measure has unit mass. Scoring and
+; measuring its mass can use the base directly. Leave the measure graph
+; itself intact so sampling retains the authored RNG path.
+(relation portable-normalized (Expr))
+(relation portable-unit-normalization (Expr Expr))
+(rule ((= e (U "normalize" m)) (portable-normalized m) (type-id e ty) (type-id m ty))
+      ((portable-unit-normalization e m)) :ruleset portable)
+(relation portable-density-head (String))
+(portable-density-head "logdensityof")
+(portable-density-head "densityof")
+(rule ((= e (B head normalized x)) (portable-density-head head)
+       (portable-unit-normalization normalized m))
+      ((union e (B head m x))) :ruleset portable)
+(rule ((= e (U "totalmass" normalized)) (portable-unit-normalization normalized m))
+      ((union e (U "totalmass" m))) :ruleset portable)
+
+; Reification discovers inputs by following ancestors. Only fixed total
+; expressions may disappear altogether, even when their value is unused.
+(relation portable-discardable (Expr))
+(rule ((= e (Boolean value))) ((portable-discardable e)) :ruleset portable)
+(rule ((= e (Integer value))) ((portable-discardable e)) :ruleset portable)
+(rule ((= e (Real bits))) ((portable-discardable e)) :ruleset portable)
+(rule ((= e (U "vector" a)) (real-vector e 1) (portable-discardable a))
+      ((portable-discardable e)) :ruleset portable)
+(rule ((= e (B "vector" a b)) (real-vector e 2)
+       (portable-discardable a) (portable-discardable b))
+      ((portable-discardable e)) :ruleset portable)
+(rule ((= e (T "vector" a b c)) (real-vector e 3)
+       (portable-discardable a) (portable-discardable b) (portable-discardable c))
+      ((portable-discardable e)) :ruleset portable)
+
+(rule ((= e (U "identity" x)) (type-id e ty) (type-id x ty))
+      ((union e x)) :ruleset portable)
+
+; FlatPPL §07: these maps are permutations on the proved real shapes.
+; Transpose and adjoint coincide on reals, with no arithmetic on entries.
+(relation portable-transpose-head (String))
+(portable-transpose-head "transpose")
+(portable-transpose-head "adjoint")
+(relation portable-transposable (Expr))
+(rule ((real-vector x n)) ((portable-transposable x)) :ruleset portable)
+(rule ((real-matrix x rows cols)) ((portable-transposable x)) :ruleset portable)
+(rule ((= e (U outer (U inner x))) (portable-transpose-head outer)
+       (portable-transpose-head inner) (portable-transposable x)
+       (type-id e ty) (type-id x ty))
+      ((union e x)) :ruleset portable)
+
+(relation portable-reverse (Expr Expr i64))
+(rule ((= e (U "reverse" x)) (real-vector x n) (type-id e ty) (type-id x ty))
+      ((portable-reverse e x n)) :ruleset portable)
+(rule ((portable-reverse e x n) (<= n 1)) ((union e x)) :ruleset portable)
+(rule ((portable-reverse e rev n) (portable-reverse rev x n))
+      ((union e x)) :ruleset portable)
+
+; Reflect a written selector only inside the proved bounds. Keep the
+; original index base and stay within the common signed 32-bit range.
+(relation portable-index-base (String i64))
+(portable-index-base "get" 1)
+(portable-index-base "get0" 0)
+
+; A scalar slice of a real transpose/adjoint reads the corresponding source
+; cell. Exclusivity is measured on the original query, including opaque uses.
+(relation portable-exclusive-transposed-cell (Expr Expr Expr))
+(rule ((portable-exclusive-transposed-cell e t a)
+       (= e (T op t (Integer i) (Integer j))) (portable-index-base op base)
+       (= t (U tr a)) (portable-transpose-head tr)
+       (real-matrix a rows cols) (real-matrix t cols rows) (real-value e)
+       (>= i base) (< i (+ cols base)) (<= i 2147483647)
+       (>= j base) (< j (+ rows base)) (<= j 2147483647))
+      ((union e (T op a (Integer j) (Integer i)))) :ruleset portable)
+
+(rule ((= e (B head rev (Integer k))) (portable-index-base head base)
+       (portable-reverse rev x n) (real-value e)
+       (<= n 2147483647) (>= k base) (< k (+ n base)))
+      ((union e (B head x (Integer (- (+ n (+ base base)) (+ k 1))))))
+      :ruleset portable)
+
+; Project a constructor cell only if removing its siblings preserves the
+; graph and the selected cell already has the result's type.
+(relation portable-vector-cell (Expr i64 Expr))
+(rule ((= v (U "vector" x)) (real-vector v 1))
+      ((portable-vector-cell v 0 x)) :ruleset portable)
+(rule ((= v (B "vector" x y)) (real-vector v 2) (portable-discardable y))
+      ((portable-vector-cell v 0 x)) :ruleset portable)
+(rule ((= v (B "vector" x y)) (real-vector v 2) (portable-discardable x))
+      ((portable-vector-cell v 1 y)) :ruleset portable)
+(rule ((= e (B head v (Integer k))) (portable-index-base head base)
+       (portable-vector-cell v position x) (= k (+ position base))
+       (type-id e ty) (type-id x ty))
+      ((union e x)) :ruleset portable)
+
+(rule ((= e (U "lengthof" x)) (real-vector x n) (int-value e)
+       (portable-discardable x) (<= n 2147483647))
+      ((union e (Integer n))) :ruleset portable)
+
+; Boolean identities keep the nonliteral operand, including its ancestry.
+(rewrite (U "lnot" (U "lnot" p)) p :when ((bool-value p)) :ruleset portable)
+(rewrite (U "lnot" (Boolean true)) (Boolean false) :ruleset portable)
+(rewrite (U "lnot" (Boolean false)) (Boolean true) :ruleset portable)
+
+(relation portable-bool-identity (String bool))
+(portable-bool-identity "land" true)
+(portable-bool-identity "lor" false)
+(portable-bool-identity "lxor" false)
+(portable-bool-identity "equal" true)
+(portable-bool-identity "unequal" false)
+(rewrite (B head p (Boolean c)) p
+  :when ((portable-bool-identity head c) (bool-value p)) :ruleset portable)
+(rewrite (B head (Boolean c) p) p
+  :when ((portable-bool-identity head c) (bool-value p)) :ruleset portable)
+
+(relation portable-bool-absorber (String bool))
+(portable-bool-absorber "land" false)
+(portable-bool-absorber "lor" true)
+(rewrite (B head p (Boolean c)) (Boolean c)
+  :when ((portable-bool-absorber head c) (bool-value p) (portable-discardable p))
+  :ruleset portable)
+(rewrite (B head (Boolean c) p) (Boolean c)
+  :when ((portable-bool-absorber head c) (bool-value p) (portable-discardable p))
+  :ruleset portable)
+(rule ((= e (B head p (U "lnot" p))) (portable-bool-absorber head c)
+       (bool-value p) (portable-discardable p))
+      ((union e (Boolean c))) :ruleset portable)
+(rule ((= e (B head (U "lnot" p) p)) (portable-bool-absorber head c)
+       (bool-value p) (portable-discardable p))
+      ((union e (Boolean c))) :ruleset portable)
+
+; Bounds on the same integer imply one another. Dropping the looser or
+; tighter comparison still evaluates the shared input and its ancestors.
+(relation portable-flipped-order (String String))
+(portable-flipped-order "lt" "gt")
+(portable-flipped-order "le" "ge")
+(portable-flipped-order "gt" "lt")
+(portable-flipped-order "ge" "le")
+
+(relation portable-cutoff (Expr String Expr i64))
+(rule ((= p (B op x (Integer n))) (portable-flipped-order op flipped)
+       (bool-value p) (int-value x) (>= n -2147483648) (<= n 2147483647))
+      ((portable-cutoff p op x n)) :ruleset portable)
+(rule ((= p (B op (Integer n) x)) (portable-flipped-order op flipped)
+       (bool-value p) (int-value x) (>= n -2147483648) (<= n 2147483647))
+      ((portable-cutoff p flipped x n)) :ruleset portable)
+
+; Strict and weak tests describe the same half-line after moving an integer
+; endpoint by one. Only combine spellings where adjacent input thresholds
+; remain distinct even on a backend that widens an integer operand to f32.
+(relation portable-inclusive-cut (String String i64))
+(portable-inclusive-cut "lt" "upper" -1)
+(portable-inclusive-cut "le" "upper" 0)
+(portable-inclusive-cut "gt" "lower" 1)
+(portable-inclusive-cut "ge" "lower" 0)
+(rule ((portable-cutoff p op x n) (portable-inclusive-cut op side offset)
+       (>= n -16777216) (<= n 16777216))
+      ((portable-cutoff p side x (+ n offset))) :ruleset portable)
+
+(relation portable-bound-choice (String String bool))
+(portable-bound-choice "land" "lt" true)
+(portable-bound-choice "land" "le" true)
+(portable-bound-choice "land" "gt" false)
+(portable-bound-choice "land" "ge" false)
+(portable-bound-choice "lor" "lt" false)
+(portable-bound-choice "lor" "le" false)
+(portable-bound-choice "lor" "gt" true)
+(portable-bound-choice "lor" "ge" true)
+(portable-bound-choice "land" "upper" true)
+(portable-bound-choice "land" "lower" false)
+(portable-bound-choice "lor" "upper" false)
+(portable-bound-choice "lor" "lower" true)
+(relation portable-compared-bounds (Expr String Expr Expr))
+(rule ((= e (B op p q)) (portable-bool-absorber op c))
+      ((portable-compared-bounds e op p q) (portable-compared-bounds e op q p))
+      :ruleset portable)
+(rule ((portable-compared-bounds e op p q) (portable-bound-choice op cmp true)
+       (portable-cutoff p cmp x a) (portable-cutoff q cmp x b) (<= a b))
+      ((union e p)) :ruleset portable)
+(rule ((portable-compared-bounds e op p q) (portable-bound-choice op cmp false)
+       (portable-cutoff p cmp x a) (portable-cutoff q cmp x b) (<= a b))
+      ((union e q)) :ruleset portable)
+
+(rewrite (T "ifelse" p (Boolean true) (Boolean false)) p
+  :when ((bool-value p)) :ruleset portable)
+(rewrite (T "ifelse" p (Boolean false) (Boolean true)) (U "lnot" p)
+  :when ((bool-value p)) :ruleset portable)
+(rule ((= e (T "ifelse" (Boolean true) a b))
+       (type-id e ty) (type-id a ty) (type-id b ty) (portable-discardable b))
+      ((union e a)) :ruleset portable)
+(rule ((= e (T "ifelse" (Boolean false) a b))
+       (type-id e ty) (type-id a ty) (type-id b ty) (portable-discardable a))
+      ((union e b)) :ruleset portable)
+(rule ((= e (T "ifelse" p a a)) (bool-value p) (portable-discardable p)
+       (type-id e ty) (type-id a ty))
+      ((union e a)) :ruleset portable)

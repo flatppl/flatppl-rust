@@ -1,0 +1,24 @@
+(ruleset ordered-scan)
+
+; The emitter supplies an eligible scalar scan and its bounded callback size.
+(relation ordered-scalar-scan (i64 i64))
+; Width 16 has a higher XLA compile cost. Require a longer loop before
+; trading that cost for the additional reduction in the number of groups.
+(relation ordered-group-width (i64 i64))
+(ordered-group-width 8 16)
+(ordered-group-width 16 32)
+
+; Keep the tail explicit. Its steps contribute to generated code size, not to
+; the number of launch groups in the loop.
+(relation ordered-block-geometry (i64 i64 i64 i64 i64))
+(rule ((ordered-scalar-scan length nodes)
+       (ordered-group-width width minimum))
+      ((ordered-block-geometry width (/ length width) (% length width) nodes minimum))
+  :ruleset ordered-scan)
+
+(relation ordered-block-choice (i64))
+(rule ((ordered-block-geometry width blocks tail nodes minimum)
+       (>= blocks minimum)
+       (<= (* (+ width tail) nodes) 768))
+      ((ordered-block-choice width))
+  :ruleset ordered-scan)

@@ -181,6 +181,49 @@ fn small_nonlinear_gpu_scans_write_ordered_blocks_and_an_exact_tail() {
 }
 
 #[test]
+fn long_elementary_scalar_gpu_scans_widen_and_keep_the_exact_tail() {
+    let emit_step = |step: &str, target, length| {
+        emit(
+            &format!(
+                "xs = elementof(cartpow(reals, {length}))\n\
+                 seed = elementof(reals)\n\
+                 inputs = (seed, xs)\n\
+                 states = scan((s, x) -> {step}, seed, xs)\n\
+                 outputs = sum(states)"
+            ),
+            target,
+        )
+    };
+    let check = |ir: &str, trips, occurrences| {
+        let condition = ir
+            .split_once("cond {")
+            .unwrap()
+            .1
+            .split_once("} do {")
+            .unwrap()
+            .0;
+        assert!(
+            condition.contains(&format!("dense<{trips}>")),
+            "{condition}"
+        );
+        assert_eq!(ir.matches("stablehlo.sqrt").count(), occurrences, "{ir}");
+    };
+    let simple = "sqrt((s - x) ^ 2 + 0.5)";
+    check(&emit_step(simple, Target::Gpu, 199), 24, 8 + 7);
+    check(&emit_step(simple, Target::Gpu, 599), 37, 16 + 7);
+    check(&emit_step(simple, Target::Cpu, 199), 199, 1);
+    check(
+        &emit_step(
+            "sqrt(ifelse(x > 0.0, s - x, s + x) ^ 2 + 0.5)",
+            Target::Gpu,
+            199,
+        ),
+        49,
+        4 + 3,
+    );
+}
+
+#[test]
 fn empty_and_large_state_scans_keep_their_existing_lowering() {
     let empty = "seed = elementof(reals)\n\
                  xs = filter(x -> x > 10.0, [1.0,2.0])\n\

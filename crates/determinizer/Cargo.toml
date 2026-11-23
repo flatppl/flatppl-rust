@@ -11,6 +11,7 @@ repository.workspace = true
 flatppl-core = { path = "../core" }
 flatppl-infer = { path = "../infer" }
 flatppl-model-analysis = { path = "../model-analysis" }
+flatppl-optimise = { path = "../optimise" }
 
 [dev-dependencies]
 flatppl-syntax = { path = "../syntax" }

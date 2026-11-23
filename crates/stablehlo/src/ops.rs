@@ -1774,6 +1774,9 @@ pub(crate) fn lower_bare_arith<'m>(
 /// and this is the only caller that reaches them from surface `*`.
 fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [a, b] = args_exact(id, args)?;
+    if let Some(value) = e.lower_matrix_projection(id, a, b) {
+        return Ok(value);
+    }
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
     let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (e.cell_ty(&a), e.cell_ty(&b)) else {
@@ -1922,6 +1925,9 @@ fn lower_sum(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
 
 fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [c, a, b] = args_exact(id, args)?;
+    if let Some(choice) = e.lower_likelihood_choice(id, c, a, b) {
+        return choice;
+    }
     let c = lower_predicate(e, c, "ifelse condition")?;
     // The two BRANCHES must share an orientation: selecting between a row and a
     // column is not defined, and neither the `broadcast_pair` below nor

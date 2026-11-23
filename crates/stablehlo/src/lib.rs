@@ -235,7 +235,7 @@ pub use modes::check_query_inputs;
 pub use refuse::EmitError;
 pub use types::mlir_type_of;
 
-use flatppl_core::Module;
+use flatppl_core::{Module, NodeId};
 
 /// Which computation to emit: the model's log-density, or a sampling program.
 pub enum Mode {
@@ -340,6 +340,35 @@ impl Default for EmitOptions {
             check_parameters: true,
         }
     }
+}
+
+/// Optimise a validated query for the selected backend. The returned node is
+/// the updated `outputs` binding's RHS. Sampling retains its authored RNG walk.
+pub fn optimise_query(m: &Module, opts: &EmitOptions) -> Option<(Module, NodeId)> {
+    use flatppl_optimise::{Dtype as Precision, Target as Backend};
+
+    let (outputs, binding) = m.bindings().find(|(_, b)| m.resolve(b.name) == "outputs")?;
+    if modes::reaches_sample(m, binding.rhs) {
+        return None;
+    }
+    let mut optimised = flatppl_optimise::optimise_stablehlo(
+        m,
+        Some(&[binding.name]),
+        match opts.target {
+            Target::Cpu => Backend::Cpu,
+            Target::Gpu => Backend::Gpu,
+        },
+        match opts.dtype {
+            Dtype::F32 => Precision::F32,
+            Dtype::F64 => Precision::F64,
+        },
+        opts.sufficient_statistics,
+    )?;
+    if flatppl_determinizer::has_alias_chains(&optimised) {
+        flatppl_determinizer::resolve_alias_chains(&mut optimised);
+    }
+    let rhs = optimised.binding(outputs).rhs;
+    Some((optimised, rhs))
 }
 
 /// Keep these calls intact so the emitter can use model and modifier structure.

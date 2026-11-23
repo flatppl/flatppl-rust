@@ -1,0 +1,13 @@
+; The witness covers a native Poisson density broadcast with fixed integer
+; counts and in-bounds fixed selectors. Sharing and parameter proofs refer
+; to the original query. The compact plan preserves native large-count sites.
+(relation fixed-poisson-partition (Expr Expr Expr i64 i64))
+(ruleset fixed-poisson)
+
+(rule ((= original (U "sum" cells))
+       (fixed-poisson-partition cells source plan rows retained)
+       (real-vector cells rows)
+       (> retained 0)
+       (>= rows (* 4 retained)))
+      ((union original (B "poisson.grouped-score" source plan)))
+  :ruleset fixed-poisson)

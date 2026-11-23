@@ -22,8 +22,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use flatppl_core::{
-    Axis, Call, CallHead, Doc, Inputs, Markup, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar,
-    Symbol, Variance,
+    Axis, BindingId, Call, CallHead, Doc, Inputs, Markup, Module, NamedArg, Node, NodeId, Ref,
+    RefNs, Scalar, Span, Symbol, Variance,
 };
 
 use crate::parser::is_placeholder;
@@ -67,6 +67,51 @@ pub fn print_with(module: &Module, syntax: Syntax) -> String {
         }
         out.push_str(&printer.binding_text(binding));
     }
+    out
+}
+
+/// Apply assignment rewrites to the original source while retaining its
+/// statement forms. `assignments` comes from `parse_with_assignment_spans`.
+/// The rewritten module retains the original binding IDs.
+pub fn print_assignment_rewrites(
+    source: &str,
+    assignments: &[(BindingId, Span)],
+    original: &Module,
+    rewritten: &Module,
+) -> String {
+    let printer = Printer::new(rewritten, Syntax::Full);
+    let mut out = String::with_capacity(source.len());
+    let mut cursor = 0;
+    let mut references = HashSet::new();
+    for &(binding, span) in assignments {
+        let rhs = rewritten.binding(binding).rhs;
+        if original.binding(binding).rhs == rhs {
+            continue;
+        }
+        // A decomposition's temporary is available in FlatPIR. Its name
+        // has no declaration in the original source.
+        references.clear();
+        rewritten.collect_referenced_names(rhs, &mut references);
+        if references.iter().any(|&name| {
+            rewritten
+                .binding_by_name(name)
+                .is_some_and(|id| rewritten.binding(id).synthetic)
+        }) {
+            continue;
+        }
+        let start = span.start as usize;
+        let end = span.end as usize;
+        let col = source[..start]
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .chars()
+            .count();
+        out.push_str(&source[cursor..start]);
+        out.push_str(&printer.body_w(rhs, col));
+        cursor = end;
+    }
+    out.push_str(&source[cursor..]);
     out
 }
 

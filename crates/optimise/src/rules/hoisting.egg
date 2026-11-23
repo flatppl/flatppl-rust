@@ -1,0 +1,25 @@
+(ruleset hoisting)
+
+; The host certifies that the intermediate has a single query consumer.
+; Negation is lane-wise and introduces no runtime status checks.
+(relation commutable-negation (String Expr Expr))
+
+(rule ((fixed-gather late head full selector n k id)
+       (= full (U "neg" x))
+       (real-vector x n)
+       (fixed-selector head selector k lo hi id true identity)
+       (commutable-negation head x selector))
+      ((let subset (B head x selector))
+       (real-vector subset k)
+       (union late (U "neg" subset)))
+  :ruleset hoisting)
+
+(rule ((= early (U "neg" subset))
+       (fixed-gather subset head x selector n k id)
+       (fixed-selector head selector k lo hi id true identity)
+       (commutable-negation head x selector))
+      ((let full (U "neg" x))
+       (real-vector full n)
+       (union early (B head full selector))
+       (real-vector early k))
+  :ruleset hoisting)

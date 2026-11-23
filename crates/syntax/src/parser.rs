@@ -21,8 +21,8 @@
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
-    Axis, Binding, Call, CallHead, Doc as CoreDoc, Inputs, Markup, Module, NamedArg, NamedKind,
-    Node, NodeId, Ref, RefNs, Scalar, Span, Variance,
+    Axis, Binding, BindingId, Call, CallHead, Doc as CoreDoc, Idx, Inputs, Markup, Module,
+    NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Span, Variance,
 };
 
 use crate::error::{Error, Result};
@@ -48,6 +48,21 @@ fn stmt_span(toks: &[Token]) -> Span {
 
 /// Parse canonical FlatPPL surface text into a [`Module`].
 pub fn parse(input: &str) -> Result<Module> {
+    parse_source(input, None)
+}
+
+/// Parse a source and locate the complete right-hand side of each `=`
+/// assignment. A decomposition is located at its shared source binding.
+pub fn parse_with_assignment_spans(input: &str) -> Result<(Module, Vec<(BindingId, Span)>)> {
+    let mut assignments = Vec::new();
+    let module = parse_source(input, Some(&mut assignments))?;
+    Ok((module, assignments))
+}
+
+fn parse_source(
+    input: &str,
+    mut assignments: Option<&mut Vec<(BindingId, Span)>>,
+) -> Result<Module> {
     let tokens = token::tokenize(input)?;
     let statements = split_statements(&tokens)?;
 
@@ -71,7 +86,12 @@ pub fn parse(input: &str) -> Result<Module> {
     let mut module = Module::new();
     let mut synth: u64 = 0;
     for st in &statements {
-        lower_statement(&mut module, st, &names, &mut synth)?;
+        let first = module.binding_count();
+        if let Some(span) = lower_statement(&mut module, st, &names, &mut synth)?
+            && let Some(assignments) = assignments.as_mut()
+        {
+            assignments.push((BindingId::from_usize(first), span));
+        }
     }
     Ok(module)
 }
@@ -255,7 +275,12 @@ fn collect_module_alias(stmt: &Stmt, names: &mut Names) -> bool {
     }
 }
 
-fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut u64) -> Result<()> {
+fn lower_statement(
+    module: &mut Module,
+    stmt: &Stmt,
+    names: &Names,
+    synth: &mut u64,
+) -> Result<Option<Span>> {
     let toks = &stmt.tokens;
 
     // LHS: leading `Name (',' Name)*`, then the binding operator. The token
@@ -287,7 +312,7 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             let rhs = ep.parse_aggregate()?;
             ep.expect_end()?;
             bind_name(module, names, &lhs[0], rhs, stmt.doc.as_ref(), synth);
-            Ok(())
+            Ok(None)
         }
         // `metric: result[.axes…] := expr` — metric-aware Einstein summation
         // (spec §04), lowering to `metricsum(metric, [.axes…], expr)`. The
@@ -302,7 +327,7 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             let rhs = ep.parse_metricsum(&lhs[0])?;
             ep.expect_end()?;
             bind_name(module, names, &result, rhs, stmt.doc.as_ref(), synth);
-            Ok(())
+            Ok(None)
         }
         // `f(arg1, arg2, …) = expr` — function-definition sugar (spec §05
         // "Function definition syntax"): a named binding of `f` to the lambda
@@ -371,7 +396,7 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             let rhs = ep.lower_lambda(params, 0, body);
             ep.expect_end()?;
             bind_name(module, names, &lhs[0], rhs, stmt.doc.as_ref(), synth);
-            Ok(())
+            Ok(None)
         }
         Some(op @ (TokenKind::Assign | TokenKind::Tilde)) => {
             for (name, tok) in lhs.iter().zip(&lhs_toks) {
@@ -391,7 +416,7 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             } else {
                 lower_decomposition(module, names, &lhs, rhs, synth, stmt_span(toks));
             }
-            Ok(())
+            Ok((!is_tilde).then(|| stmt_span(&toks[i + 1..])))
         }
         _ => Err(err_at(
             toks.get(i).unwrap_or(&toks[0]),

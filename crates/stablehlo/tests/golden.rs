@@ -10063,6 +10063,69 @@ outputs = lp
     assert!(is_delimiter_balanced(&out));
 }
 
+#[test]
+fn fixed_paired_matrix_selection_keeps_a_dense_exceptional_branch() {
+    let source = "\
+flatppl_compat = \"0.1\"
+a = elementof(cartpow(reals, [4, 5]))
+row = [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4]
+col = [4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3]
+rlevel = [1, 2, 3, 4]
+clevel = [1, 2, 3, 4, 5]
+rows = ifelse.(addaxes(row, 0, 1) .== addaxes(rlevel, 1, 0), 1.0, 0.0)
+cols = ifelse.(addaxes(col, 0, 1) .== addaxes(clevel, 1, 0), 1.0, 0.0)
+inputs = a
+outputs = ((rows * a) .* cols) * ones(5)
+";
+    let emit = |src: &str, target| {
+        let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+        flatppl_stablehlo::emit(
+            &d,
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions {
+                target,
+                ..Default::default()
+            },
+        )
+        .expect("valid projection")
+    };
+    use flatppl_stablehlo::Target;
+
+    for src in [
+        source.to_owned(),
+        source.replace("(rows * a) .* cols", "cols .* (rows * a)"),
+    ] {
+        let hlo = emit(&src, Target::Cpu);
+        let (guard, branches) = hlo.split_once("\"stablehlo.if\"").expect("finite guard");
+        assert!(guard.contains("stablehlo.compare LE"));
+        let (fast, dense) = branches.split_once("}, {").expect("two branches");
+        assert!(fast.contains("stablehlo.gather"));
+        assert!(!fast.contains("stablehlo.dot_general"));
+        assert_eq!(dense.matches("stablehlo.dot_general").count(), 2);
+    }
+
+    for (src, target) in [
+        (source.to_owned(), Target::Gpu),
+        (
+            source.replace("outputs = ", "projected = ") + "outputs = (projected .+ 2.0)[1]\n",
+            Target::Cpu,
+        ),
+        (
+            source.replace("inputs = a", "inputs = (a, cols)"),
+            Target::Cpu,
+        ),
+        (source.replace("col = [4, 1", "col = [6, 1"), Target::Cpu),
+        (
+            source.replace("* ones(5)", "* [1.0, 1.0, 1.0, 1.0, 2.0]"),
+            Target::Cpu,
+        ),
+    ] {
+        let hlo = emit(&src, target);
+        assert!(!hlo.contains("\"stablehlo.if\""));
+        assert!(hlo.matches("stablehlo.dot_general").count() >= 2);
+    }
+}
+
 // ---- §07 transpose/adjoint and the transposed-vector products ---------------
 //
 // §07 "Linear algebra": "Matrix multiplication and addition use the standard `*`
@@ -10148,15 +10211,9 @@ outputs = lp
     );
 }
 
-/// The MATRIX half of §07's "`transpose` and `adjoint` are self-inverse": the
-/// involution is left to the consuming compiler, so BOTH transposes are emitted
-/// and the round trip returns to the original shape. Pinning the choice (rather
-/// than folding here) because a `transpose(transpose(x))` peephole would be this
-/// crate's first such rewrite and buys nothing XLA does not already do — if
-/// someone later adds the fold, this golden is what they must update
-/// deliberately.
+/// The matrix involution in §07 preserves the original axes and reduction order.
 #[test]
-fn emit_logdensity_double_matrix_transpose_emits_both_and_round_trips() {
+fn emit_logdensity_double_matrix_transpose_emits_the_original_matrix() {
     let src = "\
 m = elementof(cartpow(reals, [4, 3]))
 z = sum(sum(transpose(transpose(m))))
@@ -10166,16 +10223,12 @@ outputs = lp
 ";
     let d = determinize_abi_roots(src, &["inputs", "outputs"]);
     let out = emit_logdensity(&d);
-    assert_eq!(
-        out.matches("stablehlo.transpose").count(),
-        2,
-        "both matrix transposes are emitted, unfolded, in:\n{out}"
+    let direct = determinize_abi_roots(
+        &src.replace("transpose(transpose(m))", "m"),
+        &["inputs", "outputs"],
     );
-    assert!(
-        out.contains("(tensor<4x3xf32>) -> tensor<3x4xf32>")
-            && out.contains("(tensor<3x4xf32>) -> tensor<4x3xf32>"),
-        "the round trip must return to tensor<4x3xf32>, in:\n{out}"
-    );
+    assert_eq!(out, emit_logdensity(&direct));
+    assert!(!out.contains("stablehlo.transpose"), "{out}");
 }
 
 /// Orientation is enforced on the DOTTED and predicate paths too, not just the
@@ -11853,8 +11906,9 @@ outputs = (lp)\n";
     .expect("table field access must emit, not refuse the `table` head");
     assert!(out.contains("module {"));
     assert!(
-        out.contains("dense<\"0x0000A841\"> : tensor<1xf32>"),
-        "bb[1] = 21.0 (the projected column) must appear:\n{out}"
+        out.contains("dense<21.0> : tensor<f32>")
+            || out.contains("dense<\"0x0000A841\"> : tensor<1xf32>"),
+        "the projected value bb[1] must be 21.0:\n{out}"
     );
     assert!(
         !out.contains("11.0")

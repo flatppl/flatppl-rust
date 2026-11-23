@@ -1,0 +1,44 @@
+; Fixed integer vectors retain their ordered normalized row identity across bases.
+(relation fixed-selector (String Expr i64 i64 i64 i64 bool bool))
+(relation selector-representative (i64 String Expr))
+(relation fixed-gather (Expr String Expr Expr i64 i64 i64))
+
+; These witnesses use the original query's edges, including opaque consumers.
+(relation exclusive-gather-source (String Expr Expr))
+(relation composed-selector (Expr String Expr String Expr i64))
+
+(ruleset selector-facts)
+(ruleset sharing)
+
+(rule ((= gather (B head x selector))
+       (real-vector x n)
+       (fixed-selector head selector k lo hi id unique identity)
+       (>= lo 0) (< hi n))
+      ((fixed-gather gather head x selector n k id)
+       (real-vector gather k))
+  :ruleset selector-facts)
+
+; Reuse the representative without merging cotangents from two gather sites.
+(rule ((fixed-gather gather head x selector n k id)
+       (exclusive-gather-source head x selector)
+       (fixed-selector head selector k lo hi id true identity)
+       (selector-representative id canonical rows))
+      ((union gather (B canonical x rows)))
+  :ruleset sharing)
+
+(rule ((fixed-gather gather head x selector n n id)
+       (exclusive-gather-source head x selector)
+       (fixed-selector head selector n lo hi id true true))
+      ((union gather x))
+  :ruleset sharing)
+
+; The inner gather has no other consumers and the final rows are injective.
+; Repeats would change the grouping of scatter-adds in the pullback.
+(rule ((fixed-gather outer outer-head inner outer-rows m k outer-id)
+       (fixed-gather inner inner-head x inner-rows n m inner-id)
+       (composed-selector x inner-head inner-rows outer-head outer-rows id)
+       (selector-representative id head rows)
+       (fixed-selector head rows k lo hi id true identity)
+       (>= lo 0) (< hi n))
+      ((union outer (B head x rows)))
+  :ruleset sharing)

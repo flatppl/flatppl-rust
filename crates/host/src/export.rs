@@ -2,12 +2,13 @@
 
 use std::collections::{HashMap, HashSet};
 
+use flatppl_core::query::{Component as Selector, component};
 use flatppl_core::{
     Call, CallHead, Dim, Idx, Module, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
 };
 use flatppl_stablehlo::{
     BatchSpec, Dtype, ElemKind, EmitError, EmitOptions, Emitter, Lowered, MlirTy, Value,
-    check_query_inputs, mlir_type_of,
+    check_query_inputs, mlir_type_of, optimise_query,
 };
 use serde::Serialize;
 
@@ -68,12 +69,6 @@ pub enum Schema {
     },
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-enum Selector {
-    Field(String),
-    Index(usize),
-}
-
 type InputPath = (Symbol, Vec<Selector>);
 
 struct Leaf {
@@ -102,7 +97,7 @@ pub fn emit_query(
     )?;
     // The emitter reads fixed operands through one ref hop (`Emitter::resolve_ref_one`).
     flatppl_determinizer::resolve_alias_chains(&mut module);
-    let output_node = binding(&module, "outputs")
+    let mut output_node = binding(&module, "outputs")
         .ok_or_else(|| EmitError::whole("declare at least one output"))?;
     let input_nodes = binding(&module, "inputs")
         .map(|id| signature(&module, id))
@@ -143,7 +138,6 @@ pub fn emit_query(
         declared.push((module.resolve(r.name).to_string(), node));
     }
     check_query_inputs(&module, &[output_node], &names, &[])?;
-    let roots = input_roots(&module, &names);
     // Canonicalization may inline output bindings. Describe their authored names.
     let source = source.unwrap_or(&module);
     let declared_output = binding(source, "outputs")
@@ -156,6 +150,11 @@ pub fn emit_query(
             _ => None,
         })
         .collect();
+    if let Some((optimised, rhs)) = optimise_query(&module, options) {
+        module = optimised;
+        output_node = rhs;
+    }
+    let roots = input_roots(&module, &names);
     let mut arguments = Vec::new();
     let mut inputs = Vec::new();
     for (name, node) in &declared {
@@ -702,22 +701,9 @@ fn input_path(
         Node::Ref(r) if r.ns == RefNs::SelfMod => module
             .binding_by_name(r.name)
             .and_then(|b| input_path(module, module.binding(b).rhs, roots, memo)),
-        Node::Call(c)
-            if (builtin(module, node, "get") || builtin(module, node, "get0"))
-                && c.args.len() == 2 =>
-        {
-            let selector = match (module.type_of(c.args[0]), module.node(c.args[1])) {
-                (Some(Type::Record(_) | Type::Table { .. }), Node::Lit(Scalar::Str(s))) => {
-                    Some(Selector::Field(s.to_string()))
-                }
-                (Some(Type::Tuple(_)), Node::Lit(Scalar::Int(i))) => {
-                    let index = i - i64::from(builtin(module, node, "get"));
-                    usize::try_from(index).ok().map(Selector::Index)
-                }
-                _ => None,
-            };
-            selector.and_then(|selector| {
-                input_path(module, c.args[0], roots, memo).map(|(root, mut path)| {
+        Node::Call(_) if builtin(module, node, "get") || builtin(module, node, "get0") => {
+            component(module, node).and_then(|(base, selector)| {
+                input_path(module, base, roots, memo).map(|(root, mut path)| {
                     path.push(selector);
                     (root, path)
                 })

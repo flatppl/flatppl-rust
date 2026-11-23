@@ -70,6 +70,9 @@ pub struct Module {
     /// value, but must not reopen its draw provenance when restoring its own law.
     /// Per expression: one binding may contain several queries. Not serialized.
     sample_results: HashSet<NodeId>,
+    /// Optimizer-generated likelihood choices whose compact arms rely on
+    /// their runtime predicates. Kept out of serialized IR.
+    guarded_likelihoods: HashSet<NodeId>,
     /// Optional analysis provenance from a lowered sampling expression to its source measure.
     /// Kept out of serialized IR and ordinary compilation.
     sample_origins: Option<Box<SampleOrigins>>,
@@ -200,6 +203,16 @@ impl Module {
     /// Whether `id` is a concrete `rand` result rather than a generative trace.
     pub fn is_sample_result(&self, id: NodeId) -> bool {
         self.sample_results.contains(&id)
+    }
+
+    /// Mark a generated likelihood branch for lazy evaluation by the emitter.
+    pub fn mark_guarded_likelihood(&mut self, id: NodeId) {
+        self.guarded_likelihoods.insert(id);
+    }
+
+    /// Whether a generated likelihood branch requires lazy evaluation.
+    pub fn is_guarded_likelihood(&self, id: NodeId) -> bool {
+        self.guarded_likelihoods.contains(&id)
     }
 
     /// Seed source identities so a rewritten copy of a measure retains its origin.

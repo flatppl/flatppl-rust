@@ -1,6 +1,8 @@
 //! Callable state is flattened into tensor leaves. A scan emits one while,
 //! with a fixed state type and an output buffer for each leaf.
 
+use flatppl_core::Call;
+
 use super::batching::tensor;
 use super::*;
 
@@ -790,10 +792,10 @@ impl Emitter<'_> {
                 .iter()
                 .map(|v| v.ty.render(self.dtype, v.elem))
                 .collect::<Vec<_>>();
-            let width = if !reduce && self.block_scan(body, &state, xs, n) {
-                4
-            } else {
+            let width = if reduce {
                 1
+            } else {
+                self.scan_block_width(body, &state, xs, n)
             };
             let advance = |e: &mut Self,
                            args: &[Value],
@@ -973,9 +975,15 @@ impl Emitter<'_> {
         Ok(result)
     }
 
-    /// Small real carries have little device parallelism. Compile four ordered
-    /// steps per GPU loop to amortize launch overhead without reassociating them.
-    fn block_scan(&self, body: NodeId, state: &Components, xs: &Components, length: u64) -> bool {
+    /// Small real carries have little device parallelism. Group ordered steps
+    /// per GPU loop to amortize launch overhead without reassociating them.
+    fn scan_block_width(
+        &self,
+        body: NodeId,
+        state: &Components,
+        xs: &Components,
+        length: u64,
+    ) -> u64 {
         let compact_state = |v: &Value| {
             v.elem == ElemKind::Real
                 && (v.ty == MlirTy::Scalar
@@ -991,8 +999,15 @@ impl Emitter<'_> {
             || !state.values.iter().all(compact_state)
             || !xs.values.iter().all(compact_items)
         {
-            return false;
+            return 1;
         }
+        let mut allow_wide = length >= 128
+            && state.fields.is_none()
+            && xs.fields.is_none()
+            && matches!(state.values.as_slice(), [value] if value.ty == MlirTy::Scalar)
+            && matches!(xs.values.as_slice(), [value]
+                if value.elem == ElemKind::Real
+                    && matches!(&value.ty, MlirTy::Ranked(dims) if dims.len() == 1));
         // Bound repeated code and skip nested loops. Already-bound operands
         // are captured once in the enclosing function.
         const MAX_NODES: usize = 48;
@@ -1003,12 +1018,12 @@ impl Emitter<'_> {
                 continue;
             }
             if seen.len() > MAX_NODES {
-                return false;
+                return 1;
             }
             let node = self.m.node(id);
             if let Node::Call(call) = node {
                 if call.args.len() + call.named.len() > MAX_NODES {
-                    return false;
+                    return 1;
                 }
                 if let CallHead::Builtin(head) = call.head
                     && matches!(
@@ -1016,8 +1031,9 @@ impl Emitter<'_> {
                         "scan" | "reduce" | "builtin_sample" | "integral"
                     )
                 {
-                    return false;
+                    return 1;
                 }
+                allow_wide = allow_wide && self.simple_scan_call(call);
             }
             node.for_each_child(|child| pending.push(child));
             let target = self.resolve_ref_one(id);
@@ -1025,7 +1041,31 @@ impl Emitter<'_> {
                 pending.push(target);
             }
         }
-        true
+        if allow_wide {
+            flatppl_optimise::ordered_scan_width(length, seen.len())
+        } else {
+            4
+        }
+    }
+
+    /// Widen only elementary arithmetic and statically named field reads. In
+    /// particular, indexing, checked operations and opaque callbacks keep the
+    /// existing four-step plan.
+    fn simple_scan_call(&self, call: &Call) -> bool {
+        if !call.named.is_empty() || call.inputs.is_some() {
+            return false;
+        }
+        let CallHead::Builtin(head) = call.head else {
+            return false;
+        };
+        match (self.m.resolve(head), call.args.as_ref()) {
+            ("add" | "sub" | "mul", [_, _]) | ("neg" | "sqrt", [_]) => true,
+            ("pow", [_, exponent]) => matches!(self.m.node(*exponent), Node::Lit(Scalar::Int(2))),
+            ("get" | "get_field", [_, key]) => {
+                matches!(self.m.node(*key), Node::Lit(Scalar::Str(_)))
+            }
+            _ => false,
+        }
     }
 
     /// A left scan of scalar integers with the literal callback `(a, x) -> a + x`.
