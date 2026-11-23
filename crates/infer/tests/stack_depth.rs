@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use flatppl_core::{Module, Phase, ScalarType, Type};
+use flatppl_core::{Module, Phase, ScalarType, Type, ValueSet};
 use flatppl_infer::{Level, ModuleBundle, Severity, infer_module};
 
 fn infer_on_small_stack(mut module: Module, bundle: ModuleBundle) -> Module {
@@ -57,14 +57,46 @@ fn deep_module_chain_infers_on_a_small_stack() {
 #[test]
 fn nested_callable_substitutions_keep_their_contexts() {
     let mut source = "f0(x) = x + x\n".to_string();
-    for i in 1..=8 {
-        source.push_str(&format!("f{i}(x) = f{}(x)\n", i - 1));
+    let depth = 48;
+    for i in 1..=depth {
+        source.push_str(&format!("f{i}(x) = f{}(x) + x\n", i - 1));
     }
-    source.push_str("integer = f8(1)\nreal = f8(1.5)\n");
+    source.push_str(&format!("integer = f{depth}(1)\nreal = f{depth}(1.5)\n"));
     let module = flatppl_syntax::parse(&source).unwrap();
     let module = infer_on_small_stack(module, ModuleBundle::new());
     assert_result(&module, "integer", ScalarType::Integer);
     assert_result(&module, "real", ScalarType::Real);
+}
+
+#[test]
+fn nested_callable_substitutions_keep_captures_and_value_sets() {
+    let source = "\
+shared = external(anything)
+helper(x) = x + shared
+outer = functionof(helper(2), q = shared)
+identity(x) = x
+forward(x) = identity(x)
+positive = elementof(posreals)
+real = elementof(reals)
+integer_result = outer(1)
+real_result = outer(1.5)
+positive_result = forward(positive)
+broad_result = forward(real)
+";
+    let module = flatppl_syntax::parse(source).unwrap();
+    let module = infer_on_small_stack(module, ModuleBundle::new());
+    assert_result(&module, "integer_result", ScalarType::Integer);
+    assert_result(&module, "real_result", ScalarType::Real);
+    for (name, support) in [
+        ("positive_result", ValueSet::PosReals),
+        ("broad_result", ValueSet::Reals),
+    ] {
+        let (_, binding) = module
+            .bindings()
+            .find(|(_, b)| module.resolve(b.name) == name)
+            .unwrap();
+        assert_eq!(module.valueset_of(binding.rhs), Some(&support));
+    }
 }
 
 #[test]
