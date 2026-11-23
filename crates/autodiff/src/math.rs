@@ -215,10 +215,7 @@ pub(super) fn zero_when_masked_complex(
 }
 
 pub(super) fn requires_unmasked(op: &str) -> bool {
-    matches!(
-        op,
-        "inv" | "logabsdet" | "linsolve" | "lower_cholesky" | "indexed sum product"
-    )
+    matches!(op, "inv" | "logabsdet" | "linsolve" | "lower_cholesky")
 }
 
 pub(super) fn scalar_reduction(op: &str) -> bool {

@@ -86,3 +86,86 @@
     (Binary "mul" (Real 3.141592653589793)
       (Binary "divide" (Arg 1) (Unary "sin" (CauchyTailAngle))))
     (Unary "sin" (CauchyTailAngle)))) :ruleset pullbacks)
+
+; The standard Normal log density shares the CDF/probit slope.
+(constructor StandardNormalLogPdf (Expr) Expr :unextractable)
+(rewrite (StandardNormalLogPdf x)
+  (Binary "sub" (Binary "mul" (Real -0.5) (Unary "abs2" x)) (Real 0.9189385332046727))
+  :ruleset pullbacks)
+(rewrite (Pullback "invprobit" 1 0)
+  (Binary "mul" (Bar) (Unary "exp" (StandardNormalLogPdf (Arg 0)))) :ruleset pullbacks)
+(rewrite (Pullback "probit" 1 0)
+  (Binary "mul" (Bar) (Unary "exp" (Unary "neg" (StandardNormalLogPdf (Out)))))
+  :ruleset pullbacks)
+
+; The lower-tail ratio phi(x)/Phi(x) simplifies to a reciprocal scaled
+; complementary error function. Subtracting the two log terms there loses
+; the slope to cancellation once both are dominated by -x^2/2. Infinite
+; CDF endpoints are fixed, matching the backend's endpoint tangent convention.
+(rewrite (Pullback "log_ndtr" 1 0)
+  (Ternary "ifelse" (Unary "isinf" (Arg 0)) (Real 0.0)
+    (Binary "mul" (Bar) (Ternary "ifelse" (Binary "lt" (Arg 0) (Real 0.0))
+      (Binary "divide" (Real 0.7978845608028654)
+        (SpecialUnary "erfcx" (Binary "mul" (Real 0.7071067811865476) (Unary "abs" (Arg 0)))))
+      (Unary "exp" (Binary "sub" (StandardNormalLogPdf (Arg 0)) (Out))))))
+  :ruleset pullbacks)
+
+; expm1 retains the interval width near coincident endpoints. Define a zero
+; contribution on the empty branch, including two equal infinite endpoints.
+(constructor LogCdfDelta () Expr :unextractable)
+(rewrite (LogCdfDelta) (Binary "sub" (Arg 1) (Arg 0)) :ruleset pullbacks)
+(constructor LogCdfNonempty () Expr :unextractable)
+(rewrite (LogCdfNonempty) (Binary "lt" (LogCdfDelta) (Real 0.0)) :ruleset pullbacks)
+(constructor LogCdfSafeDelta () Expr :unextractable)
+(rewrite (LogCdfSafeDelta)
+  (Ternary "ifelse" (LogCdfNonempty) (LogCdfDelta) (Real -1.0)) :ruleset pullbacks)
+(rewrite (Pullback "%log_cdf_difference" 2 0)
+  (Ternary "ifelse" (LogCdfNonempty)
+    (Unary "neg" (Binary "divide" (Bar) (Unary "expm1" (LogCdfSafeDelta))))
+    (Real 0.0)) :ruleset pullbacks)
+(rewrite (Pullback "%log_cdf_difference" 2 1)
+  (Ternary "ifelse" (LogCdfNonempty)
+    (Binary "divide" (Binary "mul" (Bar) (Unary "exp" (LogCdfSafeDelta)))
+      (Unary "expm1" (LogCdfSafeDelta))) (Real 0.0)) :ruleset pullbacks)
+
+; Differentiate regularized tails with respect to their integration limit.
+; Shape derivatives do not follow from the density at the integration limit.
+(constructor LogKernelPower (Expr Expr) Expr :unextractable)
+(rewrite (LogKernelPower exponent log_x)
+  (Ternary "ifelse" (Unary "iszero" exponent) (Real 0.0) (Binary "mul" exponent log_x))
+  :ruleset pullbacks)
+(constructor TailContribution (Expr Expr) Expr :unextractable)
+(rewrite (TailContribution log_pdf log_probability)
+  (Binary "mul" (Bar) (Unary "exp" (Binary "sub" log_pdf log_probability)))
+  :ruleset pullbacks)
+
+(constructor GammaLogPdf () Expr :unextractable)
+(rewrite (GammaLogPdf)
+  (Ternary "ifelse" (Unary "isinf" (Arg 1)) (Unary "log" (Real 0.0))
+    (Binary "sub"
+      (Binary "sub"
+        (LogKernelPower (Binary "sub" (Arg 0) (Real 1.0)) (Unary "log" (Arg 1)))
+        (Arg 1))
+      (Unary "loggamma" (Arg 0)))) :ruleset pullbacks)
+(rewrite (Pullback "gammainc" 2 1) (TailContribution (GammaLogPdf) (Real 0.0)) :ruleset pullbacks)
+(rewrite (Pullback "gammaincc" 2 1)
+  (Unary "neg" (TailContribution (GammaLogPdf) (Real 0.0))) :ruleset pullbacks)
+(rewrite (Pullback "log_gammainc" 2 1) (TailContribution (GammaLogPdf) (Out)) :ruleset pullbacks)
+(rewrite (Pullback "log_gammaincc" 2 1)
+  (Ternary "ifelse" (Unary "isinf" (Arg 1)) (Real 0.0)
+    (Unary "neg" (TailContribution (GammaLogPdf) (Out)))) :ruleset pullbacks)
+
+(constructor BetaLogPdf () Expr :unextractable)
+(rewrite (BetaLogPdf)
+  (Binary "sub"
+    (Binary "add"
+      (LogKernelPower (Binary "sub" (Arg 0) (Real 1.0)) (Unary "log" (Arg 2)))
+      (LogKernelPower (Binary "sub" (Arg 1) (Real 1.0))
+        (Unary "log1p" (Unary "neg" (Arg 2)))))
+    (SpecialBinary "logbeta" (Arg 0) (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "betainc" 3 2) (TailContribution (BetaLogPdf) (Real 0.0)) :ruleset pullbacks)
+(rewrite (Pullback "betaincc" 3 2)
+  (Unary "neg" (TailContribution (BetaLogPdf) (Real 0.0))) :ruleset pullbacks)
+(rewrite (Pullback "log_betainc" 3 2) (TailContribution (BetaLogPdf) (Out)) :ruleset pullbacks)
+(rewrite (Pullback "log_betaincc" 3 2)
+  (Unary "neg" (TailContribution (BetaLogPdf) (Out))) :ruleset pullbacks)

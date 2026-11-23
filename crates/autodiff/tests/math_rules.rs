@@ -118,3 +118,19 @@ outputs = aggregate(sum, [], A[.i] * b[.j])
         differentiate(&module, &["A", "b"]).unwrap();
     }
 }
+
+#[test]
+fn masked_matrix_product_uses_a_scoped_contraction() {
+    let module = lower(
+        "
+A = elementof(cartpow(reals, [2, 2]))
+b = elementof(cartpow(reals, 2))
+product = A * b
+inputs = (A, b)
+outputs = ifelse.([true, false], product, 0.0)
+",
+    );
+    let derivative = vjp(&module, &["A", "b"]).unwrap();
+    let text = flatppl_syntax::print(&derivative);
+    assert!(text.contains(".adinner"), "{text}");
+}

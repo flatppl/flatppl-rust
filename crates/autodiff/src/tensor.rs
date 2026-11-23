@@ -211,6 +211,70 @@ pub(super) fn insert(emitter: &mut Emitter, value: NodeId, index: i64, length: u
     build_call(m, "mul", &[basis, value])
 }
 
+pub(super) fn cat_slice(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    args: &[NodeId],
+    slot: usize,
+) -> Option<NodeId> {
+    let &input = args.get(slot)?;
+    let offset = args[..slot].iter().try_fold(0i64, |offset, &arg| {
+        let length = match numeric_shape(&emitter.module, arg)? {
+            [] => 1,
+            [Dim::Static(n)] => i64::from(*n),
+            _ => return None,
+        };
+        offset.checked_add(length)
+    })?;
+    let is_vector = match numeric_shape(&emitter.module, input)? {
+        [] => false,
+        [_] => true,
+        _ => return None,
+    };
+    let input = emitter.primal(input);
+    let m = &mut emitter.module;
+    let start = int(m, offset);
+    let selector = if is_vector {
+        let indices = build_call(m, "indicesof0", &[input]);
+        if offset == 0 {
+            indices
+        } else {
+            broadcast(m, "add", &[indices, start])
+        }
+    } else {
+        start
+    };
+    Some(build_call(m, "get0", &[bar, selector]))
+}
+
+pub(super) fn cat_embed(
+    emitter: &mut Emitter,
+    tangent: NodeId,
+    args: &[NodeId],
+    slot: usize,
+) -> Option<NodeId> {
+    let zero = real(&mut emitter.module, 0.0);
+    let parts = args
+        .iter()
+        .enumerate()
+        .map(|(index, &primal)| {
+            if index == slot {
+                return Some(tangent);
+            }
+            match numeric_shape(&emitter.module, primal)? {
+                [] => Some(zero),
+                [dim] => {
+                    let dim = *dim;
+                    let size = shape_arg(emitter, primal, &[dim])?;
+                    Some(build_call(&mut emitter.module, "fill", &[zero, size]))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(build_call(&mut emitter.module, "cat", &parts))
+}
+
 pub(super) fn stack_pick(module: &mut Module, bar: NodeId, index: i64, columns: bool) -> NodeId {
     let index = int(module, index);
     let all = constant(module, "all");
@@ -507,6 +571,51 @@ fn aggregate(module: &mut Module, output_axes: &[NodeId], expression: NodeId) ->
     let sum = constant(module, "sum");
     let axes = build_call(module, "vector", output_axes);
     build_call(module, "aggregate", &[sum, axes, expression])
+}
+
+pub(super) fn cumulative_extreme(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    input: NodeId,
+    output: NodeId,
+    maximum: bool,
+    forward: bool,
+) -> Option<NodeId> {
+    let [length] = *real_shape(&emitter.module, input)? else {
+        return None;
+    };
+    if length == Dim::Static(0) {
+        return Some(bar);
+    }
+    let source = emitter.primal(input);
+    let prefix = emitter.primal(output);
+    let m = &mut emitter.module;
+    let indices = build_call(m, "indicesof", &[source]);
+    let one = int(m, 1);
+    let zero = int(m, 0);
+    let previous_indices = broadcast(m, "sub", &[indices, one]);
+    let previous_indices = broadcast(m, "max", &[previous_indices, one]);
+    let previous = build_call(m, "get", &[prefix, previous_indices]);
+    let first = broadcast(m, "equal", &[indices, one]);
+    // At equal values, keep the previous winner. A finite tie between
+    // distinct arguments is outside the smooth domain.
+    let compare = if maximum { "gt" } else { "lt" };
+    let better = broadcast(m, compare, &[source, previous]);
+    let took = broadcast(m, "lor", &[first, better]);
+    let changes = broadcast(m, "ifelse", &[took, indices, zero]);
+    let winners = build_call(m, "cummax", &[changes]);
+    m.set_type(
+        winners,
+        Type::Array {
+            shape: Box::new([length]),
+            elem: Box::new(Type::Scalar(ScalarType::Integer)),
+        },
+    );
+    if forward {
+        Some(build_call(m, "get", &[bar, winners]))
+    } else {
+        scatter(emitter, bar, input, &[winners], 1)
+    }
 }
 
 pub(super) fn logsumexp(

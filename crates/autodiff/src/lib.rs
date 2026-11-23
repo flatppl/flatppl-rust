@@ -3,6 +3,7 @@
 //! Use [`determinize_query`] to prepare the inferred model for [`gradient`].
 //! The returned module is ordinary FlatPDL.
 
+mod aggregate;
 mod callbacks;
 mod contract;
 mod integral;
@@ -106,7 +107,7 @@ pub fn gradient(module: &Module, wrt: &[&str]) -> Result<Module, Error> {
 /// Apply [`gradient`] to a module that uses the requested deterministic extensions.
 ///
 /// Numerical integrals differentiate the integrand and its moving boundaries.
-/// This mode requires scalar captures when differentiating a numerical integral.
+/// Reverse mode supports real scalar, fixed vector, and fixed matrix captures.
 pub fn gradient_with_options(
     module: &Module,
     wrt: &[&str],
@@ -120,7 +121,7 @@ pub fn gradient_with_options(
 /// Append one cotangent input per original output. Results contain the original
 /// outputs followed by the input cotangents in request order. Selected inputs
 /// can be real scalars, fixed-shape arrays, or nonempty records of these values.
-/// Outputs are real scalars or fixed-shape flat real arrays.
+/// Outputs can use the same real-valued scalars, arrays and records as inputs.
 pub fn vjp(module: &Module, wrt: &[&str]) -> Result<Module, Error> {
     vjp_with_options(module, wrt, &LoweringOptions::default())
 }
@@ -128,7 +129,7 @@ pub fn vjp(module: &Module, wrt: &[&str]) -> Result<Module, Error> {
 /// Apply [`vjp`] to a module that uses the requested deterministic extensions.
 ///
 /// Numerical integrals differentiate the integrand and its moving boundaries.
-/// This mode requires scalar captures when differentiating a numerical integral.
+/// Reverse mode supports real scalar, fixed vector, and fixed matrix captures.
 pub fn vjp_with_options(
     module: &Module,
     wrt: &[&str],
@@ -142,7 +143,7 @@ pub fn vjp_with_options(
 /// Append one tangent input per selected input. Results contain the original
 /// outputs followed by their tangents. Selected inputs can be real scalars,
 /// fixed-shape arrays, or nonempty records of these values.
-/// Outputs are real scalars or fixed-shape flat real arrays.
+/// Outputs can use the same real-valued scalars, arrays and records as inputs.
 pub fn jvp(module: &Module, wrt: &[&str]) -> Result<Module, Error> {
     jvp_with_options(module, wrt, &LoweringOptions::default())
 }
@@ -283,14 +284,9 @@ fn reverse(
         let terms: Vec<_> = terms.into_iter().map(|(value, _)| value).collect();
         let bar = emitter.named_adjoint("_ad_bar", step.node, &terms);
         let scope = plan.integrals.get(&step.node);
-        if scope.is_none() {
+        let aggregate = plan.aggregates.get(&step.node);
+        if scope.is_none() && aggregate.is_none() {
             step.check_types(plan.module)?;
-        }
-        if masked && step.op == "matrix product" {
-            return Err(Error::new(
-                Some(step.node),
-                "a masked matrix product needs a mask-aware contraction pullback",
-            ));
         }
         if masked && math::requires_unmasked(step.op) {
             return Err(Error::new(
@@ -304,9 +300,11 @@ fn reverse(
             };
             let mut contribution = if let Some(scope) = scope {
                 scope.pullback(emitter, rules, step, slot, bar)?
+            } else if let Some(scope) = aggregate {
+                scope.pullback(emitter, rules, slot, bar, masked)?
             } else {
                 let template = step.rule(rules, mode, slot)?;
-                template.instantiate(emitter, step, bar)?
+                template.instantiate(emitter, step, bar, masked)?
             };
             if math::complex_rule_name(step.op)
                 && tensor::real_shape(plan.module, step.args[slot]).is_some()
@@ -325,7 +323,8 @@ fn reverse(
                 contribution =
                     tensor::zero_when_masked(&mut emitter.module, bar, contribution, true);
             } else if masked && (!structural(step.op) || multivariate_density(step.op)) {
-                let pointwise = step.pointwise(plan.module) || multivariate_density(step.op);
+                let pointwise =
+                    step.pointwise(plan.module) || multivariate_density(step.op) || scope.is_some();
                 contribution =
                     tensor::zero_when_masked(&mut emitter.module, bar, contribution, pointwise);
             }
@@ -405,6 +404,11 @@ fn forward_values(
             tangents.insert(Key::Node(step.node), tangent);
             continue;
         }
+        if let Some(scope) = plan.aggregates.get(&step.node) {
+            let tangent = scope.pushforward(emitter, rules, step, &tangents)?;
+            tangents.insert(Key::Node(step.node), tangent);
+            continue;
+        }
         step.check_types(plan.module)?;
         let terms: Vec<_> = step
             .targets
@@ -417,7 +421,7 @@ fn forward_values(
             })
             .map(|(slot, tangent)| {
                 let template = step.rule(rules, Mode::Jvp, slot)?;
-                let term = template.instantiate(emitter, step, tangent)?;
+                let term = template.instantiate(emitter, step, tangent, false)?;
                 if step.pointwise(plan.module) {
                     tensor::expand_like(emitter, term, step.node)
                 } else {
@@ -488,11 +492,11 @@ impl<'a> Query<'a> {
         if results.is_empty()
             || results
                 .iter()
-                .any(|&node| tensor::real_shape(module, node).is_none())
+                .any(|&node| !module.type_of(node).is_some_and(record::is_differentiable))
         {
             return Err(Error::new(
                 Some(result.rhs),
-                "`outputs` must contain real scalars or fixed-shape real arrays",
+                "`outputs` must contain real scalars, fixed-shape real arrays, or nonempty records of those",
             ));
         }
         let items = abi_terms(module, input);
@@ -675,6 +679,7 @@ struct Plan<'a> {
     activity: HashMap<Key, bool>,
     steps: Vec<Step<'a>>,
     integrals: HashMap<NodeId, integral::Scope<'a>>,
+    aggregates: HashMap<NodeId, aggregate::Scope<'a>>,
     in_integrand: bool,
 }
 
@@ -686,6 +691,7 @@ impl<'a> Plan<'a> {
             activity: HashMap::new(),
             steps: Vec::new(),
             integrals: HashMap::new(),
+            aggregates: HashMap::new(),
             in_integrand: false,
         }
     }
@@ -693,6 +699,10 @@ impl<'a> Plan<'a> {
     fn collect_rules(&self, mode: Mode, requests: &mut BTreeSet<rules::RuleKey<'a>>) {
         for step in &self.steps {
             if let Some(scope) = self.integrals.get(&step.node) {
+                scope.plan.collect_rules(Mode::Jvp, requests);
+                continue;
+            }
+            if let Some(scope) = self.aggregates.get(&step.node) {
                 scope.plan.collect_rules(Mode::Jvp, requests);
                 continue;
             }
@@ -734,6 +744,13 @@ impl<'a> Plan<'a> {
         };
         if matches!(op, flatppl_core::LOG_INTEGRAL | flatppl_core::MASS_INTEGRAL) {
             return integral::visit(self, node, op, &call.args, depth);
+        }
+        if op == "aggregate"
+            && call.named.is_empty()
+            && contract::SumProduct::read(self.module, &call.args).is_none()
+            && let Some(active) = aggregate::visit(self, node, &call.args, depth)?
+        {
+            return Ok(active);
         }
         if matches!(op, "elementof" | "external" | "load_data") {
             return Err(Error::new(
@@ -827,6 +844,15 @@ fn special_op(module: &Module, callee: NodeId) -> Option<&'static str> {
         "erf" => Some("erf"),
         "erfc" => Some("erfc"),
         "erfcx" => Some("erfcx"),
+        "log_ndtr" => Some("log_ndtr"),
+        "gammainc" => Some("gammainc"),
+        "gammaincc" => Some("gammaincc"),
+        "log_gammainc" => Some("log_gammainc"),
+        "log_gammaincc" => Some("log_gammaincc"),
+        "betainc" => Some("betainc"),
+        "betaincc" => Some("betaincc"),
+        "log_betainc" => Some("log_betainc"),
+        "log_betaincc" => Some("log_betaincc"),
         "digamma" => Some("digamma"),
         "polygamma" => Some("polygamma"),
         _ => None,
@@ -863,6 +889,8 @@ fn density_args(
     };
     let (rule, fields): (&str, &[&str]) = match module.resolve(*tag) {
         "Normal" => ("Normal log density", &["mu", "sigma"]),
+        "GeneralizedNormal" => ("GeneralizedNormal log density", &["mean", "alpha", "beta"]),
+        "VonMises" => ("VonMises log density", &["mu", "kappa"]),
         "ChiSquared" => ("ChiSquared log density", &["k"]),
         "Pareto" => ("Pareto log density", &["shape", "scale"]),
         "Rayleigh" => ("Rayleigh log density", &["scale"]),
@@ -891,6 +919,9 @@ fn density_args(
         "Poisson" => ("Poisson log density", &["rate"]),
         "Dirichlet" if !batched => ("Dirichlet log density", &["alpha"]),
         "MvNormal" if !batched => ("MvNormal log density", &["mu", "cov"]),
+        "Wishart" if !batched => ("Wishart log density", &["nu", "scale"]),
+        "InverseWishart" if !batched => ("InverseWishart log density", &["nu", "scale"]),
+        "Multinomial" if !batched => ("Multinomial log density", &["n", "p"]),
         "Uniform" => ("Uniform log density", &["support"]),
         _ => return None,
     };
@@ -933,6 +964,11 @@ fn density_args(
         .iter()
         .map(|&name| field(name))
         .collect::<Option<Vec<_>>>()?;
+    if rule == "Uniform log density"
+        && let Some([lo, hi]) = uniform_interval(module, query, args[0], batched)
+    {
+        return Some(("Uniform interval log density", vec![lo, hi, observation]));
+    }
     // A singleton wrapper around a probability vector shares it across all observations.
     // The inverse pass scatters the observation cotangents into that one vector.
     if matches!(
@@ -957,6 +993,33 @@ fn density_args(
     Some((rule, args))
 }
 
+fn uniform_interval(
+    module: &Module,
+    query: &Query<'_>,
+    set: NodeId,
+    batched: bool,
+) -> Option<[NodeId; 2]> {
+    let Key::Node(set) = query.key(module, set).ok()? else {
+        return None;
+    };
+    let set = if batched {
+        let &[set] = expect_builtin_call(module, set, "vector")?.args.as_ref() else {
+            return None;
+        };
+        let Key::Node(set) = query.key(module, set).ok()? else {
+            return None;
+        };
+        set
+    } else {
+        set
+    };
+    expect_builtin_call(module, set, "interval")?
+        .args
+        .as_ref()
+        .try_into()
+        .ok()
+}
+
 struct Step<'a> {
     node: NodeId,
     op: &'a str,
@@ -970,6 +1033,9 @@ fn multivariate_density(op: &str) -> bool {
         op,
         "Dirichlet log density"
             | "MvNormal log density"
+            | "Wishart log density"
+            | "InverseWishart log density"
+            | "Multinomial log density"
             | "Categorical log density"
             | "Categorical0 log density"
     )
@@ -979,9 +1045,15 @@ fn structural(op: &str) -> bool {
     matches!(
         op,
         "sum"
+            | "cumsum"
+            | "cummax"
+            | "cummin"
+            | "reverse"
             | "mean"
             | "logsumexp"
             | "vector"
+            | "cat"
+            | "record"
             | "addaxes"
             | "get"
             | "get0"
@@ -990,6 +1062,7 @@ fn structural(op: &str) -> bool {
             | "rowstack"
             | "colstack"
             | "matrix product"
+            | "scoped aggregate"
             | "transpose"
             | "iid Categorical log density"
             | "iid Categorical0 log density"
@@ -1033,6 +1106,14 @@ impl<'a> Step<'a> {
     }
 
     fn check_types(&self, module: &Module) -> Result<(), Error> {
+        if self.op == "record"
+            && !self.broadcast
+            && module
+                .type_of(self.node)
+                .is_some_and(record::is_differentiable)
+        {
+            return Ok(());
+        }
         let nested_vector = |node| tensor::nested_vector(module, node).is_some();
         let record_access =
             matches!(self.op, "get" | "get0") && record::is_access(module, &self.args);
@@ -1099,6 +1180,14 @@ impl<'a> Step<'a> {
             return Err(Error::new(
                 Some(self.node),
                 "stack pullback requires equal-length vectors",
+            ));
+        }
+        if matches!(self.op, "cumsum" | "cummax" | "cummin" | "reverse")
+            && !matches!(tensor::real_shape(module, self.node), Some([_]))
+        {
+            return Err(Error::new(
+                Some(self.node),
+                "cumulative and reverse pullbacks require a fixed-length real vector",
             ));
         }
         if self.op == "det" && !math::cofactor_shape(module, self.args[0]) {

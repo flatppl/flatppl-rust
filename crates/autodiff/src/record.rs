@@ -1,6 +1,6 @@
 //! Cotangents for records with fixed-shape real leaves.
 
-use flatppl_core::graph::{build_call, build_record};
+use flatppl_core::graph::{build_call, build_record, expect_builtin_call, rebuild_with_children};
 use flatppl_core::{
     Call, CallHead, Module, NamedArg, NamedKind, Node, NodeId, Scalar, Symbol, Type,
 };
@@ -89,6 +89,39 @@ pub(super) fn add(emitter: &mut Emitter, fields: &Fields, records: &[NodeId]) ->
         })
         .collect();
     build_record(&mut emitter.module, &terms)
+}
+
+pub(super) fn pick(
+    emitter: &mut Emitter,
+    primal: NodeId,
+    adjoint: NodeId,
+    slot: usize,
+) -> Option<NodeId> {
+    let constructor = expect_builtin_call(&emitter.module, primal, "record")?;
+    let name = constructor.named.get(slot)?.name;
+    Some(project(&mut emitter.module, adjoint, name))
+}
+
+pub(super) fn embed(
+    emitter: &mut Emitter,
+    primal: NodeId,
+    tangent: NodeId,
+    slot: usize,
+) -> Option<NodeId> {
+    let constructor = expect_builtin_call(&emitter.module, primal, "record")?;
+    let members: Vec<_> = constructor.named.iter().map(|field| field.value).collect();
+    let values: Vec<_> = members
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if index == slot {
+                Some(tangent)
+            } else {
+                emitter.zero_like(value).ok()
+            }
+        })
+        .collect::<Option<_>>()?;
+    Some(rebuild_with_children(&mut emitter.module, primal, &values))
 }
 
 pub(super) fn scatter(

@@ -183,16 +183,37 @@ fn literal_only_and_all_slice_and_collapse_axes() {
 }
 
 #[test]
-fn unsupported_advanced_selectors_refuse() {
-    let multiple = emit(
-        "flatppl_compat = \"0.1\"\n\
-         matrix = elementof(cartpow(reals, [4, 3]))\n\
-         selected = get(matrix, [1, 2], [2, 1])\n\
-         inputs = (matrix)\noutputs = (selected)\n",
-    )
-    .expect_err("multiple vector selectors remain outside this lowering");
-    assert!(multiple.msg.contains("multiple integer-vector selectors"));
+fn independent_vector_selectors_form_a_cartesian_selection() {
+    let base = "matrix = elementof(cartpow(reals, [4, 3]))
+inputs = matrix
+";
+    let implicit = emit(&format!(
+        "{base}outputs = get(matrix, [3, 1, 3])
+"
+    ))
+    .unwrap();
+    let explicit = emit(&format!(
+        "{base}outputs = get(matrix, [3, 1, 3], all)
+"
+    ))
+    .unwrap();
+    assert_eq!(implicit, explicit);
 
+    let selected = emit(&format!(
+        "{base}outputs = get(matrix, [3, 1, 3], [3, 1, 1, 2])
+"
+    ))
+    .expect("row and column selectors take their Cartesian product");
+    assert!(selected.contains("-> tensor<3x4xf32>"), "{selected}");
+    assert_eq!(
+        selected.matches(r#""stablehlo.gather""#).count(),
+        2,
+        "{selected}"
+    );
+}
+
+#[test]
+fn unsupported_advanced_selectors_refuse() {
     let non_numeric = emit(
         "flatppl_compat = \"0.1\"\n\
          matrix = elementof(cartpow(booleans, [4, 3]))\n\
@@ -217,7 +238,7 @@ fn unsupported_advanced_selectors_refuse() {
          inputs = (a)\noutputs = (selected)\n",
     )
     .expect_err("nested array cells are not flat matrices");
-    assert!(nested.msg.contains("every cell axis must be selected"));
+    assert!(nested.msg.contains("too many selectors"));
 
     let batch_varying = emit(
         "flatppl_compat = \"0.1\"\n\

@@ -89,3 +89,42 @@ outputs = 2.0 * p.a + sum(p.b .* p.b) + p.c.d * p.a
         flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
     }
 }
+
+#[test]
+fn directional_products_preserve_record_outputs_and_nested_vectors() {
+    let module = lower(
+        "
+x = elementof(cartpow(reals, 3))
+y = elementof(reals)
+result = record(loss = y * sum(x), extras = record(rows = [x, x .* y], idle = 3.0))
+inputs = (x, y)
+outputs = (result, x)
+",
+    );
+    for transformed in [jvp, vjp] {
+        let derivative = transformed(&module, &["x", "y"]).unwrap();
+        let printed = flatppl_syntax::print(&derivative);
+        let reparsed = lower(&printed);
+        flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
+    }
+}
+
+#[test]
+fn concatenating_differently_sized_vectors_splits_cotangents_at_the_original_boundaries() {
+    let module = lower(
+        "
+x = elementof(cartpow(reals, 2))
+z = elementof(cartpow(reals, 3))
+joined = cat(x, [4, 5, 6, 7], z)
+weighted = joined .* [1, 2, 3, 4, 5, 6, 7, 8, 9]
+inputs = (x, z)
+outputs = sum(weighted)
+",
+    );
+    for transformed in [gradient, jvp, vjp] {
+        let derivative = transformed(&module, &["x", "z"]).unwrap();
+        let printed = flatppl_syntax::print(&derivative);
+        let reparsed = lower(&printed);
+        flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
+    }
+}

@@ -19,7 +19,9 @@ pub(super) fn legalize(module: &Module, query: &Query<'_>) -> Option<Module> {
         expect_builtin_call(module, NodeId::from_usize(index), "broadcast")
             .and_then(|call| call.args.first())
             .is_some_and(|&head| {
-                expect_builtin_call(module, resolve_ref(module, head).0, "functionof").is_some()
+                let head = resolve_ref(module, head).0;
+                expect_builtin_call(module, head, "functionof").is_some()
+                    || matches!(module.node(head), Node::Const(op) if cumulative(module.resolve(*op)))
             })
     }) {
         return None;
@@ -87,7 +89,9 @@ impl Walker<'_> {
                     }
                     rebuilt
                 };
-                lift_broadcast(self.module, self.inputs, current).unwrap_or(current)
+                lift_broadcast(self.module, self.inputs, current)
+                    .or_else(|| expand_cumulative(self.module, self.inputs, current))
+                    .unwrap_or(current)
             }
             _ => node,
         };
@@ -103,16 +107,7 @@ fn lift_broadcast(
 ) -> Option<NodeId> {
     let call = expect_builtin_call(module, node, "broadcast")?.clone();
     let (&head, positional) = call.args.split_first()?;
-    let mut head = head;
-    for _ in 0..=DEFAULT_MAX_DEPTH {
-        let (rhs, Some(binding)) = resolve_ref_one(module, head) else {
-            break;
-        };
-        if inputs.contains(&binding) {
-            return None;
-        }
-        head = rhs;
-    }
+    let head = resolve_unpromoted(module, inputs, head)?;
     let function = expect_builtin_call(module, head, "functionof")?;
     let [body] = *function.args else { return None };
     let boundary = function.inputs.as_ref()?;
@@ -147,8 +142,12 @@ fn lift_broadcast(
     scope.depends(body, 0)?;
     let result = scope.expression(body)?;
     let result = expand(scope.module, result, shape, elem)?;
-    let (types, diagnostics) = flatppl_infer::infer_expression(scope.module, result.value, &[]);
-    if types.get(&result.value) != Some(&expected)
+    annotate_equivalent(scope.module, result.value, &expected)
+}
+
+fn annotate_equivalent(module: &mut Module, result: NodeId, expected: &Type) -> Option<NodeId> {
+    let (types, diagnostics) = flatppl_infer::infer_expression(module, result, &[]);
+    if types.get(&result) != Some(expected)
         || diagnostics
             .iter()
             .any(|diag| diag.severity == flatppl_infer::Severity::Error)
@@ -156,11 +155,28 @@ fn lift_broadcast(
         return None;
     }
     for (node, ty) in types {
-        if scope.module.type_of(node).is_none() {
-            scope.module.set_type(node, ty);
+        if module.type_of(node).is_none() {
+            module.set_type(node, ty);
         }
     }
-    Some(result.value)
+    Some(result)
+}
+
+fn resolve_unpromoted(
+    module: &Module,
+    inputs: &HashSet<BindingId>,
+    mut node: NodeId,
+) -> Option<NodeId> {
+    for _ in 0..=DEFAULT_MAX_DEPTH {
+        let (rhs, Some(binding)) = resolve_ref_one(module, node) else {
+            return Some(node);
+        };
+        if inputs.contains(&binding) {
+            return None;
+        }
+        node = rhs;
+    }
+    None
 }
 
 fn scalar(ty: &Type) -> bool {
@@ -265,6 +281,38 @@ impl Scope<'_> {
         Some(cell)
     }
 
+    fn instantiate(&mut self, node: NodeId) -> Option<NodeId> {
+        if !self.depends(node, 0)? {
+            return Some(node);
+        }
+        if let Some(cell) = self.lifted.get(&node) {
+            return Some(cell.value);
+        }
+        let value = match self.module.node(node) {
+            Node::Ref(reference) => {
+                let reference = *reference;
+                if let Some(target) = self.target(reference) {
+                    target.value
+                } else {
+                    self.instantiate(self.rhs(reference)?)?
+                }
+            }
+            Node::Call(_) => {
+                let children = self
+                    .module
+                    .node(node)
+                    .children()
+                    .into_iter()
+                    .map(|child| self.instantiate(child))
+                    .collect::<Option<Vec<_>>>()?;
+                rebuild_with_children(self.module, node, &children)
+            }
+            _ => return None,
+        };
+        self.lifted.insert(node, Cell::scalar(value));
+        Some(value)
+    }
+
     fn call(&mut self, call: Call) -> Option<Cell> {
         let CallHead::Builtin(op) = call.head else {
             return None;
@@ -278,6 +326,7 @@ impl Scope<'_> {
         }
         match name.as_str() {
             "get" => return self.projection(&call.args),
+            "in" => return self.membership(&call.args),
             "logsumexp" => return self.logsumexp(&call.args),
             _ => {}
         }
@@ -313,6 +362,32 @@ impl Scope<'_> {
             node = rhs;
         }
         node
+    }
+
+    fn membership(&mut self, args: &[NodeId]) -> Option<Cell> {
+        let [point, set] = *args else {
+            return None;
+        };
+        if self.depends(set, 0)? {
+            return None;
+        }
+        let point = self.expression(point)?;
+        let m = &mut *self.module;
+        let value = if point.shape.is_empty() {
+            build_call(m, "in", &[point.value, set])
+        } else {
+            // Keep the set in the callable scope. It has no numeric
+            // representation and is not itself a mapped argument.
+            let mut entries = Vec::new();
+            let argument = callback_input(m, "point", &mut entries);
+            let body = build_call(m, "in", &[argument, set]);
+            let function = reify(m, body, entries);
+            build_call(m, "broadcast", &[function, point.value])
+        };
+        Some(Cell {
+            value,
+            shape: point.shape,
+        })
     }
 
     fn projection(&mut self, args: &[NodeId]) -> Option<Cell> {
@@ -441,7 +516,7 @@ fn broadcast_density(
     let mut parameters = Vec::with_capacity(fields.len());
     for (name, argument) in fields {
         let label = format!("parameter_{}", module.resolve(name));
-        let reference = density_input(module, &label, &mut entries);
+        let reference = callback_input(module, &label, &mut entries);
         parameters.push(NamedArg {
             kind: NamedKind::Field,
             name,
@@ -456,25 +531,29 @@ fn broadcast_density(
         named: parameters.into(),
         inputs: None,
     }));
-    let observation_ref = density_input(module, "observation", &mut entries);
+    let observation_ref = callback_input(module, "observation", &mut entries);
     let body = build_call(
         module,
         "builtin_logdensityof",
         &[tag, params, observation_ref],
     );
-    let functionof = module.intern("functionof");
-    let function = module.alloc(Node::Call(Call {
-        head: CallHead::Builtin(functionof),
-        args: Box::new([body]),
-        named: Box::new([]),
-        inputs: Some(Inputs::Spec(entries.into())),
-    }));
+    let function = reify(module, body, entries);
     arguments.insert(0, function);
     arguments.push(observation);
     build_call(module, "broadcast", &arguments)
 }
 
-fn density_input(module: &mut Module, label: &str, entries: &mut Vec<(Symbol, Ref)>) -> NodeId {
+fn reify(module: &mut Module, body: NodeId, entries: Vec<(Symbol, Ref)>) -> NodeId {
+    let functionof = module.intern("functionof");
+    module.alloc(Node::Call(Call {
+        head: CallHead::Builtin(functionof),
+        args: Box::new([body]),
+        named: Box::new([]),
+        inputs: Some(Inputs::Spec(entries.into())),
+    }))
+}
+
+fn callback_input(module: &mut Module, label: &str, entries: &mut Vec<(Symbol, Ref)>) -> NodeId {
     let target = Ref {
         ns: RefNs::Local,
         name: module.intern(&format!("_{label}_")),
@@ -543,6 +622,107 @@ pub(super) fn density_operands(module: &Module, node: NodeId) -> Option<DensityO
         fields,
         observation: operand(observation)?,
     })
+}
+
+fn cumulative(name: &str) -> bool {
+    matches!(name, "cumsum" | "cummax" | "cummin")
+}
+
+/// Specialize small fixed-length vector maps without crossing a reification
+/// boundary or assigning one cell's placeholders to another cell.
+fn expand_cumulative(
+    module: &mut Module,
+    inputs: &HashSet<BindingId>,
+    node: NodeId,
+) -> Option<NodeId> {
+    // Explicit cells make one copy of the body per lane. Keep this fallback
+    // bounded until the AD graph can describe a vectorized structured map.
+    const MAX_EXPLICIT_CELLS: u32 = 32;
+    let expected = module.type_of(node)?.clone();
+    let (length, _) = tensor::nested_vector_type(&expected)?;
+    if length > MAX_EXPLICIT_CELLS {
+        return None;
+    }
+    let call = expect_builtin_call(module, node, "broadcast")?.clone();
+    let (&head, args) = call.args.split_first()?;
+    let head = resolve_unpromoted(module, inputs, head)?;
+    let mut cells = Vec::with_capacity(length as usize);
+    if let Node::Const(op) = module.node(head) {
+        let op = module.resolve(*op).to_owned();
+        let [operand] = *args else {
+            return None;
+        };
+        if !cumulative(&op) || !call.named.is_empty() {
+            return None;
+        }
+        for index in 0..length {
+            let cell = pick_cell(module, inputs, operand, index, length)?;
+            cells.push(build_call(module, &op, &[cell]));
+        }
+    } else {
+        let function = expect_builtin_call(module, head, "functionof")?;
+        let [body] = *function.args else {
+            return None;
+        };
+        let body_op = match module.node(resolve_unpromoted(module, inputs, body)?) {
+            Node::Call(call) => match call.head {
+                CallHead::Builtin(op) => module.resolve(op),
+                CallHead::User(_) => return None,
+            },
+            _ => return None,
+        };
+        if !cumulative(body_op) {
+            return None;
+        }
+        let boundary = function.inputs.as_ref()?;
+        let entries = reified_inputs(module, head, boundary)?.to_vec();
+        let keyword_only = matches!(boundary, Inputs::Auto);
+        let names: Vec<_> = entries.iter().map(|&(label, _)| label).collect();
+        let operands = bind_call_args(module, &names, args, &call.named, keyword_only)?;
+        for index in 0..length {
+            let mut bound = Vec::with_capacity(entries.len());
+            for ((_, reference), &value) in entries.iter().zip(&operands) {
+                let value = pick_cell(module, inputs, value, index, length)?;
+                bound.push((*reference, Cell::scalar(value)));
+            }
+            let mut scope = Scope {
+                module,
+                inputs,
+                bound,
+                dependencies: HashMap::new(),
+                lifted: HashMap::new(),
+            };
+            scope.depends(body, 0)?;
+            cells.push(scope.instantiate(body)?);
+        }
+    }
+    let result = build_call(module, "vector", &cells);
+    annotate_equivalent(module, result, &expected)
+}
+
+fn pick_cell(
+    module: &mut Module,
+    inputs: &HashSet<BindingId>,
+    value: NodeId,
+    index: u32,
+    length: u32,
+) -> Option<NodeId> {
+    let extent = match module.type_of(value)? {
+        Type::Array { shape, .. } => match shape.as_ref() {
+            [Dim::Static(extent)] if *extent == length || *extent == 1 => *extent,
+            _ => return None,
+        },
+        ty if scalar(ty) => return Some(value),
+        _ => return None,
+    };
+    let index = if extent == 1 { 0 } else { index };
+    if let Some(resolved) = resolve_unpromoted(module, inputs, value)
+        && let Some(vector) = expect_builtin_call(module, resolved, "vector")
+    {
+        return vector.args.get(index as usize).copied();
+    }
+    let position = tensor::int(module, i64::from(index) + 1);
+    Some(build_call(module, "get", &[value, position]))
 }
 
 /// Scalar kernels whose operation has the same meaning in base broadcast.

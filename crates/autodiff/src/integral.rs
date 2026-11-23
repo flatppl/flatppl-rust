@@ -1,10 +1,10 @@
 //! Differentiate the mathematical integral, independently of the quadrature mesh.
 
 use flatppl_core::graph::{build_call, expect_builtin_call, rebuild_with_children};
-use flatppl_core::{CallHead, LOG_INTEGRAL, MASS_INTEGRAL, Scalar};
+use flatppl_core::{CallHead, Dim, LOG_INTEGRAL, MASS_INTEGRAL, Scalar};
 
-use crate::{Emitter, Error, HashMap, HashSet, Key, Module, Node, NodeId, Plan, Query, REAL, Step};
-use crate::{forward_values, real, rules::Rules};
+use crate::{Emitter, Error, HashMap, HashSet, Key, Module, Node, NodeId, Plan, Query, Step};
+use crate::{forward_values, real, rules::Rules, tensor};
 
 pub(super) struct Scope<'a> {
     pub(super) plan: Plan<'a>,
@@ -123,23 +123,63 @@ impl<'a> Scope<'a> {
         let factor = if slot < fixed {
             self.boundary(emitter, step.node, slot)
         } else {
-            let arg = step.args[slot];
-            if self.plan.module.type_of(arg) != Some(&REAL) {
-                return Err(Error::new(
-                    Some(arg),
-                    "a numerical integral pullback needs a scalar capture",
-                ));
-            }
-            let one = real(&mut emitter.module, 1.0);
-            self.interior(
-                emitter,
-                rules,
-                step.node,
-                HashMap::from([(step.targets[slot].unwrap(), one)]),
-            )?
-            .ok_or_else(|| Error::new(Some(step.node), "missing active integrand derivative"))?
+            self.capture_pullback(emitter, rules, step, slot)?
         };
         Ok(build_call(&mut emitter.module, "mul", &[cotangent, factor]))
+    }
+
+    fn capture_pullback(
+        &self,
+        emitter: &mut Emitter,
+        rules: &Rules<'a>,
+        step: &Step<'_>,
+        slot: usize,
+    ) -> Result<NodeId, Error> {
+        let arg = step.args[slot];
+        let key = step.targets[slot].unwrap();
+        let integrate = |emitter: &mut Emitter, direction| {
+            self.interior(emitter, rules, step.node, HashMap::from([(key, direction)]))?
+                .ok_or_else(|| Error::new(Some(step.node), "missing active integrand derivative"))
+        };
+        // Quadrature emits a scalar. Integrate one basis direction per cell,
+        // then restore the capture's shape outside the integration binder.
+        match tensor::real_shape(self.plan.module, arg) {
+            Some([]) => {
+                let one = real(&mut emitter.module, 1.0);
+                integrate(emitter, one)
+            }
+            Some(shape) if shape.contains(&Dim::Static(0)) => emitter.zero_like(arg),
+            Some([Dim::Static(n)]) => {
+                let terms = (1..=*n)
+                    .map(|i| {
+                        let basis = basis_vector(&mut emitter.module, i, *n);
+                        integrate(emitter, basis)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(build_call(&mut emitter.module, "vector", &terms))
+            }
+            Some([Dim::Static(rows), Dim::Static(cols)]) => {
+                let mut vectors = Vec::new();
+                for i in 1..=*rows {
+                    let axis = basis_vector(&mut emitter.module, i, *rows);
+                    let rows = singleton_axis(&mut emitter.module, axis, false);
+                    let mut terms = Vec::new();
+                    for j in 1..=*cols {
+                        let axis = basis_vector(&mut emitter.module, j, *cols);
+                        let cols = singleton_axis(&mut emitter.module, axis, true);
+                        let basis = tensor::broadcast(&mut emitter.module, "mul", &[rows, cols]);
+                        terms.push(integrate(emitter, basis)?);
+                    }
+                    vectors.push(build_call(&mut emitter.module, "vector", &terms));
+                }
+                let vectors = build_call(&mut emitter.module, "vector", &vectors);
+                Ok(build_call(&mut emitter.module, "rowstack", &[vectors]))
+            }
+            _ => Err(Error::new(
+                Some(arg),
+                "a numerical integral pullback needs a real scalar, fixed vector, or fixed matrix capture",
+            )),
+        }
     }
 
     pub(super) fn pushforward(
@@ -327,6 +367,18 @@ impl<'a> Scope<'a> {
         let inside = build_call(module, "lt", &[cut.value, hi]);
         build_call(module, "ifelse", &[inside, delta, zero])
     }
+}
+
+fn basis_vector(module: &mut Module, index: u32, len: u32) -> NodeId {
+    let index = tensor::int(module, i64::from(index));
+    let len = tensor::int(module, i64::from(len));
+    build_call(module, "onehot", &[index, len])
+}
+
+fn singleton_axis(module: &mut Module, vector: NodeId, leading: bool) -> NodeId {
+    let left = tensor::int(module, i64::from(leading));
+    let right = tensor::int(module, i64::from(!leading));
+    build_call(module, "addaxes", &[vector, left, right])
 }
 
 fn interior_point(module: &mut Module, lo: NodeId, hi: NodeId) -> NodeId {

@@ -5,7 +5,7 @@ use egglog::{CommandOutput, EGraph, Term, TermDag, TermId};
 use flatppl_core::graph::{build_call, expect_builtin_call, special_functions_alias};
 use flatppl_core::{Call, CallHead, Module, Node, NodeId, Ref, RefNs};
 
-use crate::{Emitter, Error, Step, contract, math, real, tensor};
+use crate::{Emitter, Error, Step, contract, math, real, record, tensor};
 
 pub(super) type RuleKey<'a> = (&'static str, &'a str, usize, usize);
 
@@ -72,10 +72,12 @@ impl Template {
         emitter: &mut Emitter,
         step: &Step<'_>,
         bar: NodeId,
+        masked: bool,
     ) -> Result<NodeId, Error> {
         let mut values = Values {
             step,
             bar,
+            masked,
             pointwise: step.pointwise(&emitter.module),
             terms: HashMap::new(),
         };
@@ -157,6 +159,22 @@ impl Template {
                 let index = tensor::int(&mut emitter.module, self.int(*index)?);
                 build_call(&mut emitter.module, "get", &[bar, index])
             }
+            ("RecordPick" | "RecordEmbed", [slot]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                if head == "RecordPick" {
+                    record::pick(emitter, values.step.node, values.bar, slot)?
+                } else {
+                    record::embed(emitter, values.step.node, values.bar, slot)?
+                }
+            }
+            ("CatSlice" | "CatEmbed", [slot]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                if head == "CatSlice" {
+                    tensor::cat_slice(emitter, values.bar, &values.step.args, slot)?
+                } else {
+                    tensor::cat_embed(emitter, values.bar, &values.step.args, slot)?
+                }
+            }
             ("StackPick", [index, columns]) => tensor::stack_pick(
                 &mut emitter.module,
                 values.bar,
@@ -199,6 +217,19 @@ impl Template {
                 let (&primal, selectors) = values.step.args.split_first()?;
                 tensor::scatter(emitter, bar, primal, selectors, self.int(*base)?)?
             }
+            ("CumulativeExtreme" | "CumulativeExtremeForward", [maximum]) => {
+                let [input] = *values.step.args.as_slice() else {
+                    return None;
+                };
+                tensor::cumulative_extreme(
+                    emitter,
+                    values.bar,
+                    input,
+                    values.step.node,
+                    self.int(*maximum)? == 1,
+                    head == "CumulativeExtremeForward",
+                )?
+            }
             ("LogSumExp", [forward]) => {
                 let [input] = *values.step.args.as_slice() else {
                     return None;
@@ -230,12 +261,20 @@ impl Template {
                 let right = self.emit(*right, emitter, values)?;
                 math::dot(&mut emitter.module, left, right)
             }
+            ("MatrixPullback", [slot, regular]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                if values.masked {
+                    contract::matrix_pullback(emitter, values.step, values.bar, slot)?
+                } else {
+                    self.emit(*regular, emitter, values)?
+                }
+            }
             ("IndexedProduct", [slot, forward]) => {
                 let slot = usize::try_from(self.int(*slot)?).ok()?;
                 let forward = self.int(*forward)? != 0;
                 let call = expect_builtin_call(&emitter.module, values.step.node, "aggregate")?;
                 let contraction = contract::SumProduct::read(&emitter.module, &call.args)?;
-                contraction.contribution(emitter, values.bar, slot, forward)?
+                contraction.contribution(emitter, values.bar, slot, forward, values.masked)?
             }
             ("PolynomialSlope", []) => {
                 let [coefficients, x] = *values.step.args.as_slice() else {
@@ -295,6 +334,7 @@ impl Template {
 struct Values<'a> {
     step: &'a Step<'a>,
     bar: NodeId,
+    masked: bool,
     pointwise: bool,
     terms: HashMap<TermId, NodeId>,
 }

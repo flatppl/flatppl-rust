@@ -2754,6 +2754,10 @@ fn broadcast_collection_cell(name: &str, cell: &Type) -> Option<Type> {
         "var" | "std" | "median" | "quantile" | "l1norm" | "l2norm" | "linfnorm" | "logsumexp" => {
             matches!(elem, Type::Scalar(_)).then_some(Type::Scalar(ScalarType::Real))
         }
+        "cumsum" | "cumprod" if bool_elem_array(Some(cell)) => {
+            Some(cumulative_bool_type(Some(cell)))
+        }
+        "cumsum" | "cumprod" | "cummax" | "cummin" => Some(cell.clone()),
         "lany" | "lall" => Some(Type::Scalar(ScalarType::Boolean)),
         "lengthof" => Some(Type::Scalar(ScalarType::Integer)),
         "sizeof" => Some(sizeof_type(Some(cell))),

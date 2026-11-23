@@ -63,3 +63,75 @@ outputs = first + second
     assert!(diagnostics.iter().all(|d| d.severity != Severity::Error));
     flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
 }
+
+#[test]
+fn differentiates_retained_normal_log_mass() {
+    use flatppl_autodiff::{determinize_query_with_options, gradient_with_options};
+    use flatppl_determinizer::LoweringOptions;
+
+    let source = "
+mu = elementof(reals)
+sigma = elementof(posreals)
+lo = elementof(reals)
+hi = elementof(reals)
+x = elementof(reals)
+law = normalize(truncate(Normal(mu, sigma), interval(lo, hi)))
+inputs = (mu, sigma, lo, hi, x)
+outputs = logdensityof(law, x)
+";
+    let mut module = flatppl_syntax::parse(source).unwrap();
+    let diagnostics = flatppl_infer::infer(&mut module);
+    assert!(diagnostics.iter().all(|d| d.severity != Severity::Error));
+    for compact_log_cdf_difference in [false, true] {
+        let options = LoweringOptions {
+            compact_log_cdf_difference,
+            retain_standard_functions: &[("special-functions", "log_ndtr")],
+            ..Default::default()
+        };
+        let deterministic =
+            determinize_query_with_options(&module, &ModuleBundle::new(), &options).unwrap();
+        let derivative =
+            gradient_with_options(&deterministic, &["mu", "sigma", "lo", "hi", "x"], &options)
+                .unwrap();
+        let text = flatppl_syntax::print(&derivative);
+        assert!(text.contains(".log_ndtr("), "{text}");
+        assert!(text.contains(".erfcx("), "{text}");
+    }
+}
+
+#[test]
+fn differentiates_standard_normal_cdf_and_quantile() {
+    for function in ["invprobit", "probit"] {
+        let mut module = flatppl_syntax::parse(&format!(
+            "x = elementof(reals)\ninputs = x\noutputs = {function}(x)\n"
+        ))
+        .unwrap();
+        let diagnostics = flatppl_infer::infer(&mut module);
+        assert!(diagnostics.iter().all(|d| d.severity != Severity::Error));
+        let deterministic = determinize_query(&module, &ModuleBundle::new()).unwrap();
+        gradient(&deterministic, &["x"]).unwrap();
+    }
+}
+
+#[test]
+fn differentiates_incomplete_tails_in_the_integration_limit() {
+    for (family, parameters) in [("gamma", "a"), ("beta", "a, b")] {
+        for (prefix, suffix) in [("", ""), ("", "c"), ("log_", ""), ("log_", "c")] {
+            let function = format!("{prefix}{family}inc{suffix}");
+            let source = format!(
+                "sp = standard_module(\"special-functions\", \"0.1\")\n\
+                 a = elementof(posreals)\n\
+                 b = elementof(posreals)\n\
+                 x = elementof(reals)\n\
+                 inputs = (a, b, x)\n\
+                 outputs = sp.{function}({parameters}, x)\n"
+            );
+            let mut module = flatppl_syntax::parse(&source).unwrap();
+            let diagnostics = flatppl_infer::infer(&mut module);
+            assert!(diagnostics.iter().all(|d| d.severity != Severity::Error));
+            let deterministic = determinize_query(&module, &ModuleBundle::new()).unwrap();
+            gradient(&deterministic, &["x"]).unwrap_or_else(|error| panic!("{function}: {error}"));
+            assert!(gradient(&deterministic, &["a"]).is_err(), "{function}");
+        }
+    }
+}
