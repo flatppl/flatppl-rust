@@ -1414,3 +1414,29 @@ fn fixed_filter_counts_broadcast_mask_cells() {
         "{runtime}"
     );
 }
+
+#[test]
+fn fixed_filter_leaves_precision_dependent_lengths_dynamic() {
+    let source = "a = [1.0, 1.00000001, 1.0000001]\n\
+        kept = filter(i -> a[i] > 1.0, [1, 2, 3])\n";
+    let out = ir(source);
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (%dynamic) (%scalar integer))"),
+        "{out}"
+    );
+
+    let out = ir(&source.replace("1.00000001, 1.0000001", "1.25, 1.5"));
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (2) (%scalar integer))"),
+        "{out}"
+    );
+}
+
+#[test]
+fn fixed_filter_does_not_prove_masks_with_narrow_integer_overflow() {
+    let out = ir("kept = filter(i -> i * 1073741824 > 0, [1, 2, 3])");
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (%dynamic) (%scalar integer))"),
+        "{out}"
+    );
+}

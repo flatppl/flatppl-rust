@@ -559,7 +559,7 @@ impl Filter<'_, '_, '_> {
                 .map(|&a| {
                     let value = self.number(a, None, depth + 1)?;
                     if real {
-                        Some(FixedValue::Real(as_real(&value)?))
+                        Some(FixedValue::Real(exact_real(&value)?))
                     } else {
                         Some(value)
                     }
@@ -600,7 +600,7 @@ impl Filter<'_, '_, '_> {
     ) -> Option<FixedValue> {
         let node = self.container(node, depth)?;
         match self.inf.module.node(node) {
-            Node::Lit(Scalar::Int(n)) => Some(FixedValue::Int(*n)),
+            Node::Lit(Scalar::Int(n)) => exact_filter_int(*n),
             Node::Lit(Scalar::Real(x)) => Some(FixedValue::Real(*x)),
             Node::Ref(r) if r.ns == RefNs::Local => {
                 let (name, value) = param?;
@@ -614,7 +614,7 @@ impl Filter<'_, '_, '_> {
                     "neg" => {
                         let [arg] = *c.args else { return None };
                         match self.number(arg, param, depth + 1)? {
-                            FixedValue::Int(x) => Some(FixedValue::Int(x.checked_neg()?)),
+                            FixedValue::Int(x) => exact_filter_int(x.checked_neg()?),
                             FixedValue::Real(x) => Some(FixedValue::Real(-x)),
                             FixedValue::Vec(_) => None,
                         }
@@ -623,7 +623,10 @@ impl Filter<'_, '_, '_> {
                         let [a, b] = *c.args else { return None };
                         let a = self.number(a, param, depth + 1)?;
                         let b = self.number(b, param, depth + 1)?;
-                        eval_arith(op, &a, &b)
+                        let FixedValue::Int(value) = eval_arith(op, &a, &b)? else {
+                            return None;
+                        };
+                        exact_filter_int(value)
                     }
                     op @ ("get" | "get0") => {
                         let (&data, selectors) = c.args.split_first()?;
@@ -818,8 +821,8 @@ impl Filter<'_, '_, '_> {
             return None;
         };
         Some((
-            as_real(&self.number(lo, None, depth + 1)?)?,
-            as_real(&self.number(hi, None, depth + 1)?)?,
+            exact_real(&self.number(lo, None, depth + 1)?)?,
+            exact_real(&self.number(hi, None, depth + 1)?)?,
         ))
     }
 
@@ -849,7 +852,7 @@ impl Filter<'_, '_, '_> {
                 Some(value)
             }
             ("in", [a, set]) => {
-                let x = as_real(&self.number(*a, Some(param), depth + 1)?)?;
+                let x = exact_real(&self.number(*a, Some(param), depth + 1)?)?;
                 let (lo, hi) = self.interval(*set, depth + 1)?;
                 Some(lo <= x && x <= hi)
             }
@@ -872,7 +875,7 @@ impl Filter<'_, '_, '_> {
 
 fn scalar_number(value: Scalar) -> Option<FixedValue> {
     match value {
-        Scalar::Int(value) => Some(FixedValue::Int(value)),
+        Scalar::Int(value) => exact_filter_int(value),
         Scalar::Real(value) => Some(FixedValue::Real(value)),
         _ => None,
     }
@@ -882,7 +885,7 @@ fn fixed_comparison(op: &str, lhs: &FixedValue, rhs: &FixedValue) -> Option<bool
     let order = match (lhs, rhs) {
         (FixedValue::Int(a), FixedValue::Int(b)) => Some(a.cmp(b)),
         _ if matches!(op, "equal" | "unequal") => return None,
-        _ => as_real(lhs)?.partial_cmp(&as_real(rhs)?),
+        _ => exact_real(lhs)?.partial_cmp(&exact_real(rhs)?),
     };
     Some(match op {
         "lt" => order.is_some_and(|o| o.is_lt()),
@@ -895,12 +898,21 @@ fn fixed_comparison(op: &str, lhs: &FixedValue, rhs: &FixedValue) -> Option<bool
     })
 }
 
-fn as_real(value: &FixedValue) -> Option<f64> {
-    match value {
-        FixedValue::Int(x) => Some(*x as f64),
-        FixedValue::Real(x) => Some(*x),
-        FixedValue::Vec(_) => None,
-    }
+fn exact_filter_int(value: i64) -> Option<FixedValue> {
+    i32::try_from(value).ok().map(|_| FixedValue::Int(value))
+}
+
+// Shape inference runs before a target precision is selected. A real
+// comparison only proves a mask element if its operands survive conversion
+// to f32 exactly. Decline subnormals as targets may flush them to zero.
+fn exact_real(value: &FixedValue) -> Option<f64> {
+    let real = match value {
+        FixedValue::Int(x) => *x as f64,
+        FixedValue::Real(x) => *x,
+        FixedValue::Vec(_) => return None,
+    };
+    let narrow = real as f32;
+    (f64::from(narrow) == real && (narrow.is_normal() || narrow == 0.0)).then_some(real)
 }
 
 fn is_builtin(inf: &Inferencer<'_, '_>, c: &Call, name: &str) -> bool {
