@@ -15,7 +15,7 @@ use flatppl_stablehlo::{BatchSpec, EmitOptions};
 use serde::Serialize;
 
 use crate::Constant;
-use crate::export::{Export, emit_query};
+use crate::export::{Export, emit_prepared, emit_query};
 use crate::inspect::{self, BindingKind, Domain, InputInfo};
 use crate::posterior::{PosteriorTrace, PosteriorUpdate};
 
@@ -271,7 +271,7 @@ impl LoadedModule {
     }
 
     pub fn compile(&self, options: &EmitOptions) -> Result<Export, Diagnostic> {
-        self.compile_export(options, None)
+        self.compile_export(options, None, false)
     }
 
     /// Compile independent calls over explicit host batch axes.
@@ -280,20 +280,53 @@ impl LoadedModule {
         options: &EmitOptions,
         batch: &BatchSpec,
     ) -> Result<Export, Diagnostic> {
-        self.compile_export(options, Some(batch))
+        self.compile_export(options, Some(batch), false)
+    }
+
+    /// Compile fixed-data likelihood summaries into an optional zero-input
+    /// [`Export::preparation`]. Queries without summaries compile normally.
+    pub fn compile_prepared(&self, options: &EmitOptions) -> Result<Export, Diagnostic> {
+        self.compile_export(options, None, true)
+    }
+
+    /// Batch a prepared score. The batch spec covers every physical argument,
+    /// with an unmapped row for each trailing preparation result.
+    pub fn compile_batched_prepared(
+        &self,
+        options: &EmitOptions,
+        batch: &BatchSpec,
+    ) -> Result<Export, Diagnostic> {
+        self.compile_export(options, Some(batch), true)
     }
 
     fn compile_export(
         &self,
         options: &EmitOptions,
         batch: Option<&BatchSpec>,
+        prepare_fixed_data: bool,
     ) -> Result<Export, Diagnostic> {
         let typed = &self.typed;
         let lowered = self.lower_query(options, None)?;
-        emit_query(lowered, typed, options, batch).map_err(|e| {
-            let node = e.node.filter(|id| id.index() < typed.node_count());
-            Diagnostic::new("stablehlo", self.source_name(), e.msg).at(typed, node, self.source())
-        })
+        let locate = |stage, node: Option<NodeId>, message| {
+            Diagnostic::new(stage, self.source_name(), message).at(
+                typed,
+                node.filter(|id| id.index() < typed.node_count()),
+                self.source(),
+            )
+        };
+        // Some fixed-data rules match before load_data is materialized.
+        // Split the ordinarily lowered query to retain their summary bindings.
+        let split = if prepare_fixed_data && options.sufficient_statistics {
+            flatppl_determinizer::prepare_fixed_likelihood(&lowered)
+                .map_err(|e| locate("prepare_likelihood", Some(e.node), e.reason))?
+        } else {
+            None
+        };
+        match split {
+            Some(prepared) => emit_prepared(prepared, typed, options, batch),
+            None => emit_query(lowered, Some(typed), options, batch),
+        }
+        .map_err(|e| locate("stablehlo", e.node, e.msg))
     }
 
     pub(crate) fn may_have_posteriors(&self) -> bool {

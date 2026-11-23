@@ -1,15 +1,13 @@
 //! Fixed-design Gaussian residuals, expressed with portable array operations.
 
 use super::multivariate::{
-    entry, finite_data, get, held_cells, real_shape, residual_factor, vector,
+    cells, dot, entry, finite_data, get, held_cells, real_shape, residual_factor, vector,
 };
 use super::{
-    Expr, Reducer, data_only, local_ref, map, materialize, num, op, per_cell_with_invariants,
-    resolve,
+    Expr, Reducer, data_only, local_ref, map, materialize, num, op, operation,
+    per_cell_with_invariants, resolve,
 };
-use flatppl_core::{
-    Binding, CallHead, Dim, Module, Node, NodeId, Scalar, ScalarType, Type, ValueSet,
-};
+use flatppl_core::{Binding, Dim, Module, Node, NodeId, Scalar, ScalarType, Type, ValueSet};
 
 fn data_shape(ty: &Type) -> Option<Vec<usize>> {
     let Type::Array { shape, elem } = ty else {
@@ -41,25 +39,6 @@ struct Design {
     offsets: Vec<(NodeId, f64)>,
 }
 
-fn arithmetic(m: &Module, id: NodeId) -> Option<(&str, &[NodeId])> {
-    let Node::Call(c) = m.node(id) else {
-        return None;
-    };
-    let CallHead::Builtin(head) = c.head else {
-        return None;
-    };
-    let name = m.resolve(head);
-    if name == "broadcast" {
-        let (head, args) = c.args.split_first()?;
-        let Node::Const(head) = m.node(*head) else {
-            return None;
-        };
-        Some((m.resolve(*head), args))
-    } else {
-        Some((name, &c.args))
-    }
-}
-
 fn scalar(m: &Module, id: NodeId) -> bool {
     matches!(
         m.type_of(id),
@@ -88,7 +67,7 @@ pub(super) fn bounds(m: &Module, id: NodeId, reducer: &Reducer) -> Option<(f64, 
         }
         _ => {}
     }
-    let (name, args) = arithmetic(m, id)?;
+    let (name, args) = operation(m, id)?;
     match (name, args) {
         ("get" | "get0" | "fill", [array, ..]) => bounds(m, *array, reducer),
         ("neg", [value]) => bounds(m, *value, reducer).map(|(lo, hi)| (-hi, -lo)),
@@ -129,7 +108,7 @@ fn row_scales(
     let (shared, scales) = if reducer.data_only(m, id) {
         (None, id)
     } else {
-        let ("mul", [a, b]) = arithmetic(m, id)? else {
+        let ("mul", [a, b]) = operation(m, id)? else {
             return None;
         };
         if let Some(shared) = reducer.scalar(m, *a) {
@@ -213,7 +192,7 @@ fn collect(
     if m.type_of(id).and_then(real_shape).as_deref() != Some(&[count]) {
         return None;
     }
-    let (name, args) = arithmetic(m, id)?;
+    let (name, args) = operation(m, id)?;
     let name = name.to_owned();
     let args = args.to_vec();
     match (name.as_str(), args.as_slice()) {
@@ -317,7 +296,42 @@ fn safe_scales(scales: Expr) -> Expr {
     )
 }
 
-fn factor(columns: &[Expr], scales: Expr, observed: NodeId, count: usize) -> Expr {
+/// Orthogonal transformations preserve the norm of the scaled residual column.
+/// Its norm sets the scale derivative near a fitted reference, where two large
+/// terms cancel. Restore it from the centered rows before discarding them.
+fn match_residual_norm(
+    m: &mut Module,
+    factor: Expr,
+    residual: Expr,
+    scales: Expr,
+    count: usize,
+    p: usize,
+) -> Expr {
+    let factor = setup(m, factor);
+    let last = op(
+        "get",
+        [
+            factor.clone(),
+            Expr::Constant("all"),
+            Expr::Integer(p as i64 + 1),
+        ],
+    );
+    let squared = setup(m, dot(last.clone(), last));
+    let denominator = op(
+        "ifelse",
+        [op("iszero", [squared.clone()]), num(1.0), squared],
+    );
+    let normalized = setup(m, map("divide", [residual, get(scales, p)]));
+    let target = op(
+        "divide",
+        [dot(normalized.clone(), normalized), num(count as f64)],
+    );
+    let gain = op("sqrt", [op("divide", [target, denominator])]);
+    let weights = vector((0..p).map(|_| num(1.0)).chain([gain]));
+    map("mul", [factor, op("rowstack", [vector([weights])])])
+}
+
+fn factor(columns: &[Expr], scales: Expr, observed: NodeId, count: usize, preparing: bool) -> Expr {
     let dimension = columns.len();
     let normalized = op(
         "colstack",
@@ -338,6 +352,31 @@ fn factor(columns: &[Expr], scales: Expr, observed: NodeId, count: usize) -> Exp
     );
     if count <= dimension {
         return op("rowstack", [rows]);
+    }
+    if preparing
+        && let Some(blocks) = count.div_ceil(dimension).checked_next_power_of_two()
+        && let Some(padded) = blocks.checked_mul(dimension)
+        && let Ok(padding) = i64::try_from(padded - count)
+    {
+        // Merge pairs of blocks to limit Householder rounding depth to log2(blocks).
+        // A linear scan of fixed rows can lose precision in the residual norm.
+        let rows = if padding == 0 {
+            rows
+        } else {
+            let zero = op("fill", [num(0.0), Expr::Integer(dimension as i64)]);
+            op("cat", [rows, op("fill", [zero, Expr::Integer(padding)])])
+        };
+        let shape = vector([
+            Expr::Integer(2 * dimension as i64),
+            Expr::Integer(dimension as i64),
+        ]);
+        let mut matrix = op("rowstack", [rows]);
+        for _ in 1..blocks.ilog2() {
+            let pairs = op("splitblocks", [matrix, shape.clone()]);
+            let factors = cells(op("get", [op("qr", [Expr::Local]), Expr::Text("R")]), pairs);
+            matrix = op("joinblocks", [factors]);
+        }
+        return op("get", [op("qr", [matrix]), Expr::Text("R")]);
     }
     residual_factor(rows, count, dimension)
 }
@@ -445,7 +484,13 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
         let initial_scales = setup(m, safe_scales(column_scales(&initial_columns)));
         let initial = setup(
             m,
-            factor(&initial_columns, initial_scales.clone(), f.observed, count),
+            factor(
+                &initial_columns,
+                initial_scales.clone(),
+                f.observed,
+                count,
+                reducer.preparing,
+            ),
         );
         // Small pivots affect only the reference choice, never the model rank.
         // Use a conservative float32 rounding bound in both precisions.
@@ -583,12 +628,19 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
     } else {
         "regression_factor"
     };
-    let r = reducer.summary_for(
-        m,
-        &key,
-        kind,
-        factor(&final_columns, scales.clone(), f.observed, count),
+    let r = factor(
+        &final_columns,
+        scales.clone(),
+        f.observed,
+        count,
+        reducer.preparing,
     );
+    let r = if reducer.preparing && count > p + 1 {
+        match_residual_norm(m, r, final_columns[p].clone(), scales.clone(), count, p)
+    } else {
+        r
+    };
+    let r = reducer.summary_for(m, &key, kind, r);
     let coefficients = vector(
         design
             .terms

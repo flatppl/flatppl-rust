@@ -2,14 +2,16 @@
 
 use std::collections::HashMap;
 
-use super::{Expr, Factor, Reducer, call, map, materialize, op, per_cell, resolve};
+use super::{
+    Expr, Factor, Reducer, call, map, materialize, op, per_cell, resolve, resolve_record_field,
+};
 use flatppl_core::{
     Call, CallHead, Dim, Inputs, Module, Node, NodeId, Ref, Scalar, ScalarType, Type, ValueSet,
 };
 
 // A small selector evaluator. It never follows a promoted query input's RHS.
 pub(super) fn fixed_indices(m: &Module, id: NodeId, r: &Reducer) -> Option<Vec<i64>> {
-    let id = resolve(m, id, &r.boundary);
+    let id = resolve_record_field(m, id, &r.boundary);
     if let Node::Lit(Scalar::Int(i)) = m.node(id) {
         return Some(vec![*i]);
     }
@@ -372,7 +374,7 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
     if count < 2 {
         return None;
     }
-    let root = resolve(m, f.observed, &r.boundary);
+    let root = resolve_record_field(m, f.observed, &r.boundary);
     let literal = call(m, root, "vector").map(|c| c.args.to_vec());
     r.fallback = "parameters need shared scalars or fixed, in-range gather selectors";
     let parameters = f
@@ -552,13 +554,9 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
                 value
             }
         };
-        terms.push(Expr::Node(value));
+        terms.push(value);
     }
-    let terms = terms
-        .into_iter()
-        .map(|term| materialize(&mut candidate, term))
-        .collect::<Vec<_>>();
-    let result = flatppl_core::graph::fold_add(&mut candidate, &terms);
+    let result = super::vectorize::sum_terms(&mut candidate, &terms, m.node_count());
     *m = candidate;
     *r = reducer;
     r.rule = Some(("grouped scalar summaries", Some(partition)));

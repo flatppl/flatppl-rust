@@ -35,6 +35,7 @@ mod runtime_partition;
 mod scalar;
 mod sorted;
 mod structural;
+mod vectorize;
 use flatppl_core::graph::{build_call, build_record};
 pub use report::{GroupPartition, ReductionDecision, ReductionOutcome, ReductionReport};
 pub use structural::{IidNormalPlan, plan_iid_normal};
@@ -340,10 +341,61 @@ fn resolve(m: &Module, mut id: NodeId, boundary: &HashSet<Symbol>) -> NodeId {
     id
 }
 
+/// Resolve a field of a constructed record, including nested projections.
+/// A promoted record or field stays live even when its source RHS is literal.
+fn resolve_record_field(m: &Module, id: NodeId, boundary: &HashSet<Symbol>) -> NodeId {
+    let root = resolve(m, id, boundary);
+    let mut current = root;
+    let mut fields = Vec::new();
+    let mut seen = HashSet::new();
+    loop {
+        if let Some(get) = call(m, current, "get")
+            && let [record, key] = *get.args
+            && let Node::Lit(Scalar::Str(field)) = m.node(key)
+        {
+            if !seen.insert(current) {
+                return root;
+            }
+            fields.push(field.as_ref());
+            current = resolve(m, record, boundary);
+            continue;
+        }
+        let Some(name) = fields.pop() else {
+            return current;
+        };
+        let Some(field) = call(m, current, "record")
+            .and_then(|record| record.named.iter().find(|arg| m.resolve(arg.name) == name))
+        else {
+            return root;
+        };
+        current = resolve(m, field.value, boundary);
+    }
+}
+
 fn signature(m: &Module, name: &str) -> Vec<NodeId> {
     binding(m, name)
         .map(|id| call(m, id, "tuple").map_or_else(|| vec![id], |c| c.args.to_vec()))
         .unwrap_or_default()
+}
+
+/// The operator and its operands for either a direct call or a broadcast.
+fn operation(m: &Module, id: NodeId) -> Option<(&str, &[NodeId])> {
+    let Node::Call(c) = m.node(id) else {
+        return None;
+    };
+    let CallHead::Builtin(head) = c.head else {
+        return None;
+    };
+    let name = m.resolve(head);
+    if name == "broadcast" {
+        let (head, args) = c.args.split_first()?;
+        let Node::Const(head) = m.node(*head) else {
+            return None;
+        };
+        Some((m.resolve(*head), args))
+    } else {
+        Some((name, &c.args))
+    }
 }
 
 fn set_signature(m: &mut Module, name: &str, values: &[NodeId]) {
@@ -1571,14 +1623,40 @@ pub fn prepare_likelihood_with_options(
     options: &PreparationOptions,
     report: Option<&mut ReductionReport>,
 ) -> Result<PreparedLikelihood, PreparationError> {
-    let error_node = binding(m, "outputs").unwrap_or_else(|| NodeId::from_usize(0));
+    let output = binding(m, "outputs").ok_or_else(|| PreparationError {
+        node: NodeId::from_usize(0),
+        reason: "declare outputs before preparing a likelihood".into(),
+    })?;
+    try_prepare_likelihood(m, output, data_inputs, options, report)?.ok_or_else(|| {
+        PreparationError {
+            node: output,
+            reason: "no supported sufficient-statistic likelihood factor".into(),
+        }
+    })
+}
+
+/// Split summaries independent of every declared input, including promoted
+/// fixed bindings. An ineligible query has no preparation program.
+pub fn prepare_fixed_likelihood(
+    m: &Module,
+) -> Result<Option<PreparedLikelihood>, PreparationError> {
+    let Some(output) = binding(m, "outputs") else {
+        return Ok(None);
+    };
+    try_prepare_likelihood(m, output, &[], &PreparationOptions::default(), None)
+}
+
+fn try_prepare_likelihood(
+    m: &Module,
+    output: NodeId,
+    data_inputs: &[String],
+    options: &PreparationOptions,
+    report: Option<&mut ReductionReport>,
+) -> Result<Option<PreparedLikelihood>, PreparationError> {
     let refuse = |reason: &str| PreparationError {
-        node: error_node,
+        node: output,
         reason: reason.into(),
     };
-    if binding(m, "outputs").is_none() {
-        return Err(refuse("declare outputs before preparing a likelihood"));
-    }
     let input_nodes = signature(m, "inputs");
     let input_names: HashSet<_> = input_nodes
         .iter()
@@ -1604,32 +1682,26 @@ pub fn prepare_likelihood_with_options(
         .collect();
     let (_, added) = reduce(&mut score, allowed.clone(), true, report, true);
     let boundary = query::promoted_input_names(&score);
+    let mut candidates = summary_bindings(&score).peekable();
+    if candidates.peek().is_none() {
+        return Ok(None);
+    }
+    // The lowered module also contains the default expressions of promoted
+    // inputs. Only summaries reached from the score can be prepared.
+    let score_output = binding(&score, "outputs").unwrap();
+    let reached = score_references(&score, score_output, &boundary);
+    let added: HashSet<_> = added.into_iter().collect();
     let mut proofs = HashMap::new();
-    let mut summaries: Vec<_> = summary_bindings(&score)
-        .filter(|&(_, rhs)| data_only_cached(&score, rhs, &allowed, &boundary, &mut proofs))
-        .map(|(name, _)| name)
-        .collect();
-    for name in added {
-        if !summaries.contains(&name) {
+    let mut summaries = Vec::new();
+    for (name, rhs) in candidates.filter(|(name, _)| reached.contains(name)) {
+        if data_only_cached(&score, rhs, &allowed, &boundary, &mut proofs) {
             summaries.push(name);
+        } else if added.contains(&name) {
+            return Err(refuse("a summary depends on a scoring input"));
         }
     }
     if summaries.is_empty() {
-        return Err(refuse(
-            "no supported sufficient-statistic likelihood factor",
-        ));
-    }
-    for &name in &summaries {
-        let bid = score.binding_by_name(name).unwrap();
-        if !data_only_cached(
-            &score,
-            score.binding(bid).rhs,
-            &allowed,
-            &boundary,
-            &mut proofs,
-        ) {
-            return Err(refuse("a summary depends on a scoring input"));
-        }
+        return Ok(None);
     }
     let (summaries, projections) = if options.pack_summaries {
         let packed = packing::pack(&mut score, &summaries)
@@ -1678,13 +1750,17 @@ pub fn prepare_likelihood_with_options(
         let rhs = build_call(&mut score, "external", &[set]);
         score.set_binding_rhs(bid, rhs);
     }
-    let output = binding(&score, "outputs").unwrap();
-    let needed: HashSet<_> = allowed
-        .iter()
-        .copied()
-        .filter(|name| depends_on(&score, output, *name))
-        .collect();
-    let mut inputs: Vec<_> = input_nodes.into_iter().filter(|id| !matches!(score.node(*id), Node::Ref(r) if allowed.contains(&r.name) && !needed.contains(&r.name))).collect();
+    let mut inputs = input_nodes;
+    if !allowed.is_empty() {
+        let remaining = score_references(&score, score_output, &boundary);
+        inputs.retain(|id| match score.node(*id) {
+            Node::Ref(r) if allowed.contains(&r.name) => score
+                .alias_chain(r.name)
+                .iter()
+                .any(|name| remaining.contains(name)),
+            _ => true,
+        });
+    }
     inputs.extend(summaries.iter().map(|&name| local_ref(&mut score, name)));
     set_signature(&mut score, "inputs", &inputs);
     for module in [&mut preparation, &mut score] {
@@ -1704,11 +1780,11 @@ pub fn prepare_likelihood_with_options(
         .iter()
         .map(|name| score.resolve(*name).to_string())
         .collect();
-    Ok(PreparedLikelihood {
+    Ok(Some(PreparedLikelihood {
         preparation,
         score,
         summaries,
-    })
+    }))
 }
 
 fn summary_set(m: &mut Module, ty: &Type) -> Option<NodeId> {
@@ -1745,32 +1821,20 @@ fn summary_set(m: &mut Module, ty: &Type) -> Option<NodeId> {
     }
 }
 
-fn depends_on(m: &Module, root: NodeId, name: Symbol) -> bool {
-    let target = m.alias_target(name);
-    let boundary = query::promoted_input_names(m);
-    let mut stack = vec![root];
-    let mut seen = HashSet::new();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        if let Node::Ref(Ref {
-            ns: RefNs::SelfMod,
-            name: found,
-        }) = m.node(id)
-        {
-            if *found == name || (target.is_some() && m.alias_target(*found) == target) {
-                return true;
+fn score_references(m: &Module, output: NodeId, boundary: &HashSet<Symbol>) -> HashSet<Symbol> {
+    let mut reached = HashSet::new();
+    let mut direct = HashSet::new();
+    let mut pending = vec![output];
+    while let Some(rhs) = pending.pop() {
+        m.collect_referenced_names(rhs, &mut direct);
+        for name in direct.drain() {
+            if reached.insert(name)
+                && !boundary.contains(&name)
+                && let Some(binding) = m.binding_by_name(name)
+            {
+                pending.push(m.binding(binding).rhs);
             }
-            if boundary.contains(found) {
-                continue;
-            }
-            if let Some(bid) = m.binding_by_name(*found) {
-                stack.push(m.binding(bid).rhs);
-            }
-        } else {
-            stack.extend(m.node(id).children());
         }
     }
-    false
+    reached
 }

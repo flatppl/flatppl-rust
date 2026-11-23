@@ -288,6 +288,44 @@ fn ordinary_report_keeps_the_compilers_pre_file_reduction_order() {
 }
 
 #[test]
+fn fixed_record_regression_requires_finite_design_columns() -> Result<(), Box<dyn std::error::Error>>
+{
+    use flatppl_host::ReductionOutcome;
+    let path = std::env::temp_dir().join(format!("flatppl-regression-{}.json", std::process::id()));
+    std::fs::write(&path, r#"{"x":[1,2,3,4],"y":[1,3,2,4]}"#)?;
+    let mut context = Context::default();
+    for (indicator, inputs, preparing, reduced) in [
+        ("1.0", "(beta, sigma)", false, false),
+        ("1.0", "(beta, sigma)", true, true),
+        ("inf", "(beta, sigma)", true, false),
+        ("2e38", "(beta, sigma)", true, false),
+        ("1.0", "(beta, sigma, data)", true, false),
+    ] {
+        let source = format!(
+            "data = load_data({path:?}, cartprod(x = cartpow(reals,4), y = cartpow(reals,4)))\n\
+             X = colstack([ones(4), data.x, ifelse.(data.x .> 2.0, {indicator}, 0.0)])\n\
+             beta = elementof(cartpow(reals,3))\nsigma = elementof(posreals)\n\
+             inputs = {inputs}\noutputs = logdensityof(Normal.(X * beta, sigma), data.y)"
+        );
+        let module = context.parse(&source, None, None)?;
+        let report = context.analyze_query(&module, &[], preparing, true)?;
+        assert_eq!(
+            report.reductions.decisions.iter().any(|d| matches!(
+                d.outcome,
+                ReductionOutcome::Reduced {
+                    rule: "regression statistics",
+                    ..
+                }
+            )),
+            reduced,
+            "{source}"
+        );
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
 fn reduction_reports_match_preparation_and_leave_compilation_unchanged() {
     use flatppl_host::ReductionOutcome;
     let mut context = Context::default();

@@ -115,7 +115,20 @@ fn finite_bound(set: &ValueSet) -> bool {
 /// Infinities in a multivariate primitive can interact with covariance entries.
 /// A few scalar flags cannot reconstruct those IEEE outcomes after compression.
 pub(super) fn finite_data(m: &Module, root: NodeId, reducer: &Reducer) -> bool {
-    let id = resolve(m, root, &reducer.boundary);
+    // A fixed design assembled from file columns is worth factoring once.
+    // Inlining its QR into ordinary scoring costs more than the row score.
+    let id = if reducer.preparing {
+        let id = super::resolve_record_field(m, root, &reducer.boundary);
+        match super::operation(m, id) {
+            Some(("zeros" | "ones", _)) => return true,
+            Some(("ifelse", [_, left, right])) => {
+                return finite_data(m, *left, reducer) && finite_data(m, *right, reducer);
+            }
+            _ => id,
+        }
+    } else {
+        resolve(m, root, &reducer.boundary)
+    };
     match m.node(id) {
         Node::Ref(r) if r.ns == RefNs::SelfMod && reducer.boundary.contains(&r.name) => {
             let Some(bid) = m.binding_by_name(r.name) else {
