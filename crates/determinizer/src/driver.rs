@@ -187,6 +187,7 @@ fn determinize_inner(
     }
 
     let mut specialize_sequences = true;
+    let mut optimise_source = true;
     let mut has_mass_queries = false;
     let mut sampling = SamplingInspection {
         observer,
@@ -195,6 +196,14 @@ fn determinize_inner(
     loop {
         // Re-run inference (idempotent) so type / phase tables are fresh.
         let _ = flatppl_infer::infer(&mut work);
+        // Requested outputs are not the full set of source dependencies until
+        // every query has consumed its draw provenance.
+        if std::mem::take(&mut optimise_source)
+            && let Some(optimised) =
+                flatppl_optimise::optimise(&work, None, flatppl_optimise::Profile::Portable)
+        {
+            work = optimised;
+        }
         if std::mem::take(&mut sampling.refresh)
             && let Some(observer) = sampling.observer.as_mut()
         {

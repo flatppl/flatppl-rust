@@ -88,6 +88,46 @@ fn emit_named(name: &str, source: &str) -> flatppl_stan::StanProgram {
 }
 
 #[test]
+fn real_matrix_gram_products_use_stan_crossproducts() {
+    let source = r#"# emit: target=outputs
+flatppl_compat = "0.1"
+theta = elementof(reals)
+a = rowstack([[theta, 2.0], [3.0, 4.0], [5.0, 6.0]])
+b = rowstack([[2.0, 1.0], [4.0, 3.0], [6.0, 5.0]])
+row_product = a * transpose(a)
+column_product = adjoint(a) * a
+mixed_product = a * transpose(b)
+mu = theta + trace(row_product) + trace(column_product) + trace(mixed_product)
+inputs = theta
+outputs = logdensityof(Normal(0, 1), theta) + logdensityof(Normal(mu, 1), 0.0)
+"#;
+    let code = emit(source).code;
+    assert!(code.contains("row_product = tcrossprod(a);"), "{code}");
+    assert!(code.contains("column_product = crossprod(a);"), "{code}");
+    assert!(code.contains("mixed_product = a * b';"), "{code}");
+}
+
+#[test]
+fn stan_gram_preserves_a_named_random_matrix() {
+    let source = r#"
+flatppl_compat = "0.1"
+L_corr ~ LKJCholesky(2, 1)
+b = rowstack([[2.0, 1.0], [4.0, 3.0]])
+gram = L_corr * transpose(L_corr)
+mixed = L_corr * transpose(b)
+y ~ Normal(trace(gram) + trace(mixed), 1)
+prior = lawof(record(L_corr = L_corr))
+forward = kernelof(record(y = y), L_corr = L_corr)
+likelihood = likelihoodof(forward, record(y = 0.0))
+posterior = bayesupdate(likelihood, prior)
+"#;
+    let code = emit(source).code;
+    assert!(code.contains("L_corr ~ lkj_corr_cholesky(1);"), "{code}");
+    assert!(code.contains("gram = tcrossprod(L_corr);"), "{code}");
+    assert!(code.contains("mixed = L_corr * b';"), "{code}");
+}
+
+#[test]
 fn goldens() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
     let bless = std::env::var_os("FLATPPL_BLESS").is_some();

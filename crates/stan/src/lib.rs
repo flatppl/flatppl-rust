@@ -219,6 +219,13 @@ pub fn emit_with_bundle(
             d.message.clone(),
         ));
     }
+    let (target, optimised) = emit::prepare(&work, opts, bundle).map_err(|mut r| {
+        r.node = r.node.map(|n| emit::host_node(module, &work, &grafted, n));
+        r
+    })?;
+    if let Some(optimised) = optimised {
+        work = optimised;
+    }
     // A public member that is a positive integer sizes data as in the host.
     let public: HashSet<Symbol> = grafted
         .imports
@@ -248,7 +255,7 @@ pub fn emit_with_bundle(
         .map(|&s| emit::sanitize(work.resolve(s)))
         .collect();
     let (printed, mut taken): (Vec<bool>, HashSet<String>) =
-        match emit::program_printed(&work, opts, &first) {
+        match emit::program_printed(&work, opts, &first, target) {
             (Ok(_), p) => (
                 grafted
                     .imports
@@ -313,10 +320,12 @@ pub fn emit_with_bundle(
             names.display.insert(name, work.intern(&display));
         }
     }
-    emit::program_with(&work, opts, &names).map_err(|mut r| {
-        r.node = r.node.map(|n| emit::host_node(module, &work, &grafted, n));
-        r
-    })
+    emit::program_printed(&work, opts, &names, target)
+        .0
+        .map_err(|mut r| {
+            r.node = r.node.map(|n| emit::host_node(module, &work, &grafted, n));
+            r
+        })
 }
 
 fn is_load_module(m: &Module, id: flatppl_core::NodeId) -> bool {

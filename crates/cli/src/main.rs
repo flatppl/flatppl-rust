@@ -62,7 +62,7 @@ use flatppl_cli::banner;
 use flatppl_cli::report;
 #[cfg(any(feature = "infer", feature = "prepare"))]
 use flatppl_cli::resolve::CliResolver;
-#[cfg(feature = "convert")]
+#[cfg(any(feature = "convert", feature = "optimise"))]
 use flatppl_cli::write_module;
 #[cfg(feature = "fmtlint")]
 use flatppl_cli::{run_fmt, run_lint};
@@ -181,6 +181,19 @@ enum Command {
         /// Omit the leading provenance header comment (see `convert --no-header`).
         #[arg(long)]
         no_header: bool,
+    },
+    /// Optimise a model while keeping it in the FlatPPL language.
+    #[cfg(feature = "optimise")]
+    #[command(visible_alias = "optimize")]
+    Optimise {
+        /// Input model (`.flatppl` or `.flatpir`). Imported modules must be available locally.
+        input: PathBuf,
+        /// Output file. Writes to stdout if omitted.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Output form: FlatPPL source or annotated FlatPIR.
+        #[arg(long, value_enum, default_value_t = EmitForm::Flatppl)]
+        emit: EmitForm,
     },
     /// Prepare a model for offline use: fetch its remote dependencies into the cache.
     ///
@@ -377,13 +390,9 @@ impl From<InferLevel> for flatppl_infer::Level {
     }
 }
 
-/// Output form selector for `determinize --emit`.
-///
-/// The surface printer spells a builtin call and a user call the same way —
-/// `f(x)` either way — so surface syntax alone cannot show an external gate
-/// whether a determinised module carries a residual user call. FlatPIR (§11)
-/// keeps the head distinction (`(%call …)` for a user application), so it can.
-#[cfg(feature = "determinize")]
+/// Output form for model-to-model transformations.
+/// FlatPIR keeps annotations and distinguishes builtin calls from user calls.
+#[cfg(any(feature = "determinize", feature = "optimise"))]
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum EmitForm {
     /// Canonical FlatPPL surface syntax (the default).
@@ -497,6 +506,12 @@ fn main() -> ExitCode {
             level,
             no_header,
         } => infer_cmd(&input, &output, level.into(), no_header),
+        #[cfg(feature = "optimise")]
+        Command::Optimise {
+            input,
+            output,
+            emit,
+        } => optimise_cmd(&input, output.as_deref(), emit),
         #[cfg(feature = "prepare")]
         Command::Prepare { files, update } => prepare_cmd(&files, update),
         #[cfg(feature = "determinize")]
@@ -1025,52 +1040,8 @@ fn infer_cmd(
             flatppl_cli::terminal_path(output)
         )));
     }
-    // The input is a local file; cross-module deps resolve from the local cache
-    // only (run `flatppl prepare` first for remote deps).
-    let source = resolver.read_string(&in_loc)?;
-    let mut module = match flatppl_cli::read_module(from, &source) {
-        Ok(module) => module,
-        Err((message, line, span)) => {
-            return Err(Failure::Diagnostic {
-                path: input.to_path_buf(),
-                source,
-                message,
-                line,
-                span,
-            });
-        }
-    };
-
-    // Assemble the cross-module bundle: resolve the model's transitive
-    // `load_module` dependencies from the local cache (+ local files) so the
-    // engine — which stays I/O-free — can type cross-module references. A
-    // cache-only resolver never touches the network; a remote dep that isn't
-    // cached errors with a "run `flatppl prepare`" hint. `load_data` sources are
-    // discovered but NOT resolved — inference never reads data.
-    let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(&module, &in_loc, &resolver)?;
-    let diags = flatppl_infer::infer_module(&mut module, &bundle, level);
-    let mut errors = 0u32;
-    for d in &diags {
-        match d.severity {
-            flatppl_infer::Severity::Error => {
-                errors += 1;
-                eprintln!(
-                    "error: {}",
-                    flatppl_cli::resolve::terminal_message(&d.message)
-                );
-            }
-            flatppl_infer::Severity::Note => eprintln!(
-                "note: {}",
-                flatppl_cli::resolve::terminal_message(&d.message)
-            ),
-        }
-    }
-    if errors > 0 {
-        return Err(Failure::Plain(format!(
-            "inference found {errors} error(s) in `{}`",
-            flatppl_cli::terminal_path(input)
-        )));
-    }
+    let (mut module, _) = read_source(input, &in_loc, from, &resolver)?;
+    infer_source(&mut module, input, &in_loc, &resolver, level)?;
 
     // `try_write`, not `write`: annotations nest as deep as an array's rank, so
     // a model well inside every source limit can render FlatPIR past the
@@ -1096,6 +1067,145 @@ fn infer_cmd(
             flatppl_cli::terminal_path(output)
         ))
     })
+}
+
+#[cfg(feature = "optimise")]
+fn optimise_cmd(input: &Path, output: Option<&Path>, emit: EmitForm) -> Result<(), Failure> {
+    let resolver = CliResolver::cache_only();
+    let in_loc = resolver.model_location(&Location::Local(input.to_path_buf()))?;
+    let from = resolver.model_format(&in_loc)?;
+    let preserve_source = matches!(from, Format::FlatPpl) && emit == EmitForm::Flatppl;
+    let source = resolver.read_string(&in_loc)?;
+    let parsed = if preserve_source {
+        flatppl_syntax::parse_with_assignment_spans(&source).map_err(|e| {
+            (
+                e.message,
+                e.line as usize,
+                e.span.map(|(start, end)| (start as usize, end as usize)),
+            )
+        })
+    } else {
+        flatppl_cli::read_module(from, &source).map(|module| (module, Vec::new()))
+    };
+    let (mut module, assignments) = match parsed {
+        Ok(model) => model,
+        Err(error) => return Err(source_error(input, source, error)),
+    };
+    let bundle = infer_source(
+        &mut module,
+        input,
+        &in_loc,
+        &resolver,
+        flatppl_infer::Level::Shape,
+    )?;
+    let optimised = flatppl_optimise::optimise_with_bundle(
+        &module,
+        None,
+        flatppl_optimise::Profile::Portable,
+        &bundle,
+    );
+    let rendered = if preserve_source {
+        match optimised.as_ref() {
+            Some(rewritten) => {
+                flatppl_syntax::print_assignment_rewrites(&source, &assignments, &module, rewritten)
+            }
+            None => source,
+        }
+    } else {
+        let format = match emit {
+            EmitForm::Flatppl => Format::FlatPpl,
+            EmitForm::Flatpir => Format::FlatPir,
+        };
+        let mut text = write_module(
+            format,
+            optimised.as_ref().unwrap_or(&module),
+            flatppl_syntax::Syntax::Full,
+        )?;
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text
+    };
+    match output {
+        Some(path) => fs::write(path, rendered).map_err(|e| {
+            Failure::Plain(format!(
+                "writing `{}`: {e}",
+                flatppl_cli::terminal_path(path)
+            ))
+        })?,
+        None => print!("{rendered}"),
+    }
+    Ok(())
+}
+
+/// Type a source document using its cached imports without loading data or
+/// changing the source's relative paths.
+#[cfg(feature = "infer")]
+fn infer_source(
+    module: &mut flatppl_core::Module,
+    input: &Path,
+    location: &Location,
+    resolver: &CliResolver,
+    level: flatppl_infer::Level,
+) -> Result<flatppl_infer::ModuleBundle, Failure> {
+    let (bundle, _) = flatppl_cli::resolve::build_bundle(module, location, resolver)?;
+    let diagnostics = flatppl_infer::infer_module(module, &bundle, level);
+    report_inference(input, &diagnostics)?;
+    Ok(bundle)
+}
+
+#[cfg(feature = "infer")]
+fn read_source(
+    input: &Path,
+    location: &Location,
+    format: Format,
+    resolver: &CliResolver,
+) -> Result<(flatppl_core::Module, String), Failure> {
+    let source = resolver.read_string(location)?;
+    match flatppl_cli::read_module(format, &source) {
+        Ok(module) => Ok((module, source)),
+        Err(error) => Err(source_error(input, source, error)),
+    }
+}
+
+#[cfg(feature = "infer")]
+fn source_error(input: &Path, source: String, error: flatppl_cli::ReadError) -> Failure {
+    let (message, line, span) = error;
+    Failure::Diagnostic {
+        path: input.to_path_buf(),
+        source,
+        message,
+        line,
+        span,
+    }
+}
+
+#[cfg(feature = "infer")]
+fn report_inference(
+    input: &Path,
+    diagnostics: &[flatppl_infer::Diagnostic],
+) -> Result<(), Failure> {
+    let mut errors = 0u32;
+    for d in diagnostics {
+        let label = match d.severity {
+            flatppl_infer::Severity::Error => {
+                errors += 1;
+                "error"
+            }
+            flatppl_infer::Severity::Note => "note",
+        };
+        eprintln!(
+            "{label}: {}",
+            flatppl_cli::resolve::terminal_message(&d.message)
+        );
+    }
+    if errors > 0 {
+        return Err(Failure::Plain(format!(
+            "inference found {errors} error(s) in `{}`",
+            flatppl_cli::terminal_path(input)
+        )));
+    }
+    Ok(())
 }
 
 /// `flatppl prepare <file>… [--update]` — fetch each model's remote dependencies
@@ -1124,19 +1234,7 @@ fn load_and_infer(
     resolver: &CliResolver,
 ) -> Result<(flatppl_core::Module, flatppl_infer::ModuleBundle, String), Failure> {
     let in_loc = resolver.model_location(&Location::Local(input.to_path_buf()))?;
-    let source = resolver.read_string(&in_loc)?;
-    let mut module = match flatppl_cli::read_module(Format::FlatPpl, &source) {
-        Ok(m) => m,
-        Err((message, line, span)) => {
-            return Err(Failure::Diagnostic {
-                path: input.to_path_buf(),
-                source,
-                message,
-                line,
-                span,
-            });
-        }
-    };
+    let (mut module, source) = read_source(input, &in_loc, Format::FlatPpl, resolver)?;
 
     // Assemble the cross-module bundle: resolve the model's transitive
     // `load_module` dependencies from the local cache (+ local files) so the
@@ -1144,28 +1242,7 @@ fn load_and_infer(
     let bundle = flatppl_cli::resolve::compilation_bundle(&mut module, &in_loc, resolver)?;
     let (diags, bundle) =
         flatppl_infer::infer_module_with_inputs(&mut module, bundle, flatppl_infer::Level::Shape);
-    let mut errors = 0u32;
-    for d in &diags {
-        match d.severity {
-            flatppl_infer::Severity::Error => {
-                errors += 1;
-                eprintln!(
-                    "error: {}",
-                    flatppl_cli::resolve::terminal_message(&d.message)
-                );
-            }
-            flatppl_infer::Severity::Note => eprintln!(
-                "note: {}",
-                flatppl_cli::resolve::terminal_message(&d.message)
-            ),
-        }
-    }
-    if errors > 0 {
-        return Err(Failure::Plain(format!(
-            "inference found {errors} error(s) in `{}`",
-            flatppl_cli::terminal_path(input)
-        )));
-    }
+    report_inference(input, &diags)?;
 
     Ok((module, bundle, source))
 }

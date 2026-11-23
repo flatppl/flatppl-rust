@@ -1,0 +1,145 @@
+(ruleset mathematical)
+
+; Keep matrix axes, vector orientation and nested array layers distinct.
+(datatype MathDims (MathNil) (MathDim i64 MathDims))
+(relation math-flat-shape (Expr MathDims))
+(relation math-block-shape (Expr MathDims MathDims))
+(relation math-int-list (Expr MathDims))
+(relation math-real-row (Expr i64))
+
+(relation math-transpose-head (String))
+(math-transpose-head "transpose")
+(math-transpose-head "adjoint")
+(relation math-transposes (Expr Expr))
+
+; Adjoint conjugates only complex tensors. A real row and column have the
+; same tensor representation, but transposing either still changes its type.
+(rule ((= t (U op x)) (math-transpose-head op)
+       (real-vector x n) (math-real-row t n))
+      ((math-transposes t x)) :ruleset mathematical)
+(rule ((= t (U op x)) (math-transpose-head op)
+       (math-real-row x n) (real-vector t n))
+      ((math-transposes t x)) :ruleset mathematical)
+(rule ((= t (U op x)) (math-transpose-head op)
+       (real-matrix x rows cols) (real-matrix t cols rows))
+      ((math-transposes t x)) :ruleset mathematical)
+(rule ((math-transposes t x) (math-transposes r t) (type-id r ty) (type-id x ty))
+      ((union r x)) :ruleset mathematical)
+(rule ((math-transposes t x) (real-matrix x 1 1) (type-id t ty) (type-id x ty))
+      ((union t x)) :ruleset mathematical)
+
+(relation math-reverses (Expr Expr i64))
+(rule ((= r (U "reverse" x)) (real-vector x n) (type-id r ty) (type-id x ty))
+      ((math-reverses r x n)) :ruleset mathematical)
+(rule ((= r (U "reverse" x)) (math-block-shape x (MathDim n (MathNil)) inner)
+       (type-id r ty) (type-id x ty))
+      ((math-reverses r x n)) :ruleset mathematical)
+(rule ((math-reverses r x 1)) ((union r x)) :ruleset mathematical)
+(rule ((math-reverses t x n) (math-reverses r t n)) ((union r x)) :ruleset mathematical)
+
+; Reflect only a written, in-bounds scalar selector. The emitter lowers both
+; forms to slices, so the rewrite cannot remove a runtime domain check.
+(relation math-index-base (String i64))
+(math-index-base "get" 1)
+(math-index-base "get0" 0)
+(rule ((= r (B op rev (Integer k))) (math-index-base op base)
+       (math-reverses rev x n) (real-value r)
+       (>= k base) (< k (+ n base)))
+      ((union r (B op x (Integer (- (+ n (+ base base)) (+ k 1))))))
+      :ruleset mathematical)
+
+; A scalar count is the one-axis written form. The host provides raw integer
+; vector literals in their written order, including counts that must fail.
+(relation math-written-size (Expr MathDims))
+(rule ((= s (Integer n)) (> n 0) (<= n 4294967295))
+      ((math-written-size s (MathDim n (MathNil)))) :ruleset mathematical)
+(rule ((math-int-list s dims)) ((math-written-size s dims)) :ruleset mathematical)
+
+(relation math-rank (MathDims i64))
+(relation math-unit-counts (MathDims))
+(math-rank (MathNil) 0)
+(math-unit-counts (MathNil))
+(rule ((= dims (MathDim n tail)) (math-rank tail rank))
+      ((math-rank dims (+ rank 1))) :ruleset mathematical)
+(rule ((= dims (MathDim 1 tail)) (math-unit-counts tail))
+      ((math-unit-counts dims)) :ruleset mathematical)
+(rule ((= r (B "tile" x s)) (math-flat-shape x shape) (math-written-size s counts)
+       (math-unit-counts counts) (math-rank counts rank) (math-rank shape rank) (> rank 0)
+       (type-id r ty) (type-id x ty))
+      ((union r x)) :ruleset mathematical)
+
+; For each actual inverse pair, walk the three ordered dimension lists in
+; lockstep. The last three fields are the unchecked suffixes.
+(relation math-block-check (Expr Expr MathDims MathDims MathDims))
+(rule ((= r (U "joinblocks" blocks)) (= blocks (B "splitblocks" x s))
+       (math-flat-shape x dims) (math-block-shape blocks outer inner)
+       (math-written-size s inner) (type-id r ty) (type-id x ty))
+      ((math-block-check r x dims outer inner)) :ruleset mathematical)
+(rule ((= r (B "splitblocks" joined s)) (= joined (U "joinblocks" x))
+       (math-flat-shape joined dims) (math-block-shape x outer inner)
+       (math-written-size s inner) (type-id r ty) (type-id x ty))
+      ((math-block-check r x dims outer inner)) :ruleset mathematical)
+(rule ((math-block-check r x (MathDim n dims) (MathDim q outer) (MathDim b inner))
+       (> n 0) (> q 0) (> b 0) (= q (/ n b)) (= (% n b) 0))
+      ((math-block-check r x dims outer inner)) :ruleset mathematical)
+(rule ((math-block-check r x (MathNil) (MathNil) (MathNil)))
+      ((union r x)) :ruleset mathematical)
+
+; Moving singleton axes requires only reshapes. In particular addaxes produces
+; a matrix from a column vector, whereas transpose of the vector produces a row.
+(rule ((= r (T "addaxes" x (Integer 0) (Integer 0))) (math-flat-shape x dims)
+       (type-id r ty) (type-id x ty))
+      ((union r x)) :ruleset mathematical)
+(rule ((= r (T "addaxes" a (Integer lead) (Integer trail)))
+       (= a (T "addaxes" x (Integer left) (Integer right)))
+       (math-flat-shape r rdims) (math-flat-shape a adims) (math-flat-shape x dims)
+       (>= lead 0) (<= lead 64) (>= trail 0) (<= trail 64)
+       (>= left 0) (<= left 64) (>= right 0) (<= right 64)
+       (math-rank rdims rank) (math-rank adims inner-rank) (math-rank dims input-rank)
+       (= inner-rank (+ input-rank (+ left right))) (= rank (+ inner-rank (+ lead trail))))
+      ((union r (T "addaxes" x (Integer (+ left lead)) (Integer (+ right trail)))))
+      :ruleset mathematical)
+(rule ((math-transposes t a) (= a (T "addaxes" v (Integer 1) (Integer 0)))
+       (real-vector v n) (real-matrix a 1 n))
+      ((union t (T "addaxes" v (Integer 0) (Integer 1)))) :ruleset mathematical)
+(rule ((math-transposes t a) (= a (T "addaxes" v (Integer 0) (Integer 1)))
+       (real-vector v n) (real-matrix a n 1))
+      ((union t (T "addaxes" v (Integer 1) (Integer 0)))) :ruleset mathematical)
+
+; Row stack reinterprets the outer and inner vector axes as a matrix. Column
+; stack additionally swaps those axes. Require vector nesting at the source.
+(rule ((math-transposes t a) (= a (U "colstack" x))
+       (math-block-shape x (MathDim rows (MathNil)) (MathDim cols (MathNil)))
+       (real-matrix a cols rows))
+      ((union t (U "rowstack" x))) :ruleset mathematical)
+(rule ((math-transposes t a) (= a (U "rowstack" x))
+       (math-block-shape x (MathDim rows (MathNil)) (MathDim cols (MathNil)))
+       (real-matrix a rows cols))
+      ((union t (U "colstack" x))) :ruleset mathematical)
+
+; The emitter implements these contractions with the same operands in the
+; same order. No commutation or reassociation of floating-point arithmetic.
+(rule ((= r (B "mul" x t)) (math-transposes t x)
+       (real-matrix x rows cols) (real-matrix r rows rows))
+      ((union r (U "row_gram" x))) :ruleset mathematical)
+(rule ((= r (B "mul" t x)) (math-transposes t x)
+       (real-matrix x rows cols) (real-matrix r cols cols))
+      ((union r (U "col_gram" x))) :ruleset mathematical)
+(rule ((= r (B "mul" x t)) (math-transposes t x)
+       (real-vector x n) (real-matrix r n n))
+      ((union r (U "self_outer" x))) :ruleset mathematical)
+(rule ((= r (U "row_gram" t)) (math-transposes t x)
+       (real-matrix x rows cols) (real-matrix r cols cols))
+      ((union r (U "col_gram" x))) :ruleset mathematical)
+(rule ((= r (U "col_gram" t)) (math-transposes t x)
+       (real-matrix x rows cols) (real-matrix r rows rows))
+      ((union r (U "row_gram" x))) :ruleset mathematical)
+
+; diagmat selects the diagonal entries into a zero matrix. The reverse
+; cancellation diag(diagmat(x)) would add zeros and can lose a signed zero.
+(rule ((math-transposes t a) (= a (U "diagmat" x))
+       (real-vector x n) (real-matrix a n n) (type-id t ty) (type-id a ty))
+      ((union t a)) :ruleset mathematical)
+(rule ((= r (U "sum" d)) (= d (U "diag" x))
+       (real-matrix x n n) (real-vector d n) (real-value r))
+      ((union r (U "trace" x))) :ruleset mathematical)

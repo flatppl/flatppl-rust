@@ -10148,15 +10148,9 @@ outputs = lp
     );
 }
 
-/// The MATRIX half of §07's "`transpose` and `adjoint` are self-inverse": the
-/// involution is left to the consuming compiler, so BOTH transposes are emitted
-/// and the round trip returns to the original shape. Pinning the choice (rather
-/// than folding here) because a `transpose(transpose(x))` peephole would be this
-/// crate's first such rewrite and buys nothing XLA does not already do — if
-/// someone later adds the fold, this golden is what they must update
-/// deliberately.
+/// The matrix involution in §07 preserves the original axes and reduction order.
 #[test]
-fn emit_logdensity_double_matrix_transpose_emits_both_and_round_trips() {
+fn emit_logdensity_double_matrix_transpose_emits_the_original_matrix() {
     let src = "\
 m = elementof(cartpow(reals, [4, 3]))
 z = sum(sum(transpose(transpose(m))))
@@ -10166,16 +10160,12 @@ outputs = lp
 ";
     let d = determinize_abi_roots(src, &["inputs", "outputs"]);
     let out = emit_logdensity(&d);
-    assert_eq!(
-        out.matches("stablehlo.transpose").count(),
-        2,
-        "both matrix transposes are emitted, unfolded, in:\n{out}"
+    let direct = determinize_abi_roots(
+        &src.replace("transpose(transpose(m))", "m"),
+        &["inputs", "outputs"],
     );
-    assert!(
-        out.contains("(tensor<4x3xf32>) -> tensor<3x4xf32>")
-            && out.contains("(tensor<3x4xf32>) -> tensor<4x3xf32>"),
-        "the round trip must return to tensor<4x3xf32>, in:\n{out}"
-    );
+    assert_eq!(out, emit_logdensity(&direct));
+    assert!(!out.contains("stablehlo.transpose"), "{out}");
 }
 
 /// Orientation is enforced on the DOTTED and predicate paths too, not just the
@@ -11853,8 +11843,9 @@ outputs = (lp)\n";
     .expect("table field access must emit, not refuse the `table` head");
     assert!(out.contains("module {"));
     assert!(
-        out.contains("dense<\"0x0000A841\"> : tensor<1xf32>"),
-        "bb[1] = 21.0 (the projected column) must appear:\n{out}"
+        out.contains("dense<21.0> : tensor<f32>")
+            || out.contains("dense<\"0x0000A841\"> : tensor<1xf32>"),
+        "the projected value bb[1] must be 21.0:\n{out}"
     );
     assert!(
         !out.contains("11.0")

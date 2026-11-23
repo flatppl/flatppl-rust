@@ -26,13 +26,14 @@ required-features = ["fmtlint"]
 [features]
 # Verbs are opt-in cargo features so heavy capabilities never burden the
 # default build; `infer` is light and rides along by default.
-default = ["convert", "infer", "prepare", "fmtlint", "determinize", "stablehlo", "mathdoc"]
+default = ["convert", "infer", "prepare", "fmtlint", "optimise", "determinize", "stablehlo", "mathdoc"]
 # `convert` requires `infer`: it gates the generated module through the same
 # type/shape trace before writing, so the gate cannot vary by feature set.
 convert = ["dep:flatppl-flatpir", "infer"]
 # `infer` resolves cross-module deps from the cache only (no network), so it
 # links `flatppl-fileaccess` WITHOUT its `net` feature — no TLS stack.
 infer = ["dep:flatppl-infer", "dep:flatppl-flatpir", "dep:flatppl-fileaccess", "flatppl-bundle/source"]
+optimise = ["dep:flatppl-optimise", "infer"]
 # `prepare` is the only network-touching verb: it readies a model for offline use
 # by fetching its remote deps into the cache, so it turns on
 # `flatppl-fileaccess/net` (ureq + rustls).
@@ -66,6 +67,7 @@ flatppl-bundle = { path = "../bundle" }
 flatppl-syntax = { path = "../syntax" }
 flatppl-flatpir = { path = "../flatpir", optional = true }
 flatppl-infer = { path = "../infer", optional = true }
+flatppl-optimise = { path = "../optimise", optional = true }
 flatppl-hs3 = { path = "../hs3", optional = true }
 flatppl-formula = { path = "../formula", optional = true }
 flatppl-lint = { path = "../lint", optional = true }

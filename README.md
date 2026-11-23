@@ -15,6 +15,7 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-syntax`](crates/syntax) — canonical FlatPPL surface syntax: parse + print
 * [`flatppl-flatpir`](crates/flatpir) — FlatPIR S-expression reader + writer
 * [`flatppl-infer`](crates/infer) — type, shape, and phase inference
+* [`flatppl-optimise`](crates/optimise) — output-driven pruning and egglog rewrites for the typed model DAG
 * [`flatppl-model-analysis`](crates/model-analysis) — dependency analysis, scalar conjugacy, sufficient statistics, incremental scores and Normal coordinate maps
 * [`flatppl-hs3`](crates/hs3) — HS3 / pyhf → FlatPPL importer
 * [`flatppl-formula`](crates/formula) — Gaussian regression formulas → FlatPPL, with reusable data recipes
@@ -46,6 +47,7 @@ flatppl convert model.flatpir model.flatppl   # FlatPIR → FlatPPL
 flatppl convert messy.flatppl tidy.flatppl    # canonicalize (same format)
 flatppl infer model.flatppl typed.flatpir    # emit type/phase-annotated FlatPIR
 flatppl infer --level=phase m.flatppl m.flatpir  # or: type, valueset, normalization, shape
+flatppl optimise model.flatppl --emit flatpir -o optimised.flatpir
 flatppl prepare model.flatppl                  # fetch the model's remote deps into the cache
 flatppl convert model.flatppl model.html       # the model as a page of mathematics (MathML)
 flatppl stablehlo query.flatppl --dtype f64 -o query.mlir # float64 compilation; default is f32
@@ -103,6 +105,11 @@ refreshes already-cached deps. Cache location and trust are env-controlled
 non-interactive use unless `FLATPPL_TRUST=1`).
 
 ## Building and testing (developers)
+
+`flatppl optimise` accepts FlatPPL or FlatPIR and writes FlatPPL by default.
+For example, selecting a field from a private record can skip the other fields' computations when they have no observable effects.
+Portable rewrites also run during determinization. StableHLO applies its rules to the validated query before emission, using the existing CPU or GPU target.
+Stan can select native matrix contractions. The rule files cover each category separately. [Rule catalogue](crates/optimise/src/rules)
 
 Independent likelihood factors use shared data summaries where supported.
 `flatppl stan --reduce sufficient` prepares observed IID Normal summaries in Stan's

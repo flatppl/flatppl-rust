@@ -31,6 +31,34 @@ fn an_aliased_input_compiles_like_the_direct_one() {
 }
 
 #[test]
+fn target_optimisation_preserves_the_host_signature() {
+    let export = compile(
+        "raw = rowstack([[1.0]])\npromoted = transpose(transpose(raw))\n\
+         transposed = transpose(promoted)\ninputs = (raw, promoted)\noutputs = (transposed, raw)\n",
+    );
+    let names: Vec<_> = export
+        .inputs
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    assert_eq!(names, ["raw", "promoted"]);
+    assert_eq!(
+        export.output_names,
+        [Some("transposed".into()), Some("raw".into())]
+    );
+    assert!(
+        !export.stablehlo.contains("stablehlo.transpose"),
+        "{}",
+        export.stablehlo
+    );
+    assert!(
+        export.stablehlo.contains("return %arg1, %arg0"),
+        "{}",
+        export.stablehlo
+    );
+}
+
+#[test]
 fn an_alias_and_its_target_are_one_input() {
     let mut context = Context::default();
     let module = context

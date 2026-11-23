@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+flatppl-optimise = { path = "../optimise" }
 flatppl-core = { path = "../core" }
 flatppl-determinizer = { path = "../determinizer" }
 flatppl-infer = { path = "../infer" }

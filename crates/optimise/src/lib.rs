@@ -1,0 +1,51 @@
+//! Typed rewrites of an inferred FlatPPL model or a determinized query.
+
+mod conjugacy;
+mod demand;
+mod engine;
+mod gaussian;
+mod outputs;
+mod project;
+mod selectors;
+mod types;
+
+use flatppl_core::{Module, Symbol};
+
+/// The shared language and each emitter have separate rule schedules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    Portable,
+    Stan,
+    StableHlo { target: Target, dtype: Dtype },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Cpu,
+    Gpu,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dtype {
+    F32,
+    F64,
+}
+
+/// Optimise reachable definitions, retaining binding names, query inputs and
+/// callable boundaries. With no roots, public bindings are observable and all
+/// definitions remain in the module.
+/// Returns a freshly annotated module only when a cheaper expression wins.
+pub fn optimise(module: &Module, roots: Option<&[Symbol]>, profile: Profile) -> Option<Module> {
+    optimise_with_bundle(module, roots, profile, &flatppl_infer::ModuleBundle::new())
+}
+
+/// Optimise a module with the same dependency resolution used for inference.
+pub fn optimise_with_bundle(
+    module: &Module,
+    roots: Option<&[Symbol]>,
+    profile: Profile,
+    bundle: &flatppl_infer::ModuleBundle,
+) -> Option<Module> {
+    let pruned = demand::prune(module, roots, profile, bundle);
+    project::optimise(pruned.as_ref().unwrap_or(module), roots, profile, bundle).or(pruned)
+}

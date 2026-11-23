@@ -278,8 +278,6 @@ pub(crate) fn emit_logdensity_abi(
     abi: &Abi,
     opts: &EmitOptions,
 ) -> Result<String, EmitError> {
-    let mut e = Emitter::with_options(m, opts);
-
     check_query_inputs(m, &abi.outputs, &abi.inputs.iter().copied().collect(), &[])?;
 
     if abi.outputs.is_empty() {
@@ -288,6 +286,15 @@ pub(crate) fn emit_logdensity_abi(
         ));
     }
 
+    let optimised = crate::optimise_query(m, opts);
+    let optimised_outputs;
+    let (m, outputs) = if let Some((m, root)) = &optimised {
+        optimised_outputs = tuple_elems(m, *root);
+        (m, optimised_outputs.as_slice())
+    } else {
+        (m, abi.outputs.as_slice())
+    };
+    let mut e = Emitter::with_options(m, opts);
     let mut args: Vec<(String, MlirTy, ElemKind)> = Vec::with_capacity(abi.inputs.len());
     let mut next_arg = 0usize;
     for &sym in &abi.inputs {
@@ -295,8 +302,8 @@ pub(crate) fn emit_logdensity_abi(
     }
     check_arity(abi, args.len())?;
 
-    let mut rets_vals: Vec<Value> = Vec::with_capacity(abi.outputs.len());
-    for &node in &abi.outputs {
+    let mut rets_vals: Vec<Value> = Vec::with_capacity(outputs.len());
+    for &node in outputs {
         let before = rets_vals.len();
         if let Some(indices) = crate::indices::outputs(&mut e, node) {
             rets_vals.extend(indices?);
@@ -507,7 +514,7 @@ pub(crate) fn emit_sample_abi(
 }
 
 /// Whether `root` reads a `builtin_sample` draw.
-fn reaches_sample(m: &Module, root: NodeId) -> bool {
+pub(crate) fn reaches_sample(m: &Module, root: NodeId) -> bool {
     let mut pending = vec![root];
     let mut seen = HashSet::new();
     while let Some(node) = pending.pop() {

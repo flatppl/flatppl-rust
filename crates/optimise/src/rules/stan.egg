@@ -1,0 +1,14 @@
+(ruleset stan)
+
+; The Stan emitter maps real Gram matrices to tcrossprod and crossprod.
+; FlatPPL §07: adjoint and transpose coincide on these real matrices.
+(relation stan-transpose-head (String))
+(stan-transpose-head "transpose")
+(stan-transpose-head "adjoint")
+
+(rule ((= e (B "mul" a (U tr a))) (stan-transpose-head tr)
+       (real-matrix a rows cols) (real-matrix e rows rows))
+      ((union e (U "row_gram" a))) :ruleset stan)
+(rule ((= e (B "mul" (U tr a) a)) (stan-transpose-head tr)
+       (real-matrix a rows cols) (real-matrix e cols cols))
+      ((union e (U "col_gram" a))) :ruleset stan)

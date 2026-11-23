@@ -11,6 +11,6 @@ model {
     for (i in 1:2) {
       lps[i] = normal_lpdf(y | ([3.0, 4.0]')[i] - 2.0 * (mu - nu), 1.0);
     }
-    target += log_sum_exp(log([0.3, 0.7]') + lps) - log(sum([0.3, 0.7]'));
+    target += log_sum_exp(log([0.3, 0.7]') + lps);
   }
 }

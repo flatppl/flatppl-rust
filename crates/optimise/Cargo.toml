@@ -1,0 +1,21 @@
+[package]
+name = "flatppl-optimise"
+description = "Typed model DAG optimisation for FlatPPL and its emitters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egglog = { version = "3.0", default-features = false }
+flatppl-core = { path = "../core" }
+flatppl-infer = { path = "../infer" }
+
+# Egglog's RNG needs the JavaScript entropy backend on browser and Node wasm.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+flatppl-syntax = { path = "../syntax" }
+flatppl-flatpir = { path = "../flatpir" }

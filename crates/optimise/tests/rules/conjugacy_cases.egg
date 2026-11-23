@@ -1,0 +1,55 @@
+(let $point (Leaf 0))
+(int-value $point)
+
+; E[P] = 1/4 for P~Beta(1,3). The exponentiated density and log density
+; retain the original point and use the same counting measure.
+(let $beta-chain (Leaf 1))
+(let $beta-score (B "logdensityof" $beta-chain $point))
+(let $beta-probability (B "densityof" $beta-chain $point))
+(real-value $beta-score)
+(real-value $beta-probability)
+(conjugate-unit-predictive $beta-score 4598175219545276416)
+(conjugate-unit-predictive $beta-probability 4598175219545276416)
+
+; Integrating Poisson(lambda) against Gamma(shape=2, rate=3) gives NB(2,3).
+(let $gamma-chain (Leaf 2))
+(let $gamma-score (B "logdensityof" $gamma-chain $point))
+(real-value $gamma-score)
+(conjugate-gamma-poisson $gamma-score 4611686018427387904 4613937818241073152)
+
+; N(1.5, 3) followed by N(latent, 4) has variance 9 + 16 and mean 1.5.
+(let $normal-chain (Leaf 5))
+(let $normal-point (Leaf 6))
+(let $normal-score (B "logdensityof" $normal-chain $normal-point))
+(real-value $normal-point)
+(real-value $normal-score)
+(conjugate-normal-mean $normal-score 4609434218613702656 4617315517961601024)
+
+; These uses keep the actual measure. Weights and unsupported shapes have no
+; proof, and the predictive rewrite has no rule over sampling or total mass.
+(let $weighted-chain (Leaf 3))
+(let $weighted-score (B "logdensityof" $weighted-chain $point))
+(real-value $weighted-score)
+(let $sample (B "rand" $beta-chain (Leaf 4)))
+(let $mass (U "totalmass" $beta-chain))
+(let $real-point (Real 4607182418800017408))
+(real-value $real-point)
+(let $ill-typed (B "logdensityof" $beta-chain $real-point))
+(real-value $ill-typed)
+(conjugate-unit-predictive $ill-typed 4598175219545276416)
+
+(run conjugacy 4)
+(let $bernoulli (U "Bernoulli" (Real 4598175219545276416)))
+(let $nb (B "NegativeBinomial" (Real 4611686018427387904) (Real 4613937818241073152)))
+(let $normal (B "Normal" (Real 4609434218613702656) (Real 4617315517961601024)))
+(check (= $beta-score (B "logdensityof" $bernoulli $point)))
+(check (= $beta-probability (B "densityof" $bernoulli $point)))
+(check (= $gamma-score (B "logdensityof" $nb $point)))
+(check (= $normal-score (B "logdensityof" $normal $normal-point)))
+(check (conjugate-original-measure $beta-chain))
+(check (conjugate-original-measure $gamma-chain))
+(fail (check (conjugate-original-measure $bernoulli)))
+(fail (check (= $weighted-score $beta-score)))
+(fail (check (= $sample (B "rand" $bernoulli (Leaf 4)))))
+(fail (check (= $mass (U "totalmass" $bernoulli))))
+(fail (check (= $ill-typed (B "logdensityof" $bernoulli $real-point))))

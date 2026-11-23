@@ -2967,7 +2967,29 @@ pub(crate) struct ImportNames {
 }
 
 pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgram> {
-    program_with(m, opts, &ImportNames::default())
+    let (target, optimised) = prepare(m, opts, &flatppl_infer::ModuleBundle::new())?;
+    program_printed(
+        optimised.as_ref().unwrap_or(m),
+        opts,
+        &ImportNames::default(),
+        target,
+    )
+    .0
+}
+
+pub(crate) fn prepare(
+    m: &Module,
+    opts: &EmitOptions,
+    bundle: &flatppl_infer::ModuleBundle,
+) -> Result<(Symbol, Option<Module>)> {
+    let target = select_target(m, opts)?;
+    let optimised = flatppl_optimise::optimise_with_bundle(
+        m,
+        Some(&[target]),
+        flatppl_optimise::Profile::Stan,
+        bundle,
+    );
+    Ok((target, optimised))
 }
 
 /// What an emission printed: each binding it named and each name it made.
@@ -2977,24 +2999,13 @@ pub(crate) struct Printed {
     pub used: HashSet<String>,
 }
 
-pub(crate) fn program_with(
-    m: &Module,
-    opts: &EmitOptions,
-    imports: &ImportNames,
-) -> Result<crate::StanProgram> {
-    program_printed(m, opts, imports).0
-}
-
-/// [`program_with`], with what the emission printed, also when it refuses.
+/// Emit a selected target and report which names the emission printed.
 pub(crate) fn program_printed(
     m: &Module,
     opts: &EmitOptions,
     imports: &ImportNames,
+    target: Symbol,
 ) -> (Result<crate::StanProgram>, Printed) {
-    let target = match select_target(m, opts) {
-        Ok(t) => t,
-        Err(r) => return (Err(r), Printed::default()),
-    };
     let mut e = Emitter::new(m, opts);
     e.display.clone_from(&imports.display);
     for (_, b) in m.bindings() {
