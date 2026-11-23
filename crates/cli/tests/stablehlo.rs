@@ -453,3 +453,200 @@ fn stablehlo_moments_reject_shape_product_overflow() {
         assert!(out.stdout.is_empty(), "{name}: refusal emitted partial IR");
     }
 }
+
+const TERMINAL_SCAN: &str = r#"
+xs = external(cartpow(reals, 5))
+seed = external(cartpow(reals, 2))
+gain = 0.5
+step(state, x, a) = tanh.(a .* state .+ x)
+history = scan(step, seed, xs, gain)
+alias = history
+inputs = (seed, xs, gain)
+"#;
+
+const RECORD_SCAN: &str = r#"
+xs = external(cartpow(reals, 5))
+seed = external(reals)
+gain = 0.5
+step(state, x, a) = record(
+    mean = a * state.mean + state.energy + x,
+    energy = 0.25 * state.energy + x * x,
+)
+history = scan(step, record(mean = seed, energy = 0.5), xs, gain)
+read_mean(state) = state.mean
+alias = history
+inputs = (xs, gain, seed)
+"#;
+
+const CHECKED_SCAN: &str = r#"
+xs = external(cartpow(reals, 5))
+seed = external(reals)
+step(state, x) = record(
+    mean = state.mean + x,
+    scored = logdensityof(Normal(0.0, x), 0.25),
+)
+history = scan(step, record(mean = seed, scored = 0.0), xs)
+inputs = (xs, seed)
+outputs = history.mean
+"#;
+
+fn emit_scan(name: &str, source: &str) -> String {
+    let input = write_model(name, source);
+    let output = flatppl()
+        .args(["stablehlo", "--target", "cpu", "--dtype", "f64"])
+        .arg(input)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn terminal_scan_selectors_keep_one_history_row() {
+    for length in [1, 2, 3, 5] {
+        let prefix =
+            TERMINAL_SCAN.replace("cartpow(reals, 5)", &format!("cartpow(reals, {length})"));
+        let one = emit_scan(
+            &format!("scan-terminal-one-{length}"),
+            &format!("{prefix}outputs = alias[{length}]\n"),
+        );
+        let zero = emit_scan(
+            &format!("scan-terminal-zero-{length}"),
+            &format!("{prefix}outputs = get0(alias, {})\n", length - 1),
+        );
+        assert_eq!(one, zero);
+        assert!(one.contains(&format!(
+            "@logdensity(%arg0: tensor<2xf64>, %arg1: tensor<{length}xf64>, %arg2: tensor<f64>) -> tensor<2xf64>"
+        )));
+        let scan = one
+            .lines()
+            .find(|line| line.contains("stablehlo.while"))
+            .unwrap();
+        assert!(scan.contains("tensor<1x2xf64>"), "{scan}");
+        if length > 1 {
+            assert!(!scan.contains(&format!("tensor<{length}x2xf64>")), "{scan}");
+        }
+        assert_eq!(
+            one.matches("stablehlo.dynamic_update_slice").count(),
+            1,
+            "{one}"
+        );
+        assert!(
+            one.lines()
+                .any(|line| line.contains("stablehlo.slice") && line.contains("[0:1, 0:2]")),
+            "{one}"
+        );
+    }
+
+    let promoted = TERMINAL_SCAN.replace("inputs = (seed, xs, gain)", "inputs = alias");
+    let promoted = emit_scan(
+        "scan-terminal-promoted",
+        &format!("{promoted}outputs = alias[5]\n"),
+    );
+    assert!(promoted.contains("@logdensity(%arg0: tensor<5x2xf64>) -> tensor<2xf64>"));
+    assert!(!promoted.contains("stablehlo.while"), "{promoted}");
+}
+
+#[test]
+fn a_projected_scan_history_keeps_other_fields_in_the_recurrence() {
+    for (name, projection) in [
+        ("scan-field", "alias.mean"),
+        ("scan-accessor", "read_mean.(alias)"),
+    ] {
+        let ir = emit_scan(name, &format!("{RECORD_SCAN}outputs = {projection}\n"));
+        assert!(ir.contains(
+            "@logdensity(%arg0: tensor<5xf64>, %arg1: tensor<f64>, %arg2: tensor<f64>) -> tensor<5xf64>"
+        ));
+        assert_eq!(ir.matches("stablehlo.while").count(), 1);
+        assert_eq!(
+            ir.matches("stablehlo.dynamic_update_slice").count(),
+            1,
+            "{ir}"
+        );
+    }
+}
+
+#[test]
+fn mixed_scan_output_requests_keep_a_shared_complete_history() {
+    for (name, prefix, outputs, types, histories) in [
+        (
+            "scan-field-first",
+            RECORD_SCAN,
+            "(alias.mean[2], alias)",
+            "(tensor<f64>, tensor<5xf64>, tensor<5xf64>)",
+            2,
+        ),
+        (
+            "scan-record-first",
+            RECORD_SCAN,
+            "(alias, alias.mean[2])",
+            "(tensor<5xf64>, tensor<5xf64>, tensor<f64>)",
+            2,
+        ),
+        (
+            "scan-terminal-first",
+            TERMINAL_SCAN,
+            "(alias[5], alias)",
+            "(tensor<2xf64>, tensor<5x2xf64>)",
+            1,
+        ),
+        (
+            "scan-tensor-first",
+            TERMINAL_SCAN,
+            "(alias, get0(alias, 4))",
+            "(tensor<5x2xf64>, tensor<2xf64>)",
+            1,
+        ),
+    ] {
+        let ir = emit_scan(name, &format!("{prefix}outputs = {outputs}\n"));
+        assert_eq!(ir.matches("stablehlo.while").count(), 1, "{ir}");
+        assert_eq!(
+            ir.matches("stablehlo.dynamic_update_slice").count(),
+            histories,
+            "{ir}"
+        );
+        assert!(ir.contains(&format!("-> {types} {{")), "{ir}");
+        if histories == 1 {
+            let scan = ir
+                .lines()
+                .find(|line| line.contains("stablehlo.while"))
+                .unwrap();
+            assert!(scan.contains("tensor<5x2xf64>"), "{scan}");
+        }
+    }
+}
+
+#[test]
+fn a_promoted_scan_index_keeps_the_history_and_runtime_status() {
+    let prefix = TERMINAL_SCAN.replace(
+        "inputs = (seed, xs, gain)",
+        "index = 4\ninputs = (seed, xs, gain, index)",
+    );
+    let ir = emit_scan(
+        "scan-runtime-index",
+        &format!("{prefix}outputs = get0(alias, index)\n"),
+    );
+    assert!(ir.contains(
+        "@logdensity(%arg0: tensor<2xf64>, %arg1: tensor<5xf64>, %arg2: tensor<f64>, %arg3: tensor<i64>) -> (tensor<2xf64>, tensor<i64>)"
+    ));
+    assert_eq!(ir.matches("stablehlo.while").count(), 1);
+    assert_eq!(
+        ir.matches("stablehlo.dynamic_update_slice").count(),
+        1,
+        "{ir}"
+    );
+    assert!(ir.contains("flatppl.runtime_status"), "{ir}");
+}
+
+#[test]
+fn a_scan_checks_unreturned_fields_on_every_step() {
+    let ir = emit_scan("scan-checked-field", CHECKED_SCAN);
+    assert!(ir.contains("flatppl.runtime_status"), "{ir}");
+    assert!(ir.contains("-> (tensor<5xf64>, tensor<i64>)"), "{ir}");
+    let body = ir.split_once("} do {").expect("scan body").1;
+    assert!(body.contains("dense<9>"), "{body}");
+}

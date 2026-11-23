@@ -175,7 +175,11 @@ impl Emitter<'_> {
                 found.ok_or_else(|| unknown_field(container, name))
             }
             ("scan" | "reduce", _) => {
-                let parts = self.lower_sequence(resolved, &args, head == "reduce")?;
+                let parts = if head == "scan" {
+                    self.lower_scan_histories(resolved, &args)?
+                } else {
+                    self.lower_sequence(resolved, &args, true)?
+                };
                 let index = parts
                     .fields
                     .as_ref()

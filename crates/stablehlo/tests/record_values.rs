@@ -257,6 +257,71 @@ fn a_nested_record_scan_state_carries_each_leaf() {
     );
 }
 
+#[test]
+fn a_public_emitter_can_read_unlisted_scan_columns_in_either_order() {
+    use flatppl_stablehlo::{ElemKind, Emitter, MlirTy, Value};
+
+    let source = r#"
+seed = external(reals)
+xs = external(cartpow(reals, 5))
+step(state, x) = record(wanted = state.wanted + x, hidden = state.hidden * x)
+history = scan(step, record(wanted = seed, hidden = seed), xs)
+inputs = (seed, xs)
+other = history.hidden
+outputs = history.wanted
+"#;
+    let mut module = flatppl_syntax::parse(source).expect("parse");
+    let diagnostics = flatppl_infer::infer(&mut module);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let mut module = flatppl_determinizer::determinize_with_options(
+        &module,
+        &flatppl_infer::ModuleBundle::new(),
+        None,
+        &flatppl_stablehlo::LOWERING_OPTIONS,
+    )
+    .expect("determinize both projections");
+    flatppl_determinizer::resolve_alias_chains(&mut module);
+    let [seed, xs, wanted, other] = ["seed", "xs", "outputs", "other"].map(|name| {
+        module
+            .bindings()
+            .find(|(_, binding)| module.resolve(binding.name) == name)
+            .unwrap_or_else(|| panic!("missing binding {name}"))
+            .1
+            .rhs
+    });
+
+    let options = EmitOptions::default();
+    let five_rows = MlirTy::Ranked(vec![Some(5)]);
+    for order in [[wanted, other], [other, wanted]] {
+        let mut emitter = Emitter::with_options(&module, &options);
+        for (node, ssa, ty) in [
+            (seed, "%arg0", MlirTy::Scalar),
+            (xs, "%arg1", five_rows.clone()),
+        ] {
+            emitter.bind(
+                node,
+                Value {
+                    ssa: ssa.to_owned(),
+                    ty,
+                    elem: ElemKind::Real,
+                },
+            );
+        }
+        let [first, second] = order.map(|node| emitter.lower_node(node).expect("read scan column"));
+        assert_eq!(first.ty, five_rows);
+        assert_eq!(second.ty, five_rows);
+        assert_ne!(first.ssa, second.ssa);
+    }
+
+    let query =
+        flatppl_stablehlo::emit(&module, Mode::LogDensity, &options).expect("declared query");
+    assert_eq!(
+        query.matches("stablehlo.dynamic_update_slice").count(),
+        1,
+        "{query}"
+    );
+}
+
 fn determinize(source: &str) -> flatppl_core::Module {
     let mut model = flatppl_syntax::parse(source).expect("parse");
     let diagnostics = flatppl_infer::infer(&mut model);
