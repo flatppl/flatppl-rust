@@ -12,6 +12,7 @@ struct Integrand2 {
     kind: IntegralKind,
     origins: [Value; 2],
     widths: [Value; 2],
+    log_shift: Option<LogShift>,
 }
 
 struct TensorRule {
@@ -99,12 +100,14 @@ impl Emitter<'_> {
             ));
         }
         let [(x, dx), (y, dy)] = bounds.try_into().unwrap_or_else(|_| unreachable!());
+        let log_shift = self.quadrature_log_shift(kind, args[0], points)?;
         let integrand = Integrand2 {
             body: args[0],
             points,
             kind,
             origins: [x, y],
             widths: [dx, dy],
+            log_shift,
         };
         let rule = TensorRule::new(self);
         let unit = [zero.clone(), one.clone(), zero.clone(), one.clone()];
@@ -141,7 +144,7 @@ impl Emitter<'_> {
             .map(|v| v.ty.render(self.dtype, v.elem))
             .collect::<Vec<_>>();
         let log_rtol = self.scalar(options.rtol.ln());
-        let log_atol = self.scalar(options.atol.ln());
+        let log_atol = self.quadrature_log_atol(options.atol, integrand.log_shift.as_ref());
         let result = self.try_while_loop(
             &initial,
             &types,
@@ -265,6 +268,7 @@ impl Emitter<'_> {
         } else {
             result[8].clone()
         };
+        let value = self.restore_log_shift(value, integrand.log_shift.as_ref());
         let nan = self.scalar(f64::NAN);
         let value = self.select(&valid, &value, &nan);
         let empty = self.and(&valid_bounds, &empty);
@@ -391,12 +395,14 @@ impl Emitter<'_> {
                     self.quadrature_raw_mass(&body, &jacobian, &log_radius, &rule.kronrod);
                 (log, Some(valid), linear, None)
             }
-            IntegralKind::Log => (
-                self.quadrature_body(integrand.body, points)?,
-                None,
-                zero.clone(),
-                None,
-            ),
+            IntegralKind::Log => {
+                let body = self.quadrature_shifted_body(
+                    integrand.body,
+                    points,
+                    integrand.log_shift.as_ref(),
+                )?;
+                (body, None, zero.clone(), None)
+            }
         };
         let finite = self.compare("LT", &log, &infinity);
         let valid = self.and(&finite, &interior);

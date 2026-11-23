@@ -278,7 +278,7 @@ impl<'a> Scope<'a> {
     }
 
     fn integrate(&self, emitter: &mut Emitter, primal: NodeId, derivative: NodeId) -> NodeId {
-        let (derivative, center) = if self.logarithmic {
+        let (derivative, center) = if self.logarithmic && self.axes.len() == 1 {
             // Center the score before integration. A nearly constant score in a
             // tail interval would otherwise amplify rounding of the mass ratio.
             let mut points = HashMap::new();
@@ -312,12 +312,73 @@ impl<'a> Scope<'a> {
         if !self.logarithmic {
             return integral(emitter, MASS_INTEGRAL, part, self.axes.iter());
         }
+        let (log_weight, log_mass) = self.normalization(emitter, primal);
+        let module = &mut emitter.module;
         let part = build_call(module, "log", &[part]);
-        let weighted = build_call(module, "add", &[self.body, part]);
+        let weighted = build_call(module, "add", &[log_weight, part]);
         let neg_inf = real(module, f64::NEG_INFINITY);
-        let outside = build_call(module, "isinf", &[self.body]);
+        let outside = build_call(module, "isinf", &[log_weight]);
         let weighted = build_call(module, "ifelse", &[outside, neg_inf, weighted]);
-        normalized_log_integral(emitter, primal, weighted, self.axes.iter())
+        normalized_log_integral(emitter, log_mass, weighted, self.axes.iter())
+    }
+
+    fn normalization(&self, emitter: &mut Emitter, primal: NodeId) -> (NodeId, NodeId) {
+        if let Some(&normalization) = emitter.integral_log_weights.get(&primal) {
+            return normalization;
+        }
+        let shift = emitter.primal(primal);
+        let terms = self.log_weight_terms();
+        let normalization = if self.axes.len() == 1 && terms.is_none() {
+            (self.body, shift)
+        } else {
+            // Reuse the primal log mass as a shift. Reintegrating the shifted
+            // weight recovers normalization even when the original log mass
+            // rounded away a width or area factor.
+            let weight = self.shifted_log_weight(&mut emitter.module, shift, terms);
+            let mass = integral(emitter, LOG_INTEGRAL, weight, self.axes.iter());
+            (weight, emitter.primal(mass))
+        };
+        emitter.integral_log_weights.insert(primal, normalization);
+        normalization
+    }
+
+    fn shifted_log_weight(
+        &self,
+        module: &mut Module,
+        shift: NodeId,
+        terms: Option<(NodeId, NodeId)>,
+    ) -> NodeId {
+        let weight = build_call(module, "sub", &[self.body, shift]);
+        let Some((offset, varying)) = terms else {
+            return weight;
+        };
+        // Subtract the shift from the independent addend first so a large
+        // common offset does not round away the variation along an edge.
+        let offset = build_call(module, "sub", &[offset, shift]);
+        let stable = build_call(module, "add", &[offset, varying]);
+        let raw_finite = build_call(module, "isfinite", &[self.body]);
+        let stable_finite = build_call(module, "isfinite", &[stable]);
+        let safe = build_call(module, "land", &[raw_finite, stable_finite]);
+        build_call(module, "ifelse", &[safe, stable, weight])
+    }
+
+    fn log_weight_terms(&self) -> Option<(NodeId, NodeId)> {
+        let module = self.plan.module;
+        let query = self.plan.query;
+        let Key::Node(body) = query.key(module, self.body).ok()? else {
+            return None;
+        };
+        let [a, b] = *expect_builtin_call(module, body, "add")?.args else {
+            return None;
+        };
+        let points = self.axes.iter().map(|axis| axis[0]).collect::<HashSet<_>>();
+        let a_varies = integrand_dependencies(module, query, &points, &[a]).ok()?.0;
+        let b_varies = integrand_dependencies(module, query, &points, &[b]).ok()?.0;
+        match (a_varies, b_varies) {
+            (false, true) => Some((a, b)),
+            (true, false) => Some((b, a)),
+            _ => None,
+        }
     }
 
     fn boundary(&self, emitter: &mut Emitter, primal: NodeId, slot: usize) -> NodeId {
@@ -356,12 +417,17 @@ impl<'a> Scope<'a> {
                 values.insert(predicate, tied);
             }
         }
-        let body = substitute(&mut emitter.module, self.body, &mut values);
+        let (body, log_mass) = if self.logarithmic {
+            self.normalization(emitter, primal)
+        } else {
+            (self.body, primal)
+        };
+        let body = substitute(&mut emitter.module, body, &mut values);
         let value = match (self.axes.len(), self.logarithmic) {
             (1, false) => body,
-            (1, true) => log_ratio(emitter, primal, body),
+            (1, true) => log_ratio(emitter, log_mass, body),
             (_, false) => integral(emitter, MASS_INTEGRAL, body, [&self.axes[1 - axis]]),
-            (_, true) => normalized_log_integral(emitter, primal, body, [&self.axes[1 - axis]]),
+            (_, true) => normalized_log_integral(emitter, log_mass, body, [&self.axes[1 - axis]]),
         };
         if sign == 0 {
             build_call(&mut emitter.module, "neg", &[value])
@@ -372,6 +438,11 @@ impl<'a> Scope<'a> {
 
     fn jump(&self, emitter: &mut Emitter, primal: NodeId, cut: &Cut) -> NodeId {
         let [point, lo, hi] = self.axes[0];
+        let (body, log_mass) = if self.logarithmic {
+            self.normalization(emitter, primal)
+        } else {
+            (self.body, primal)
+        };
         let mut side = |left| {
             let mut values = HashMap::from([(point, cut.value)]);
             for &(predicate, true_on_left) in &cut.comparisons {
@@ -393,9 +464,9 @@ impl<'a> Scope<'a> {
                 };
                 values.insert(predicate, test);
             }
-            let body = substitute(&mut emitter.module, self.body, &mut values);
+            let body = substitute(&mut emitter.module, body, &mut values);
             if self.logarithmic {
-                log_ratio(emitter, primal, body)
+                log_ratio(emitter, log_mass, body)
             } else {
                 body
             }
@@ -459,21 +530,19 @@ fn integral<'a>(
 
 fn normalized_log_integral<'a>(
     emitter: &mut Emitter,
-    primal: NodeId,
+    log_mass: NodeId,
     body: NodeId,
     axes: impl IntoIterator<Item = &'a [NodeId; 3]>,
 ) -> NodeId {
     // Apply the normalization before quadrature. Otherwise a small primal
     // mass magnifies the numerator's absolute quadrature error.
-    let denominator = emitter.primal(primal);
-    let body = build_call(&mut emitter.module, "sub", &[body, denominator]);
+    let body = build_call(&mut emitter.module, "sub", &[body, log_mass]);
     let value = integral(emitter, LOG_INTEGRAL, body, axes);
     build_call(&mut emitter.module, "exp", &[value])
 }
 
-fn log_ratio(emitter: &mut Emitter, primal: NodeId, numerator: NodeId) -> NodeId {
-    let denominator = emitter.primal(primal);
-    let ratio = build_call(&mut emitter.module, "sub", &[numerator, denominator]);
+fn log_ratio(emitter: &mut Emitter, log_mass: NodeId, numerator: NodeId) -> NodeId {
+    let ratio = build_call(&mut emitter.module, "sub", &[numerator, log_mass]);
     build_call(&mut emitter.module, "exp", &[ratio])
 }
 
@@ -520,13 +589,14 @@ fn find_cuts(
             if matches!(op, "lt" | "le" | "gt" | "ge" | "in") {
                 let lhs_is_point = coordinates.contains(lhs);
                 let rhs_is_point = coordinates.contains(rhs);
-                let (point, active) = cutoff_dependencies(module, query, &coordinates, &children)?;
+                let (point, active) =
+                    integrand_dependencies(module, query, &coordinates, &children)?;
                 if op == "in"
                     && lhs_is_point
                     && let Key::Node(set) = query.key(module, *rhs)?
                     && let Some(interval) = expect_builtin_call(module, set, "interval")
                     && let &[lo, hi] = interval.args.as_ref()
-                    && !cutoff_dependencies(module, query, &coordinates, &[lo, hi])?.0
+                    && !integrand_dependencies(module, query, &coordinates, &[lo, hi])?.0
                     && let Some(&[_, bound_lo, bound_hi]) = axes.iter().find(|axis| axis[0] == *lhs)
                 {
                     let identical = query.key(module, lo)? == query.key(module, bound_lo)?
@@ -547,7 +617,7 @@ fn find_cuts(
                 if point && axes.len() == 1 && op != "in" && lhs_is_point != rhs_is_point {
                     let value = if lhs_is_point { *rhs } else { *lhs };
                     let (depends_on_point, _) =
-                        cutoff_dependencies(module, query, &coordinates, &[value])?;
+                        integrand_dependencies(module, query, &coordinates, &[value])?;
                     if !depends_on_point {
                         let true_on_left = matches!(op, "lt" | "le") == lhs_is_point;
                         let cut = get_cut(module, query, &mut indices, &mut breakpoints, value)?;
@@ -589,7 +659,7 @@ fn get_cut<'a>(
     Ok(&mut breakpoints.cuts[i])
 }
 
-fn cutoff_dependencies(
+fn integrand_dependencies(
     module: &Module,
     query: &Query<'_>,
     coordinates: &HashSet<NodeId>,

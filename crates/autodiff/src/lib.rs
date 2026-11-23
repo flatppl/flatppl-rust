@@ -1618,6 +1618,7 @@ struct Emitter {
     names: HashMap<NodeId, Symbol>,
     suffix: usize,
     inline: bool,
+    integral_log_weights: HashMap<NodeId, (NodeId, NodeId)>,
     vector_scans: HashMap<NodeId, vector_scan::Prepared>,
     vector_scan_bars: HashMap<NodeId, NodeId>,
 }
@@ -1635,6 +1636,7 @@ impl Emitter {
             names,
             suffix: 0,
             inline: false,
+            integral_log_weights: HashMap::new(),
             vector_scans: HashMap::new(),
             vector_scan_bars: HashMap::new(),
         }
