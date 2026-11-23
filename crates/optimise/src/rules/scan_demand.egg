@@ -5,7 +5,7 @@
 (relation scan-use-summary (i64 i64 i64 i64 i64))
 (relation scan-output-plan (i64 i64))
 
-; Terminal consumers can reuse the final carry without any history.
+; Terminal consumers need only the final row.
 (rule ((scan-use-summary scan 0 1 0 total))
       ((scan-output-plan scan 0))
   :ruleset scan-demand)
