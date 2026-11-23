@@ -140,6 +140,7 @@ pub struct LoadedModule {
     typed: Module,
     bundle: ModuleBundle,
     data: Arc<Mutex<HashMap<String, DataSource>>>,
+    shared_normal_scale_score: Option<Arc<LoadedModule>>,
 }
 
 /// Data preparation and scoring queries with an explicit summary boundary.
@@ -312,6 +313,11 @@ impl LoadedModule {
         batch: Option<&BatchSpec>,
         prepare_fixed_data: bool,
     ) -> Result<Export, Diagnostic> {
+        if options.lowering_options().share_normal_scale
+            && let Some(score) = &self.shared_normal_scale_score
+        {
+            return score.compile_export(options, batch, prepare_fixed_data);
+        }
         let typed = &self.typed;
         let lowered = self.lower_query(options, None)?;
         let locate = |stage, node: Option<NodeId>, message| {
@@ -796,9 +802,17 @@ impl Context {
             let node = (e.node.index() < typed.node_count()).then_some(e.node);
             fail(e.reason).at(typed, node, module.source())
         })?;
+        let optimized = prepared.shared_normal_scale_score();
+        let preparation = self.prepared_query(module, prepared.preparation)?;
+        let mut score = self.prepared_query(module, prepared.score)?;
+        if let Some(optimized) = optimized {
+            Arc::get_mut(&mut score)
+                .expect("newly instantiated score")
+                .shared_normal_scale_score = Some(self.prepared_query(module, optimized)?);
+        }
         Ok(PreparedLikelihood {
-            preparation: self.prepared_query(module, prepared.preparation)?,
-            score: self.prepared_query(module, prepared.score)?,
+            preparation,
+            score,
             summaries: prepared.summaries,
         })
     }
@@ -1225,6 +1239,7 @@ impl Context {
             typed,
             bundle,
             data: self.data.clone(),
+            shared_normal_scale_score: None,
         }))
     }
 

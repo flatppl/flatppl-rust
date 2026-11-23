@@ -3,7 +3,8 @@
 use super::{Parameter, gather_parts};
 use crate::sufficient_statistics::multivariate::{shared, vector};
 use crate::sufficient_statistics::{
-    Expr, Factor, Reducer, fixed_values, map, materialize, num, op, resolve_record_field,
+    Expr, Factor, Reducer, ReductionPolicy, fixed_values, map, materialize, num, op,
+    resolve_record_field,
 };
 use flatppl_core::{Dim, Module, NodeId, ScalarType, Symbol, Type};
 
@@ -63,6 +64,8 @@ fn f32_reciprocal(m: &mut Module, sigma: &Expr) -> (Expr, Expr) {
 }
 
 fn standardize(
+    r: &mut Reducer,
+    m: &mut Module,
     value: Expr,
     sigma: &Expr,
     reciprocal: Option<&(Expr, Expr)>,
@@ -73,6 +76,8 @@ fn standardize(
     };
     // With at most 2^24 rows, |x| <= 2^32 and sigma >= 2^-30 bound
     // sum(n*x^2/sigma) by 2^118 and (x/sigma)^2 by 2^124 in binary32.
+    let deferred = (r.policy == ReductionPolicy::DeferNormalScale)
+        .then(|| materialize(m, apply("divide", vec![value.clone(), sigma.clone()])));
     let magnitude = apply("abs", vec![value.clone()]);
     let use_inverse = apply(
         "land",
@@ -87,7 +92,14 @@ fn standardize(
         vec![choose(value.clone(), num(0.0)), inverse.clone()],
     );
     let direct = apply("divide", vec![choose(num(0.0), value), sigma.clone()]);
-    apply("add", vec![fast, direct])
+    let guarded = apply("add", vec![fast, direct]);
+    if let Some(ordinary) = deferred {
+        r.shared_normal_scale
+            .insert(ordinary, materialize(m, guarded));
+        Expr::Node(ordinary)
+    } else {
+        guarded
+    }
 }
 
 pub(super) fn reduce(
@@ -247,13 +259,14 @@ pub(super) fn reduce(
         )
     };
     let sigma_value = Expr::Node(sigma);
-    let reciprocal = (r.policy == crate::sufficient_statistics::ReductionPolicy::SharedNormalScale)
-        .then(|| f32_reciprocal(m, &sigma_value));
+    let reciprocal = matches!(
+        r.policy,
+        ReductionPolicy::SharedNormalScale | ReductionPolicy::DeferNormalScale
+    )
+    .then(|| f32_reciprocal(m, &sigma_value));
     let delta = map("add", [map("sub", [centers, means.clone()]), corrections]);
-    let z = shared(
-        m,
-        standardize(delta, &sigma_value, reciprocal.as_ref(), map),
-    );
+    let z = standardize(r, m, delta, &sigma_value, reciprocal.as_ref(), map);
+    let z = shared(m, z);
     let count = vector(ordered.iter().map(|(_, rows)| num(rows.len() as f64)));
     let loss = map(
         "mul",
@@ -292,16 +305,8 @@ pub(super) fn reduce(
         &[(parameters[mu].0, zero), (sigma_name, sigma)],
         num(0.0),
     );
-    let z = shared(
-        m,
-        op(
-            "divide",
-            [
-                standardize(scale, &sigma_value, reciprocal.as_ref(), op),
-                num(divisor),
-            ],
-        ),
-    );
+    let z = standardize(r, m, scale, &sigma_value, reciprocal.as_ref(), op);
+    let z = shared(m, op("divide", [z, num(divisor)]));
     let within = op(
         "mul",
         [weight, op("mul", [num(-0.5), op("mul", [z.clone(), z])])],

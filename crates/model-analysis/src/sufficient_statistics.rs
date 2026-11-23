@@ -79,6 +79,39 @@ pub struct PreparedLikelihood {
     pub preparation: Module,
     pub score: Module,
     pub summaries: Vec<String>,
+    shared_normal_scale: HashMap<NodeId, NodeId>,
+}
+
+impl PreparedLikelihood {
+    /// The same explicit score inputs and preparation, using one adjoint for
+    /// the two grouped Normal quadratics when the scoring target benefits.
+    pub fn shared_normal_scale_score(&self) -> Option<Module> {
+        if self.shared_normal_scale.is_empty() {
+            return None;
+        }
+        fn replace(m: &mut Module, id: NodeId, changed: &mut HashMap<NodeId, NodeId>) -> NodeId {
+            if let Some(&replacement) = changed.get(&id) {
+                return replacement;
+            }
+            let children = m.node(id).children();
+            let rewritten: Vec<_> = children.iter().map(|&n| replace(m, n, changed)).collect();
+            let replacement = if children == rewritten {
+                id
+            } else {
+                graph::rebuild_with_children(m, id, &rewritten)
+            };
+            changed.insert(id, replacement);
+            replacement
+        }
+        let mut score = self.score.clone();
+        let mut changed = self.shared_normal_scale.clone();
+        let bindings: Vec<_> = score.bindings().map(|(id, b)| (id, b.rhs)).collect();
+        for (id, rhs) in bindings {
+            let rhs = replace(&mut score, rhs, &mut changed);
+            score.set_binding_rhs(id, rhs);
+        }
+        Some(score)
+    }
 }
 
 /// A likelihood preparation failure at the output of the supplied query.
@@ -659,6 +692,7 @@ struct Reducer {
     report: Option<ReductionReport>,
     binding: String,
     policy: ReductionPolicy,
+    shared_normal_scale: HashMap<NodeId, NodeId>,
     rule: Option<(&'static str, Option<GroupPartition>)>,
     fallback: &'static str,
 }
@@ -667,6 +701,7 @@ struct Reducer {
 enum ReductionPolicy {
     Disabled,
     Portable,
+    DeferNormalScale,
     SharedNormalScale,
 }
 
@@ -697,6 +732,7 @@ impl Reducer {
             report: None,
             binding: String::new(),
             policy: ReductionPolicy::Portable,
+            shared_normal_scale: HashMap::new(),
             rule: None,
             fallback: "",
         }
@@ -1551,7 +1587,7 @@ fn reduce(
     precision: Option<RealPrecision>,
     report: Option<&mut ReductionReport>,
     policy: ReductionPolicy,
-) -> (usize, Vec<Symbol>) {
+) -> (usize, Vec<Symbol>, HashMap<NodeId, NodeId>) {
     let boundary = query::promoted_input_names(m);
     let summaries: Vec<_> = summary_bindings(m)
         .filter(|_| policy != ReductionPolicy::Disabled)
@@ -1590,7 +1626,11 @@ fn reduce(
     if let Some(report) = report {
         report.decisions.extend(reducer.report.unwrap().decisions);
     }
-    (reducer.count, reducer.summaries)
+    (
+        reducer.count,
+        reducer.summaries,
+        reducer.shared_normal_scale,
+    )
 }
 
 /// Reduce shared-parameter independent likelihood factors to portable summary
@@ -1656,12 +1696,19 @@ pub fn prepare_likelihood_with_options(
         node: NodeId::from_usize(0),
         reason: "declare outputs before preparing a likelihood".into(),
     })?;
-    try_prepare_likelihood(m, output, data_inputs, options, RealPrecision::F32, report)?.ok_or_else(
-        || PreparationError {
-            node: output,
-            reason: "no supported sufficient-statistic likelihood factor".into(),
-        },
-    )
+    try_prepare_likelihood(
+        m,
+        output,
+        data_inputs,
+        options,
+        RealPrecision::F32,
+        ReductionPolicy::DeferNormalScale,
+        report,
+    )?
+    .ok_or_else(|| PreparationError {
+        node: output,
+        reason: "no supported sufficient-statistic likelihood factor".into(),
+    })
 }
 
 /// Split summaries independent of every declared input, including promoted
@@ -1686,6 +1733,7 @@ pub fn prepare_fixed_likelihood_for_precision(
         &[],
         &PreparationOptions::default(),
         precision,
+        ReductionPolicy::Portable,
         None,
     )
 }
@@ -1696,6 +1744,7 @@ fn try_prepare_likelihood(
     data_inputs: &[String],
     options: &PreparationOptions,
     precision: RealPrecision,
+    policy: ReductionPolicy,
     report: Option<&mut ReductionReport>,
 ) -> Result<Option<PreparedLikelihood>, PreparationError> {
     let refuse = |reason: &str| PreparationError {
@@ -1725,13 +1774,8 @@ fn try_prepare_likelihood(
         .into_iter()
         .flat_map(|name| score.alias_chain(name))
         .collect();
-    let (_, added) = reduce(
-        &mut score,
-        allowed.clone(),
-        Some(precision),
-        report,
-        ReductionPolicy::Portable,
-    );
+    let (_, added, shared_normal_scale) =
+        reduce(&mut score, allowed.clone(), Some(precision), report, policy);
     let boundary = query::promoted_input_names(&score);
     let mut candidates = summary_bindings(&score).peekable();
     if candidates.peek().is_none() {
@@ -1835,6 +1879,7 @@ fn try_prepare_likelihood(
         preparation,
         score,
         summaries,
+        shared_normal_scale,
     }))
 }
 

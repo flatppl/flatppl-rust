@@ -1,10 +1,12 @@
 use flatppl_host::{BatchSpec, Context, Dtype, EmitOptions, Export, Schema, Target};
 
 #[test]
-fn shared_scale_guard_is_specific_to_gpu_binary32_in_both_exports()
+fn grouped_normal_scale_follows_the_scoring_target_in_inline_and_prepared_queries()
 -> Result<(), Box<dyn std::error::Error>> {
-    let query = Context::default().parse(
+    let mut context = Context::default();
+    let query = context.parse(
         "a=elementof(cartpow(reals,2))\ns=elementof(posreals)\ng=[1,2,1,2]\ninputs=(a,s)\noutputs=logdensityof(Normal.(a[g],s),[0.4,1.0,1.3,2.0])", None, None)?;
+    let explicit = context.prepare_likelihood(&query, &[])?;
     for target in [Target::Cpu, Target::Gpu] {
         for dtype in [Dtype::F32, Dtype::F64] {
             let options = EmitOptions {
@@ -12,7 +14,12 @@ fn shared_scale_guard_is_specific_to_gpu_binary32_in_both_exports()
                 target,
                 ..Default::default()
             };
-            for export in [query.compile(&options)?, query.compile_prepared(&options)?] {
+            for export in [
+                query.compile(&options)?,
+                query.compile_prepared(&options)?,
+                explicit.score.compile(&options)?,
+                explicit.score.compile_prepared(&options)?,
+            ] {
                 assert_eq!(
                     export.stablehlo.contains("stablehlo.compare GE,"),
                     matches!((dtype, target), (Dtype::F32, Target::Gpu))
