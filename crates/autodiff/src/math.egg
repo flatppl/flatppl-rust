@@ -1,0 +1,114 @@
+; Real elementary maps reuse the same local partial for JVP and VJP.
+(rewrite (Pullback "imag" 1 0) (ZeroOut) :ruleset pullbacks)
+(rewrite (Pullback "sinh" 1 0) (Binary "mul" (Bar) (Unary "cosh" (Arg 0))) :ruleset pullbacks)
+(rewrite (Pullback "cosh" 1 0) (Binary "mul" (Bar) (Unary "sinh" (Arg 0))) :ruleset pullbacks)
+(rewrite (Pullback "tan" 1 0)
+  (Binary "mul" (Bar) (Binary "add" (Real 1.0) (Binary "mul" (Out) (Out)))) :ruleset pullbacks)
+(rewrite (Pullback "atan" 1 0)
+  (Binary "divide" (Bar) (Binary "add" (Real 1.0) (Binary "mul" (Arg 0) (Arg 0)))) :ruleset pullbacks)
+(rewrite (Pullback "atanh" 1 0)
+  (Binary "divide" (Binary "divide" (Bar) (Binary "sub" (Real 1.0) (Arg 0)))
+    (Binary "add" (Real 1.0) (Arg 0))) :ruleset pullbacks)
+(rewrite (Pullback "asinh" 1 0)
+  (Binary "divide" (Bar) (Unary "sqrt" (Binary "add" (Real 1.0) (Binary "mul" (Arg 0) (Arg 0)))))
+  :ruleset pullbacks)
+(rewrite (Pullback "log2" 1 0)
+  (Binary "mul" (Real 1.4426950408889634) (Binary "divide" (Bar) (Arg 0))) :ruleset pullbacks)
+(rewrite (Pullback "log10" 1 0)
+  (Binary "mul" (Real 0.4342944819032518) (Binary "divide" (Bar) (Arg 0))) :ruleset pullbacks)
+
+; Use the exponential tail so a rounded tanh output does not erase its derivative.
+(constructor TanhTail () Expr :unextractable)
+(rewrite (TanhTail)
+  (Unary "exp" (Binary "mul" (Real -2.0) (Unary "abs" (Arg 0)))) :ruleset pullbacks)
+(constructor TanhRatio () Expr :unextractable)
+(rewrite (TanhRatio)
+  (Binary "divide" (TanhTail) (Binary "add" (Real 1.0) (TanhTail))) :ruleset pullbacks)
+(rewrite (Pullback "tanh" 1 0) (Binary "mul" (Bar)
+  (Binary "mul" (Binary "mul" (Real 4.0) (TanhRatio))
+    (Binary "sub" (Real 1.0) (TanhRatio)))) :ruleset pullbacks)
+
+; Euclidean norm. The zero vector has a chosen zero subgradient.
+(constructor L2Direction () Expr :unextractable)
+(rewrite (L2Direction)
+  (Binary "divide" (Arg 0) (Ternary "ifelse" (Unary "iszero" (Out)) (Real 1.0) (Out)))
+  :ruleset pullbacks)
+(rewrite (Pullback "l2norm" 1 0) (Binary "mul" (Bar) (L2Direction)) :ruleset pullbacks)
+(rewrite (Pushforward "l2norm" 1 0) (MathDot (Bar) (L2Direction)) :ruleset pullbacks)
+
+; Pullbacks on real matrix cells use the Frobenius inner product.
+(rewrite (Pullback "trace" 1 0) (Binary "mul" (Bar) (IdentityLike 0)) :ruleset pullbacks)
+(rewrite (Pushforward "trace" 1 0) (ForwardCall "trace" 0) :ruleset pullbacks)
+(rewrite (Pullback "diagmat" 1 0) (Unary "diag" (Bar)) :ruleset pullbacks)
+(rewrite (Pushforward "diagmat" 1 0) (ForwardCall "diagmat" 0) :ruleset pullbacks)
+
+; Cofactors are polynomial derivatives, including at singular matrices.
+(rewrite (Pullback "det" 1 0) (Binary "mul" (Bar) (DetCofactors)) :ruleset pullbacks)
+(rewrite (Pushforward "det" 1 0) (MathDot (Bar) (DetCofactors)) :ruleset pullbacks)
+(constructor InverseTranspose () Expr :unextractable)
+(rewrite (InverseTranspose) (Unary "transpose" (Unary "inv" (Arg 0))) :ruleset pullbacks)
+(rewrite (Pullback "logabsdet" 1 0) (Binary "mul" (Bar) (InverseTranspose)) :ruleset pullbacks)
+(rewrite (Pushforward "logabsdet" 1 0) (MathDot (Bar) (InverseTranspose)) :ruleset pullbacks)
+
+(constructor TransposedOutput () Expr :unextractable)
+(rewrite (TransposedOutput) (Unary "transpose" (Out)) :ruleset pullbacks)
+(rewrite (Pullback "inv" 1 0)
+  (Unary "neg" (Binary "mul" (Binary "mul" (TransposedOutput) (Bar)) (TransposedOutput)))
+  :ruleset pullbacks)
+(rewrite (Pushforward "inv" 1 0)
+  (Unary "neg" (Binary "mul" (Binary "mul" (Out) (Bar)) (Out))) :ruleset pullbacks)
+
+(constructor SolveTranspose () Expr :unextractable)
+(rewrite (SolveTranspose) (Binary "linsolve" (Unary "transpose" (Arg 0)) (Bar)) :ruleset pullbacks)
+(rewrite (Pullback "linsolve" 2 0)
+  (Unary "neg" (Binary "mul" (SolveTranspose) (TransposedOutput))) :ruleset pullbacks)
+(rewrite (Pullback "linsolve" 2 1) (SolveTranspose) :ruleset pullbacks)
+(rewrite (Pushforward "linsolve" 2 0) (Unary "neg"
+  (Binary "linsolve" (Arg 0) (Binary "mul" (Bar) (Out)))) :ruleset pullbacks)
+(rewrite (Pushforward "linsolve" 2 1) (ForwardCall "linsolve" 1) :ruleset pullbacks)
+
+; Cholesky is defined on symmetric inputs. Use the symmetric projection in
+; both modes to extend its tangent and cotangent to full real matrices.
+(constructor CholeskyInverse () Expr :unextractable)
+(rewrite (CholeskyInverse) (Unary "inv" (Out)) :ruleset pullbacks)
+(constructor CholeskyInverseTranspose () Expr :unextractable)
+(rewrite (CholeskyInverseTranspose) (Unary "transpose" (CholeskyInverse)) :ruleset pullbacks)
+(rewrite (Pullback "lower_cholesky" 1 0)
+  (Symmetric (Binary "mul" (Binary "mul" (CholeskyInverseTranspose)
+    (TriangleHalf (Binary "mul" (TransposedOutput) (Bar)))) (CholeskyInverse)))
+  :ruleset pullbacks)
+(rewrite (Pushforward "lower_cholesky" 1 0)
+  (Binary "mul" (Out) (TriangleHalf (Binary "mul"
+    (Binary "mul" (CholeskyInverse) (Symmetric (Bar))) (CholeskyInverseTranspose))))
+  :ruleset pullbacks)
+
+; Rescale both atan2 operands before squaring.
+(constructor Atan2Scale () Expr :unextractable)
+(rewrite (Atan2Scale) (Binary "max" (Unary "abs" (Arg 0)) (Unary "abs" (Arg 1))) :ruleset pullbacks)
+(constructor Atan2Scaled (i64) Expr :unextractable)
+(rewrite (Atan2Scaled i) (Binary "divide" (Arg i) (Atan2Scale)) :ruleset pullbacks)
+(constructor Atan2Bar () Expr :unextractable)
+(rewrite (Atan2Bar) (Binary "divide" (Binary "divide" (Bar) (Atan2Scale))
+  (Binary "add" (Unary "abs2" (Atan2Scaled 0)) (Unary "abs2" (Atan2Scaled 1))))
+  :ruleset pullbacks)
+(rewrite (Pullback "atan2" 2 0) (Binary "mul" (Atan2Bar) (Atan2Scaled 1)) :ruleset pullbacks)
+(rewrite (Pullback "atan2" 2 1) (Unary "neg" (Binary "mul" (Atan2Bar) (Atan2Scaled 0)))
+  :ruleset pullbacks)
+
+; Split cotangents equally between tied scalar extrema.
+(constructor ExtremumPartial (i64) Expr :unextractable)
+(rewrite (ExtremumPartial i)
+  (Ternary "ifelse" (Unary "iszero" (Binary "sub" (Arg 0) (Arg 1)))
+    (Binary "mul" (Real 0.5) (Bar))
+    (Ternary "ifelse" (Unary "iszero" (Binary "sub" (Arg i) (Out))) (Bar) (Real 0.0)))
+  :ruleset pullbacks)
+(rewrite (Pullback "min" 2 slot) (ExtremumPartial slot) :ruleset pullbacks)
+(rewrite (Pullback "max" 2 slot) (ExtremumPartial slot) :ruleset pullbacks)
+
+(rewrite (Pullback "polynomial" 2 0) (Binary "mul" (Bar) (PolynomialBasis)) :ruleset pullbacks)
+(rewrite (Pullback "polynomial" 2 1) (Binary "mul" (Bar) (PolynomialSlope)) :ruleset pullbacks)
+(rewrite (Pushforward "polynomial" 2 0) (ForwardCall "polynomial" 0) :ruleset pullbacks)
+(rewrite (Pushforward "polynomial" 2 1) (Binary "mul" (Bar) (PolynomialSlope)) :ruleset pullbacks)
+
+(rewrite (Pullback "indexed sum product" 2 slot) (IndexedProduct slot 0) :ruleset pullbacks)
+(rewrite (Pushforward "indexed sum product" 2 slot) (IndexedProduct slot 1) :ruleset pullbacks)

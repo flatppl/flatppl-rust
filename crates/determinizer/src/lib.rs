@@ -56,6 +56,8 @@ pub use stdfn::{expand_spline, standard_function};
 /// The default keeps the backend-independent FlatPDL form.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoweringOptions<'a> {
+    /// Stop at legal FlatPDL before post-determinization optimizations.
+    pub disable_optimizations: bool,
     /// Leave independent likelihood factors unreduced.
     pub disable_sufficient_statistics: bool,
     /// Share regular grouped Normal scale reciprocals across residual terms.

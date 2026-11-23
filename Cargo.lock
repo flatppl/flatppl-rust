@@ -800,6 +800,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "flatppl-autodiff"
+version = "0.1.0"
+dependencies = [
+ "egglog",
+ "flatppl-core",
+ "flatppl-determinizer",
+ "flatppl-infer",
+ "flatppl-syntax",
+]
+
+[[package]]
 name = "flatppl-bundle"
 version = "0.1.0"
 dependencies = [
@@ -817,6 +828,7 @@ dependencies = [
  "ariadne",
  "clap",
  "clap_complete",
+ "flatppl-autodiff",
  "flatppl-bundle",
  "flatppl-core",
  "flatppl-determinizer",

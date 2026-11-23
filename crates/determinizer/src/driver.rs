@@ -262,17 +262,25 @@ fn determinize_inner(
 
         match target {
             None => {
-                // Measure layer gone — canonicalize the FlatPDL (and, if
-                // `roots` is given, drop bindings unreachable from them) before
-                // the conformance check and return.
-                crate::canon::canonicalize(&mut work, roots);
+                // Call inlining is still required to reach FlatPDL when the
+                // caller requests the graph before optimization.
+                if options.disable_optimizations {
+                    if crate::canon::inline_user_calls(&mut work) {
+                        let _ = flatppl_infer::infer(&mut work);
+                    }
+                    if let Some(roots) = roots {
+                        crate::canon::retain_reachable(&mut work, roots);
+                    }
+                } else {
+                    crate::canon::canonicalize(&mut work, roots);
+                }
                 if has_mass_queries && crate::log_mass::lower(&mut work) {
                     if let Some(roots) = roots {
                         crate::canon::retain_reachable(&mut work, roots);
                     }
                     let _ = flatppl_infer::infer(&mut work);
                 }
-                if !options.disable_sufficient_statistics {
+                if !options.disable_optimizations && !options.disable_sufficient_statistics {
                     crate::sufficient_statistics_for_target(
                         &mut work,
                         options.share_normal_scale,

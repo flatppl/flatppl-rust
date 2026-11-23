@@ -1,0 +1,88 @@
+; Location-scale transports use the order (location, scale, variate).
+(constructor TransportDiff () Expr :unextractable)
+(rewrite (TransportDiff) (Binary "sub" (Arg 2) (Arg 0)) :ruleset pullbacks)
+(constructor TransportZ () Expr :unextractable)
+(rewrite (TransportZ) (Binary "divide" (TransportDiff) (Arg 1)) :ruleset pullbacks)
+
+; The CDF derivatives at infinite endpoints are zero. Evaluate the Normal
+; slope in log space so tiny scales can offset a small standard Normal density.
+(constructor NormalCDFSlope () Expr :unextractable)
+(rewrite (NormalCDFSlope) (Unary "exp" (Binary "sub"
+  (Binary "sub" (Binary "mul" (Real -0.5) (Unary "abs2" (TransportZ)))
+    (Real 0.9189385332046727))
+  (Unary "log" (Arg 1)))) :ruleset pullbacks)
+(rewrite (Pullback "Normal CDF" 3 0)
+  (Unary "neg" (Binary "mul" (Bar) (NormalCDFSlope))) :ruleset pullbacks)
+(rewrite (Pullback "Normal CDF" 3 1)
+  (Ternary "ifelse" (Unary "isinf" (TransportZ)) (Real 0.0)
+    (Unary "neg" (Binary "mul" (Bar) (Binary "mul" (TransportZ) (NormalCDFSlope)))))
+  :ruleset pullbacks)
+(rewrite (Pullback "Normal CDF" 3 2)
+  (Binary "mul" (Bar) (NormalCDFSlope)) :ruleset pullbacks)
+
+; Normalize scale and displacement before squaring, so either can be large.
+(constructor CauchyCDFMagnitude () Expr :unextractable)
+(rewrite (CauchyCDFMagnitude)
+  (Binary "max" (Arg 1) (Unary "abs" (Binary "sub" (Arg 2) (Arg 0)))) :ruleset pullbacks)
+(constructor CauchyCDFFactor (Expr) Expr :unextractable)
+(rewrite (CauchyCDFFactor numerator)
+  (Ternary "ifelse" (Unary "isinf" (Binary "sub" (Arg 2) (Arg 0))) (Real 0.0)
+    (Binary "mul" (Bar) (Binary "divide"
+      (Binary "divide" (Binary "mul" (Real 0.3183098861837907)
+        (Binary "divide" numerator (CauchyCDFMagnitude)))
+        (Binary "add"
+          (Unary "abs2" (Binary "divide" (Arg 1) (CauchyCDFMagnitude)))
+          (Unary "abs2" (Binary "divide" (Binary "sub" (Arg 2) (Arg 0)) (CauchyCDFMagnitude)))))
+      (CauchyCDFMagnitude)))) :ruleset pullbacks)
+(rewrite (Pullback "Cauchy CDF" 3 0)
+  (Unary "neg" (CauchyCDFFactor (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "Cauchy CDF" 3 1)
+  (Unary "neg" (CauchyCDFFactor (TransportDiff))) :ruleset pullbacks)
+(rewrite (Pullback "Cauchy CDF" 3 2) (CauchyCDFFactor (Arg 1)) :ruleset pullbacks)
+
+(rewrite (Pullback "Normal to normal" 3 0)
+  (Unary "neg" (Binary "divide" (Bar) (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "Normal to normal" 3 1)
+  (Unary "neg" (Binary "mul" (Binary "divide" (Bar) (Arg 1)) (Out))) :ruleset pullbacks)
+(rewrite (Pullback "Normal to normal" 3 2)
+  (Binary "divide" (Bar) (Arg 1)) :ruleset pullbacks)
+(rewrite (Pullback "Normal from normal" 3 0) (Bar) :ruleset pullbacks)
+(rewrite (Pullback "Normal from normal" 3 1)
+  (Binary "mul" (Bar) (Arg 2)) :ruleset pullbacks)
+(rewrite (Pullback "Normal from normal" 3 2)
+  (Binary "mul" (Bar) (Arg 1)) :ruleset pullbacks)
+
+(rewrite (Pullback "Exponential quantile" 2 0)
+  (Unary "neg" (Binary "mul" (Bar) (Binary "divide" (Out) (Arg 0)))) :ruleset pullbacks)
+(rewrite (Pullback "Exponential quantile" 2 1)
+  (Binary "divide" (Binary "divide" (Bar) (Binary "sub" (Real 1.0) (Arg 1))) (Arg 0))
+  :ruleset pullbacks)
+(rewrite (Pullback "Logistic quantile" 3 0) (Bar) :ruleset pullbacks)
+(rewrite (Pullback "Logistic quantile" 3 1)
+  (Binary "mul" (Bar) (Unary "logit" (Arg 2))) :ruleset pullbacks)
+(rewrite (Pullback "Logistic quantile" 3 2)
+  (Binary "divide" (Binary "divide" (Binary "mul" (Bar) (Arg 1)) (Arg 2))
+    (Binary "sub" (Real 1.0) (Arg 2))) :ruleset pullbacks)
+
+; The reflected angle keeps the near-zero and near-one tail derivatives
+; accurate. Computing the scale derivative from Out - location loses it
+; when the primal rounds to location.
+(constructor CauchyLowerTail () Expr :unextractable)
+(rewrite (CauchyLowerTail) (Binary "lt" (Arg 2) (Real 0.5)) :ruleset pullbacks)
+(constructor CauchyTailAngle () Expr :unextractable)
+(rewrite (CauchyTailAngle)
+  (Binary "mul" (Real 3.141592653589793)
+    (Ternary "ifelse" (CauchyLowerTail) (Arg 2) (Binary "sub" (Real 1.0) (Arg 2))))
+  :ruleset pullbacks)
+(rewrite (Pullback "Cauchy quantile" 3 0) (Bar) :ruleset pullbacks)
+(rewrite (Pullback "Cauchy quantile" 3 1)
+  (Binary "mul" (Bar) (Binary "divide"
+    (Ternary "ifelse" (CauchyLowerTail)
+      (Unary "neg" (Unary "cos" (CauchyTailAngle)))
+      (Unary "cos" (CauchyTailAngle)))
+    (Unary "sin" (CauchyTailAngle)))) :ruleset pullbacks)
+(rewrite (Pullback "Cauchy quantile" 3 2)
+  (Binary "mul" (Bar) (Binary "divide"
+    (Binary "mul" (Real 3.141592653589793)
+      (Binary "divide" (Arg 1) (Unary "sin" (CauchyTailAngle))))
+    (Unary "sin" (CauchyTailAngle)))) :ruleset pullbacks)
