@@ -627,10 +627,7 @@ impl Filter<'_, '_, '_> {
                     }
                     op @ ("get" | "get0") => {
                         let (&data, selectors) = c.args.split_first()?;
-                        let base = i64::from(op == "get");
-                        let element =
-                            self.integer_element(data, selectors, base, param, depth + 1)?;
-                        self.number(element, param, depth + 1)
+                        scalar_number(self.indexed_cell(data, selectors, op, param, depth)?)
                     }
                     _ => None,
                 }
@@ -639,28 +636,16 @@ impl Filter<'_, '_, '_> {
         }
     }
 
-    fn integer_element(
+    fn indexed_cell(
         &self,
         data: NodeId,
         selectors: &[NodeId],
-        base: i64,
+        op: &str,
         param: Option<(Symbol, &FixedValue)>,
         depth: u32,
-    ) -> Option<NodeId> {
-        let data = self.container(data, depth)?;
-        if !matches!(
-            self.inf.node_annotation(data).0,
-            Type::Array { elem, .. } if *elem == Type::Scalar(ScalarType::Integer)
-        ) {
-            return None;
-        }
-        let Node::Call(c) = self.inf.module.node(data) else {
-            return None;
-        };
-        if !c.named.is_empty() {
-            return None;
-        }
-        let coordinates: Vec<_> = selectors
+    ) -> Option<Scalar> {
+        let base = i64::from(op == "get");
+        let coordinates = selectors
             .iter()
             .map(|&selector| {
                 let FixedValue::Int(index) = self.number(selector, param, depth + 1)? else {
@@ -668,48 +653,138 @@ impl Filter<'_, '_, '_> {
                 };
                 usize::try_from(index.checked_sub(base)?).ok()
             })
-            .collect::<Option<_>>()?;
-        if is_builtin(self.inf, c, "vector") {
-            let [index] = *coordinates.as_slice() else {
-                return None;
-            };
-            return c.args.get(index).copied();
-        }
-        if !is_builtin(self.inf, c, "array") {
-            return None;
-        }
-        let [values, sizes, order] = *c.args else {
-            return None;
-        };
-        let sizes = self.literal_sizes(sizes, depth + 1)?;
-        let order = self.literal_sizes(order, depth + 1)?;
-        if sizes.len() != coordinates.len() || sizes.len() != order.len() {
-            return None;
-        }
-        let expected = sizes
-            .iter()
-            .try_fold(1usize, |len, &size| len.checked_mul(size))?;
-        let mut used = HashSet::new();
-        let offset = order.into_iter().try_fold(0usize, |offset, axis| {
-            let axis = axis.checked_sub(1)?;
-            let size = *sizes.get(axis)?;
-            let coordinate = coordinates[axis];
-            if !used.insert(axis) || coordinate >= size {
-                return None;
+            .collect::<Option<Vec<_>>>()?;
+        self.cell(data, &coordinates, depth + 1)
+    }
+
+    // Read a single fixed cell to determine the length of a filtered sequence.
+    // Scalar broadcasts and singleton axes do not require materializing a mask.
+    fn cell(&self, node: NodeId, coordinates: &[usize], depth: u32) -> Option<Scalar> {
+        let node = self.container(node, depth)?;
+        if coordinates.is_empty() {
+            if let Node::Lit(value) = self.inf.module.node(node) {
+                return Some(value.clone());
             }
-            offset.checked_mul(size)?.checked_add(coordinate)
-        })?;
-        let values = self.container(values, depth + 1)?;
-        let Node::Call(values) = self.inf.module.node(values) else {
+            return match self.number(node, None, depth + 1)? {
+                FixedValue::Int(value) => Some(Scalar::Int(value)),
+                FixedValue::Real(value) => Some(Scalar::Real(value)),
+                FixedValue::Vec(_) => None,
+            };
+        }
+        let Type::Array { shape, elem } = self.inf.node_annotation(node).0 else {
             return None;
         };
-        if !is_builtin(self.inf, values, "vector")
-            || !values.named.is_empty()
-            || values.args.len() != expected
+        if coordinates.len() != shape.len()
+            || coordinates
+                .iter()
+                .zip(shape.iter())
+                .any(|(&index, dim)| !matches!(dim, Dim::Static(size) if index < *size as usize))
         {
             return None;
         }
-        values.args.get(offset).copied()
+        let Node::Call(call) = self.inf.module.node(node) else {
+            return None;
+        };
+        let CallHead::Builtin(head) = call.head else {
+            return None;
+        };
+        if !call.named.is_empty() {
+            return None;
+        }
+        let value = match (self.inf.module.resolve(head), call.args.as_ref()) {
+            ("vector", values) => {
+                let [index] = *coordinates else { return None };
+                self.cell(*values.get(index)?, &[], depth + 1)
+            }
+            ("array", [values, sizes, order]) => {
+                let sizes = self.literal_sizes(*sizes, depth + 1)?;
+                let order = self.literal_sizes(*order, depth + 1)?;
+                if sizes.len() != coordinates.len() || sizes.len() != order.len() {
+                    return None;
+                }
+                let mut used = HashSet::new();
+                let offset = order.into_iter().try_fold(0usize, |offset, axis| {
+                    let axis = axis.checked_sub(1)?;
+                    let size = *sizes.get(axis)?;
+                    let coordinate = coordinates[axis];
+                    if !used.insert(axis) || coordinate >= size {
+                        return None;
+                    }
+                    offset.checked_mul(size)?.checked_add(coordinate)
+                })?;
+                self.cell(*values, &[offset], depth + 1)
+            }
+            (op @ ("indicesof" | "indicesof0"), [_]) => {
+                let [index] = *coordinates else { return None };
+                let base = i64::from(op == "indicesof");
+                Some(Scalar::Int(i64::try_from(index).ok()?.checked_add(base)?))
+            }
+            ("addaxes", [value, leading, trailing]) => {
+                let count = |node| match self.number(node, None, depth + 1)? {
+                    FixedValue::Int(value) => usize::try_from(value).ok(),
+                    _ => None,
+                };
+                let leading = count(*leading)?;
+                let end = coordinates.len().checked_sub(count(*trailing)?)?;
+                self.cell(*value, coordinates.get(leading..end)?, depth + 1)
+            }
+            ("broadcast", [op, values @ ..]) => {
+                let Node::Const(op) = self.inf.module.node(*op) else {
+                    return None;
+                };
+                let values = values
+                    .iter()
+                    .map(|&value| self.broadcast_cell(value, coordinates, depth + 1))
+                    .collect::<Option<Vec<_>>>()?;
+                match (self.inf.module.resolve(*op), values.as_slice()) {
+                    ("ifelse", [Scalar::Bool(condition), yes, no]) => {
+                        Some(if *condition { yes } else { no }.clone())
+                    }
+                    ("land", [Scalar::Bool(lhs), Scalar::Bool(rhs)]) => {
+                        Some(Scalar::Bool(*lhs && *rhs))
+                    }
+                    ("lor", [Scalar::Bool(lhs), Scalar::Bool(rhs)]) => {
+                        Some(Scalar::Bool(*lhs || *rhs))
+                    }
+                    ("lnot", [Scalar::Bool(value)]) => Some(Scalar::Bool(!value)),
+                    (op, [lhs, rhs]) => fixed_comparison(
+                        op,
+                        &scalar_number(lhs.clone())?,
+                        &scalar_number(rhs.clone())?,
+                    )
+                    .map(Scalar::Bool),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }?;
+        // Array construction and ifelse join their scalar types before a cell
+        // is read. Mirror numeric promotion, including its rounding.
+        match (elem.as_ref(), value) {
+            (Type::Scalar(ScalarType::Real), Scalar::Int(value)) => {
+                Some(Scalar::Real(value as f64))
+            }
+            (Type::Scalar(ScalarType::Real), Scalar::Bool(value)) => {
+                Some(Scalar::Real(f64::from(u8::from(value))))
+            }
+            (Type::Scalar(ScalarType::Integer), Scalar::Bool(value)) => {
+                Some(Scalar::Int(i64::from(value)))
+            }
+            (_, value) => Some(value),
+        }
+    }
+
+    fn broadcast_cell(&self, node: NodeId, coordinates: &[usize], depth: u32) -> Option<Scalar> {
+        match self.inf.node_annotation(node).0 {
+            Type::Scalar(_) => self.cell(node, &[], depth + 1),
+            Type::Array { shape, .. } if shape.len() == coordinates.len() => {
+                let indices = shape.iter().zip(coordinates).map(|(dim, &index)| {
+                    if *dim == Dim::Static(1) { 0 } else { index }
+                });
+                self.cell(node, &indices.collect::<Vec<_>>(), depth + 1)
+            }
+            _ => None,
+        }
     }
 
     fn literal_sizes(&self, node: NodeId, depth: u32) -> Option<Vec<usize>> {
@@ -752,8 +827,10 @@ impl Filter<'_, '_, '_> {
         if depth > 64 || self.inf.is_substituted(body) {
             return None;
         }
-        let Node::Call(c) = self.inf.module.node(body) else {
-            return None;
+        let c = match self.inf.module.node(body) {
+            Node::Lit(Scalar::Bool(value)) => return Some(*value),
+            Node::Call(c) => c,
+            _ => return None,
         };
         let CallHead::Builtin(op) = c.head else {
             return None;
@@ -763,6 +840,14 @@ impl Filter<'_, '_, '_> {
         }
         let op = self.inf.module.resolve(op);
         match (op, c.args.as_ref()) {
+            (op @ ("get" | "get0"), [data, selectors @ ..]) => {
+                let Scalar::Bool(value) =
+                    self.indexed_cell(*data, selectors, op, Some(param), depth)?
+                else {
+                    return None;
+                };
+                Some(value)
+            }
             ("in", [a, set]) => {
                 let x = as_real(&self.number(*a, Some(param), depth + 1)?)?;
                 let (lo, hi) = self.interval(*set, depth + 1)?;
@@ -771,19 +856,7 @@ impl Filter<'_, '_, '_> {
             (cmp @ ("lt" | "le" | "gt" | "ge" | "equal" | "unequal"), [a, b]) => {
                 let lhs = self.number(*a, Some(param), depth + 1)?;
                 let rhs = self.number(*b, Some(param), depth + 1)?;
-                let order = match (&lhs, &rhs) {
-                    (FixedValue::Int(a), FixedValue::Int(b)) => Some(a.cmp(b)),
-                    _ if matches!(cmp, "equal" | "unequal") => return None,
-                    _ => as_real(&lhs)?.partial_cmp(&as_real(&rhs)?),
-                };
-                Some(match cmp {
-                    "lt" => order.is_some_and(|o| o.is_lt()),
-                    "le" => order.is_some_and(|o| o.is_le()),
-                    "gt" => order.is_some_and(|o| o.is_gt()),
-                    "ge" => order.is_some_and(|o| o.is_ge()),
-                    "equal" => order.is_some_and(|o| o.is_eq()),
-                    _ => !order.is_some_and(|o| o.is_eq()),
-                })
+                fixed_comparison(cmp, &lhs, &rhs)
             }
             ("land", [a, b]) => Some(
                 self.predicate(*a, param, depth + 1)? && self.predicate(*b, param, depth + 1)?,
@@ -795,6 +868,31 @@ impl Filter<'_, '_, '_> {
             _ => None,
         }
     }
+}
+
+fn scalar_number(value: Scalar) -> Option<FixedValue> {
+    match value {
+        Scalar::Int(value) => Some(FixedValue::Int(value)),
+        Scalar::Real(value) => Some(FixedValue::Real(value)),
+        _ => None,
+    }
+}
+
+fn fixed_comparison(op: &str, lhs: &FixedValue, rhs: &FixedValue) -> Option<bool> {
+    let order = match (lhs, rhs) {
+        (FixedValue::Int(a), FixedValue::Int(b)) => Some(a.cmp(b)),
+        _ if matches!(op, "equal" | "unequal") => return None,
+        _ => as_real(lhs)?.partial_cmp(&as_real(rhs)?),
+    };
+    Some(match op {
+        "lt" => order.is_some_and(|o| o.is_lt()),
+        "le" => order.is_some_and(|o| o.is_le()),
+        "gt" => order.is_some_and(|o| o.is_gt()),
+        "ge" => order.is_some_and(|o| o.is_ge()),
+        "equal" => order.is_some_and(|o| o.is_eq()),
+        "unequal" => !order.is_some_and(|o| o.is_eq()),
+        _ => return None,
+    })
 }
 
 fn as_real(value: &FixedValue) -> Option<f64> {

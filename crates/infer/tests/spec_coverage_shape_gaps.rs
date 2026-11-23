@@ -1393,3 +1393,24 @@ fn filter_over_a_promoted_alias_uses_runtime_contents() {
         "{out}"
     );
 }
+
+#[test]
+fn fixed_filter_counts_broadcast_mask_cells() {
+    let source = "days = indicesof(zeros(4))\n\
+        starts = [2, 1]\n\
+        ends = [3, 1]\n\
+        window = ifelse.(land.(addaxes(days, 0, 1) .>= addaxes(starts, 1, 0),\n\
+            addaxes(days, 0, 1) .<= addaxes(ends, 1, 0)), 1.0, 0.0)\n\
+        kept = filter(i -> window[mod(i - 1, 4) + 1, div(i - 1, 4) + 1] > 0.0,\n\
+            indicesof(zeros(4)))\n";
+    let fixed = ir(source);
+    assert!(
+        fixed.contains("(%bind kept (%meta ((%array 1 (2) (%scalar integer))"),
+        "{fixed}"
+    );
+    let runtime = ir(&format!("{source}\ninputs = ends\n"));
+    assert!(
+        runtime.contains("(%bind kept (%meta ((%array 1 (%dynamic) (%scalar integer))"),
+        "{runtime}"
+    );
+}
