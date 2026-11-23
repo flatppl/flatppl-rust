@@ -236,6 +236,10 @@ impl Template {
                 columns[slot] = values.bar;
                 crate::callbacks::pack_vectors(&mut emitter.module, &columns)
             }
+            ("ArrayPullback", [bar]) => {
+                let bar = self.emit(*bar, emitter, values)?;
+                tensor::array_pullback(emitter, bar, values.step)?
+            }
             ("Scatter", [bar, base]) => {
                 let bar = self.emit(*bar, emitter, values)?;
                 let (&primal, selectors) = values.step.args.split_first()?;

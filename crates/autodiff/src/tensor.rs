@@ -3,7 +3,7 @@
 use flatppl_core::graph::{build_call, fold_add};
 use flatppl_core::{Axis, Dim, Module, Node, NodeId, Scalar, ScalarType, Type};
 
-use crate::{Emitter, Error, REAL, real};
+use crate::{Emitter, Error, REAL, Step, callbacks, real};
 
 pub(super) fn real_shape(module: &Module, node: NodeId) -> Option<&[Dim]> {
     real_shape_of(module.type_of(node)?)
@@ -108,6 +108,67 @@ pub(super) fn zero_when_masked(
     let call = if pointwise { broadcast } else { build_call };
     let inactive = call(module, "iszero", &[bar]);
     call(module, "ifelse", &[inactive, zero, contribution])
+}
+
+/// Read the shaped cotangent in the original flat traversal order.
+pub(super) fn array_pullback(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    step: &Step<'_>,
+) -> Option<NodeId> {
+    let [data, _, order] = *step.args.as_slice() else {
+        return None;
+    };
+    let [Dim::Static(length)] = *real_shape(&emitter.module, data)? else {
+        return None;
+    };
+    let dimensions = real_shape(&emitter.module, step.node)?
+        .iter()
+        .map(|dim| match dim {
+            Dim::Static(size) if *size > 0 => Some(i64::from(*size)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let m = &mut emitter.module;
+    let mut strides = vec![0; dimensions.len()];
+    let mut stride = 1_i64;
+    for position in (0..dimensions.len()).rev() {
+        let position = int(m, position as i64);
+        let index = build_call(m, "get0", &[order, position]);
+        let axis = flatppl_infer::fixed_int_value(m, index)?.checked_sub(1)?;
+        let axis = usize::try_from(axis).ok()?;
+        let axis_stride = strides.get_mut(axis)?;
+        if *axis_stride != 0 {
+            return None;
+        }
+        *axis_stride = stride;
+        stride = stride.checked_mul(dimensions[axis])?;
+    }
+    if stride != i64::from(length) || dimensions.is_empty() {
+        return None;
+    }
+    if dimensions.len() == 1 {
+        return Some(bar);
+    }
+
+    let length = int(m, i64::from(length));
+    let shape = build_call(m, "zeros", &[length]);
+    let positions = build_call(m, "indicesof0", &[shape]);
+    let mut formals = Vec::new();
+    let position = callbacks::callback_input(m, "position", &mut formals);
+    let tensor = callbacks::callback_input(m, "cotangent", &mut formals);
+    let mut selectors = vec![tensor];
+    for (dimension, stride) in dimensions.into_iter().zip(strides) {
+        let stride = int(m, stride);
+        let dimension = int(m, dimension);
+        let index = build_call(m, "div", &[position, stride]);
+        selectors.push(build_call(m, "mod", &[index, dimension]));
+    }
+    let cell = build_call(m, "get0", &selectors);
+    let pick = callbacks::reify(m, cell, formals);
+    // A singleton collection supplies the same tensor to every index.
+    let held = build_call(m, "vector", &[bar]);
+    Some(build_call(m, "broadcast", &[pick, positions, held]))
 }
 
 pub(super) fn int(module: &mut Module, value: i64) -> NodeId {

@@ -370,3 +370,25 @@ outputs = score
     assert_inferred(&mut reparsed);
     flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
 }
+
+#[test]
+fn array_and_fill_derivatives_round_trip_with_permuted_axes() {
+    let module = lower(
+        "
+data = elementof(cartpow(reals, 12))
+offset = elementof(reals)
+last = 1 + 1
+order = [3, 1, last]
+weights = array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0], [2, 3, 2], [1, 2, 3])
+picked = array(data .+ fill(offset, 12), [2, 3, 2], order)
+inputs = (data, offset)
+outputs = sum(picked .* weights)
+",
+    );
+    for differentiate in [gradient, flatppl_autodiff::jvp, flatppl_autodiff::vjp] {
+        let derived = differentiate(&module, &["data", "offset"]).unwrap();
+        let mut parsed = flatppl_syntax::parse(&flatppl_syntax::print(&derived)).unwrap();
+        assert_inferred(&mut parsed);
+        flatppl_determinizer::is_flatpdl(&parsed).unwrap();
+    }
+}

@@ -1349,6 +1349,8 @@ fn structural(op: &str) -> bool {
             | "mean"
             | "logsumexp"
             | "vector"
+            | "array"
+            | "fill"
             | "cat"
             | "record"
             | "addaxes"

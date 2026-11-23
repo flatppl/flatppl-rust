@@ -1611,7 +1611,7 @@ fn broadcast_density(
     build_call(module, "broadcast", &arguments)
 }
 
-fn reify(module: &mut Module, body: NodeId, entries: Vec<(Symbol, Ref)>) -> NodeId {
+pub(super) fn reify(module: &mut Module, body: NodeId, entries: Vec<(Symbol, Ref)>) -> NodeId {
     let functionof = module.intern("functionof");
     module.alloc(Node::Call(Call {
         head: CallHead::Builtin(functionof),
@@ -1621,7 +1621,11 @@ fn reify(module: &mut Module, body: NodeId, entries: Vec<(Symbol, Ref)>) -> Node
     }))
 }
 
-fn callback_input(module: &mut Module, label: &str, entries: &mut Vec<(Symbol, Ref)>) -> NodeId {
+pub(super) fn callback_input(
+    module: &mut Module,
+    label: &str,
+    entries: &mut Vec<(Symbol, Ref)>,
+) -> NodeId {
     let target = Ref {
         ns: RefNs::Local,
         name: module.intern(&format!("_{label}_")),
