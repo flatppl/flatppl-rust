@@ -321,6 +321,7 @@ impl EmitOptions {
     pub fn lowering_options(&self) -> flatppl_determinizer::LoweringOptions<'static> {
         flatppl_determinizer::LoweringOptions {
             disable_sufficient_statistics: !self.sufficient_statistics,
+            share_normal_scale: matches!((self.dtype, self.target), (Dtype::F32, Target::Gpu)),
             numerical_integrals: self.integration.is_some(),
             compact_log_cdf_difference: self.target == Target::Cpu,
             ..LOWERING_OPTIONS
@@ -347,6 +348,7 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
     flatppl_determinizer::LoweringOptions {
         compact_log_cdf_difference: false,
         disable_sufficient_statistics: false,
+        share_normal_scale: false,
         preserve_rand_tuple: false,
         numerical_integrals: false,
         vector_sort: true,

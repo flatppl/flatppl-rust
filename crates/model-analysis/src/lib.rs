@@ -39,5 +39,5 @@ pub use sufficient_statistics::{
     ReductionDecision, ReductionOutcome, ReductionReport, plan_iid_normal,
     prepare_fixed_likelihood, prepare_fixed_likelihood_for_precision, prepare_likelihood,
     prepare_likelihood_with_options, prepare_likelihood_with_report, sufficient_statistics,
-    sufficient_statistics_with_report,
+    sufficient_statistics_for_target, sufficient_statistics_with_report,
 };

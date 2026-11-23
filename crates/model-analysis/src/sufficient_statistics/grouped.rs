@@ -1,5 +1,7 @@
 //! Fixed gather partitions reuse scalar-family reductions on occupied groups.
 
+mod common_normal;
+
 use std::collections::HashMap;
 
 use super::{
@@ -434,6 +436,11 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
             .filter(|(_, positions)| positions.len() == 1)
             .count(),
     };
+    if let Some(value) = common_normal::reduce(r, m, f, &parameters, &groups) {
+        r.count += groups.len();
+        r.rule = Some(("grouped Normal with common scale", Some(partition)));
+        return Some(value);
+    }
     r.fallback = "an occupied group fails the family support or numerical guard";
     // A later bucket can fail a family-specific numerical guard. Commit the
     // whole partition only after every occupied bucket has a valid reduction.
