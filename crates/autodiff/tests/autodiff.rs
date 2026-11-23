@@ -350,3 +350,23 @@ outputs = score
     );
     assert!(gradient(&module, &["rate"]).is_ok());
 }
+
+#[test]
+fn bernoulli_ad_accepts_a_broadcast_boolean_conversion() {
+    let module = lower(
+        "
+p = elementof(unitinterval)
+present = elementof(cartpow(booleans, 2))
+probabilities = addaxes(ifelse.(boolean.(present), p, 0.0), 0, 1) .+ zeros([2, 2])
+observed = rowstack([[1, 0], [0, 0]])
+score = logdensityof(Bernoulli.(probabilities), observed)
+inputs = (p, present)
+outputs = score
+",
+    );
+    let derivative = gradient(&module, &["p"]).unwrap();
+    let printed = flatppl_syntax::print(&derivative);
+    let mut reparsed = flatppl_syntax::parse(&printed).unwrap();
+    assert_inferred(&mut reparsed);
+    flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
+}
