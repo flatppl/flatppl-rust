@@ -229,7 +229,7 @@ pub(super) fn lift_broadcast(
     let operands = bind_call_args(module, &names, positional, &call.named, keyword_only)?;
     let mut scope = Scope::new(module, inputs);
     for ((_, reference), value) in entries.into_iter().zip(operands) {
-        let mapped = scope.framed_operand(value)?;
+        let mapped = scope.broadcast_operand(value)?;
         scope.bound.push((reference, mapped));
     }
     scope.depends(body, 0)?;
@@ -404,6 +404,20 @@ impl Scope<'_> {
         self.bound
             .iter()
             .find_map(|(target, value)| (*target == reference).then_some(value))
+    }
+
+    fn broadcast_operand(&mut self, value: NodeId) -> Option<Operand> {
+        // The determinizer wraps scalar likelihood parameters in [parameter]
+        // for iid scoring. Such a lane has the same cell at every frame index.
+        if let Some(root) = resolve_unpromoted(self.module, self.inputs, value)
+            && let Some(vector) = expect_builtin_call(self.module, root, "vector")
+            && vector.named.is_empty()
+            && let [cell] = *vector.args
+            && self.module.type_of(cell).is_some_and(scalar)
+        {
+            return Some(Operand::Scalar(Cell::scalar(cell)));
+        }
+        self.framed_operand(value)
     }
 
     fn framed_operand(&mut self, value: NodeId) -> Option<Operand> {
@@ -598,7 +612,7 @@ impl Scope<'_> {
                         None => self.expression(self.rhs(reference)?)?,
                     }
                 }
-                Node::Call(call) => self.call(call.clone())?,
+                Node::Call(call) => self.call(node, call.clone())?,
                 _ => return None,
             }
         };
@@ -638,7 +652,7 @@ impl Scope<'_> {
         Some(value)
     }
 
-    fn call(&mut self, call: Call) -> Option<Cell> {
+    fn call(&mut self, node: NodeId, call: Call) -> Option<Cell> {
         let CallHead::Builtin(op) = call.head else {
             return None;
         };
@@ -656,6 +670,13 @@ impl Scope<'_> {
             "in" => return self.membership(&call.args),
             "logsumexp" => return self.logsumexp(&call.args),
             "sum" => return self.sum(&call.args),
+            "polynomial" => return self.polynomial(&call.args),
+            "builtin_touniform"
+            | "%log_cdf_difference"
+            | flatppl_core::LOG_INTEGRAL
+            | flatppl_core::MASS_INTEGRAL => {
+                return self.invariant_cell(node);
+            }
             "broadcast" => {
                 let (&op, args) = call.args.split_first()?;
                 let Node::Const(op) = self.module.node(self.resolve_structure(op)) else {
@@ -682,6 +703,49 @@ impl Scope<'_> {
             .map(|&arg| self.expression(arg))
             .collect::<Option<_>>()?;
         self.pointwise_call(&name, cells)
+    }
+
+    fn polynomial(&mut self, args: &[NodeId]) -> Option<Cell> {
+        let [coefficients, point] = *args else {
+            return None;
+        };
+        let point = self.expression(point)?;
+        let coefficients = self.vector(coefficients)?.into_vector()?;
+        let (last, rest) = coefficients.split_last()?;
+        rest.iter()
+            .rev()
+            .try_fold(last.clone(), |acc, coefficient| {
+                let scaled = self.pointwise_call("mul", vec![acc, point.clone()])?;
+                self.pointwise_call("add", vec![scaled, coefficient.clone()])
+            })
+    }
+
+    fn invariant_cell(&mut self, node: NodeId) -> Option<Cell> {
+        let mut seen = HashSet::new();
+        let mut pending = vec![node];
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current) || !self.depends(current, 0)? {
+                continue;
+            }
+            if let Node::Ref(reference) = self.module.node(current) {
+                match self.target(*reference) {
+                    Some(Operand::Scalar(cell)) if cell.shape.is_empty() => (),
+                    Some(_) => return None,
+                    None => pending.push(self.rhs(*reference)?),
+                }
+            } else {
+                self.module
+                    .node(current)
+                    .for_each_child(|child| pending.push(child));
+            }
+        }
+        let value = self.instantiate(node)?;
+        flatppl_infer::annotate_rebuilt(self.module, value);
+        if !self.module.type_of(value).is_some_and(scalar) {
+            return None;
+        }
+        self.shared.insert(value);
+        Some(Cell::scalar(value))
     }
 
     fn pointwise_call(&mut self, name: &str, operands: Vec<Cell>) -> Option<Cell> {

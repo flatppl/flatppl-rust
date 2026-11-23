@@ -1,4 +1,4 @@
-use flatppl_autodiff::{determinize_query, gradient, jvp, vjp};
+use flatppl_autodiff::{determinize_query, determinize_query_with_options, gradient, jvp, vjp};
 use flatppl_core::Module;
 use flatppl_infer::{ModuleBundle, Severity};
 
@@ -24,6 +24,46 @@ fn check_transforms(source: &str, inputs: &[&str]) {
         infer(&mut reparsed);
         flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
     }
+}
+
+#[test]
+fn differentiates_iid_truncated_normal_with_scalar_captures() {
+    let source = "
+mu = elementof(reals)
+sigma = elementof(posreals)
+observations = [-1.5, 0.2, 1.8, 2.7]
+bounded = normalize(truncate(Normal(mu, sigma), interval(-2.0, 3.0)))
+likelihood = likelihoodof(iid(bounded, 4), observations)
+inputs = (mu, sigma)
+outputs = logdensityof(likelihood, record(mu = mu, sigma = sigma))
+";
+    check_transforms(source, &["mu", "sigma"]);
+
+    // The native CPU profile retains a distinct compact CDF-difference
+    // operation in the same otherwise unoptimised likelihood callback.
+    let mut surface = flatppl_syntax::parse(source).unwrap();
+    infer(&mut surface);
+    let options = flatppl_determinizer::LoweringOptions {
+        compact_log_cdf_difference: true,
+        ..Default::default()
+    };
+    let module = determinize_query_with_options(&surface, &ModuleBundle::new(), &options).unwrap();
+    assert!(gradient(&module, &["mu", "sigma"]).is_ok());
+}
+
+#[test]
+fn differentiates_broadcast_polynomial_with_captured_coefficients() {
+    check_transforms(
+        "
+a = elementof(reals)
+b = elementof(reals)
+points = elementof(cartpow(reals, 64))
+evaluate(x, a, b) = polynomial([1.0, a, b], x)
+inputs = (a, b, points)
+outputs = sum(evaluate.(points, [a], [b]))
+",
+        &["a", "b", "points"],
+    );
 }
 
 #[test]
