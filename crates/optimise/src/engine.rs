@@ -43,6 +43,7 @@ struct Catalogue {
     profile: Profile,
     measures: bool,
     predicates_and_reductions: bool,
+    fixed_poisson: bool,
 }
 
 impl Catalogue {
@@ -63,6 +64,9 @@ impl Catalogue {
             profile,
             measures,
             predicates_and_reductions,
+            fixed_poisson: facts
+                .iter()
+                .any(|fact| fact.name == "fixed-poisson-partition"),
         }
     }
 
@@ -72,15 +76,18 @@ impl Catalogue {
             Profile::Stan => 2,
             Profile::StableHlo { .. } => 4,
         };
-        first + usize::from(self.measures) + 2 * usize::from(self.predicates_and_reductions)
+        first
+            + usize::from(self.measures)
+            + 2 * usize::from(self.predicates_and_reductions)
+            + 8 * usize::from(self.fixed_poisson)
     }
 }
 
 thread_local! {
     // Egglog snapshots share their intern pools, so retire the template after
     // a bounded amount of input and derived data have passed through it.
-    static CATALOGUES: RefCell<[Option<(EGraph, usize)>; 8]> = const {
-        RefCell::new([const { None }; 8])
+    static CATALOGUES: RefCell<[Option<(EGraph, usize)>; 16]> = const {
+        RefCell::new([const { None }; 16])
     };
 }
 
@@ -137,7 +144,12 @@ fn build_catalogue(config: Catalogue) -> EGraph {
                 load("simplification", include_str!("rules/simplification.egg"));
                 schedule.push_str(" statistical simplification");
             }
-            schedule.push_str(")\n(unstable-combined-ruleset query-cpu query-gpu hoisting)");
+            schedule.push_str(")\n(unstable-combined-ruleset query-cpu query-gpu hoisting");
+            if config.fixed_poisson {
+                load("fixed_poisson", include_str!("rules/fixed_poisson.egg"));
+                schedule.push_str(" fixed-poisson");
+            }
+            schedule.push(')');
             load("stablehlo-schedule", &schedule);
         }
     }
@@ -307,6 +319,7 @@ fn has_candidates(terms: &[Term], facts: &[Fact], profile: Profile) -> bool {
             }
             ("exclusive-gather-source" | "composed-selector", _) if hlo => return true,
             ("commutable-negation", _) if cpu => return true,
+            ("fixed-poisson-partition", _) if cpu => return true,
             ("real-vector", [Expr(id), Int(0)]) => {
                 singleton_vectors.insert(*id);
                 empty_vectors.insert(*id);
@@ -773,6 +786,7 @@ struct CostModel {
     selectors: Vec<u64>,
     conjugate_measure: Vec<bool>,
     folded_cdf: Vec<bool>,
+    poisson_rows: Vec<u64>,
     element_bytes: u64,
 }
 
@@ -786,6 +800,7 @@ impl CostModel {
         let mut selectors = vec![0; classes.len()];
         let mut conjugate_measure = vec![false; classes.len()];
         let mut folded_cdf = vec![false; classes.len()];
+        let mut poisson_rows = vec![];
         if config.measures {
             state.constructor_enodes("gaussian-folded-cdf", |row| {
                 if let Some(&class) = classes.get(&row.children[0]) {
@@ -804,6 +819,7 @@ impl CostModel {
                 selectors,
                 conjugate_measure,
                 folded_cdf,
+                poisson_rows,
                 element_bytes: 0,
             });
         };
@@ -823,6 +839,17 @@ impl CostModel {
                 selectors[class] = selectors[class].max(width.max(0) as u64);
             }
         })?;
+        if config.fixed_poisson {
+            poisson_rows.resize(classes.len(), 0);
+            state.constructor_enodes("fixed-poisson-partition", |row| {
+                for (child, width) in [(0, 3), (2, 4)] {
+                    if let Some(&class) = classes.get(&row.children[child]) {
+                        let lanes = state.value_to_base::<i64>(row.children[width]).max(0) as u64;
+                        poisson_rows[class] = poisson_rows[class].max(lanes);
+                    }
+                }
+            })?;
+        }
         // The emitter uses the integer width corresponding to the real dtype
         // for selector constants and indexing.
         let element_bytes = match dtype {
@@ -834,6 +861,7 @@ impl CostModel {
             selectors,
             conjugate_measure,
             folded_cdf,
+            poisson_rows,
             element_bytes,
         })
     }
@@ -852,6 +880,11 @@ impl CostModel {
                     moving(self.elements[class], 2)
                 }
                 ("logsumexp" | "logsumexp.pair", [x]) => moving(self.elements[*x], 2),
+                ("sum" | "poisson.grouped-score", [.., plan]) if !self.poisson_rows.is_empty() => {
+                    // Account for both the opaque native lanes and the hidden
+                    // compact plan, including constants and reverse gathers.
+                    moving(self.poisson_rows[*plan], 6)
+                }
                 ("logdensityof" | "densityof", [measure, ..])
                     if self.conjugate_measure[*measure] =>
                 {

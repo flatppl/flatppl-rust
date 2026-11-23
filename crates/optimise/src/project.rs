@@ -1,9 +1,10 @@
 //! Project typed expressions, retaining the original arena identity of every boundary.
 
 use crate::engine::{self, Fact, FactArg, Term};
+use crate::fixed_poisson::Partition;
 use crate::selectors::{self, Selectors};
 use crate::types::{TypeFacts, dimensions, fact};
-use crate::{Dtype, Profile, conjugacy, gaussian};
+use crate::{Dtype, Profile, Target, conjugacy, gaussian};
 use flatppl_core::graph::{build_call, resolve_ref_one};
 use flatppl_core::query::{Component, component};
 use flatppl_core::{
@@ -218,7 +219,12 @@ fn storage(m: &Module, cuts: &Cuts, mut node: NodeId) -> Option<(NodeId, Vec<Com
     None
 }
 
-fn query_uses(m: &Module, cuts: &Cuts, roots: &[NodeId], origins: &[NodeId]) -> Option<Vec<usize>> {
+fn query_uses(
+    m: &Module,
+    cuts: &Cuts,
+    roots: &[NodeId],
+    origins: impl Iterator<Item = NodeId>,
+) -> Option<Vec<usize>> {
     let mut uses = HashMap::new();
     let mut seen = HashSet::new();
     let mut work: Vec<_> = roots.iter().map(|&id| (id, true)).collect();
@@ -253,8 +259,7 @@ fn query_uses(m: &Module, cuts: &Cuts, roots: &[NodeId], origins: &[NodeId]) -> 
         }
     }
     origins
-        .iter()
-        .map(|&node| {
+        .map(|node| {
             let mut key = storage(m, cuts, node)?;
             let mut count = 0;
             loop {
@@ -280,10 +285,12 @@ struct Project<'a> {
     types: TypeFacts,
     facts: Vec<Fact>,
     selectors: Selectors,
+    poisson: Vec<(usize, usize, Partition)>,
+    fixed_poisson: bool,
 }
 
 impl<'a> Project<'a> {
-    fn new(m: &'a Module, profile: Profile) -> Self {
+    fn new(m: &'a Module, profile: Profile, sufficient_statistics: bool) -> Self {
         Self {
             m,
             cuts: Cuts::new(m, profile),
@@ -296,6 +303,15 @@ impl<'a> Project<'a> {
             types: TypeFacts::default(),
             facts: vec![],
             selectors: Selectors::default(),
+            poisson: vec![],
+            fixed_poisson: sufficient_statistics
+                && matches!(
+                    profile,
+                    Profile::StableHlo {
+                        target: Target::Cpu,
+                        ..
+                    }
+                ),
         }
     }
 
@@ -609,6 +625,17 @@ impl<'a> Project<'a> {
             }
         }
         if allowed {
+            if self.fixed_poisson
+                && let Term::Call(head, children) = term
+                && head == "sum"
+                && let [cells] = children.as_slice()
+                && let Some(partition) = Partition::prove(m, id, |n| self.cuts.resolve(m, n))
+                && self.cuts.abi_input(m, partition.source)
+            {
+                let cells = *cells;
+                let source = self.project(partition.source, depth + 1)?;
+                self.poisson.push((cells, source, partition));
+            }
             // The matcher reads the original fields of one certified kernel.
             // It can inspect its written scale, but never a replaced value.
             conjugacy::seed(m, id, i, |n| self.cuts.follow(m, n, false), &mut self.facts);
@@ -661,6 +688,10 @@ impl<'a> Project<'a> {
             }
             let id = match term {
                 Term::Leaf(key) => {
+                    if *key < self.m.node_count() + self.poisson.len() {
+                        // The plan key is interpreted by its only consumer.
+                        continue;
+                    }
                     let rows = self.selectors.synthetic(*key)?;
                     let args: Vec<_> = rows
                         .iter()
@@ -671,6 +702,18 @@ impl<'a> Project<'a> {
                 Term::Boolean(b) => m.alloc(Node::Lit(Scalar::Bool(*b))),
                 Term::Integer(n) => m.alloc(Node::Lit(Scalar::Int(*n))),
                 Term::Real(bits) => m.alloc(Node::Lit(Scalar::Real(f64::from_bits(*bits as u64)))),
+                Term::Call(head, args) if head == "poisson.grouped-score" => {
+                    let [source, plan] = *args.as_slice() else {
+                        return None;
+                    };
+                    let source = resolve(source, &created)?;
+                    let Term::Leaf(key) = self.terms[plan] else {
+                        return None;
+                    };
+                    let (_, _, partition) =
+                        self.poisson.get(key.checked_sub(self.m.node_count())?)?;
+                    partition.rebuild(m, source)
+                }
                 Term::Call(head, args) => {
                     let args: Vec<_> = args
                         .iter()
@@ -717,11 +760,12 @@ pub(super) fn optimise(
     names: Option<&[Symbol]>,
     profile: Profile,
     bundle: &flatppl_infer::ModuleBundle,
+    sufficient_statistics: bool,
 ) -> Option<Module> {
     if !trigger(m, profile) {
         return None;
     }
-    let mut project = Project::new(m, profile);
+    let mut project = Project::new(m, profile, sufficient_statistics);
     let mut selected: HashSet<_> = names.into_iter().flatten().copied().collect();
     if names.is_some() && !project.hlo() {
         let mut work: Vec<_> = selected.iter().copied().collect();
@@ -761,17 +805,24 @@ pub(super) fn optimise(
         }
         _ => None,
     };
-    if !transposed_cells.is_empty() || vector_selectors.is_some() {
+    if !transposed_cells.is_empty() || vector_selectors.is_some() || !project.poisson.is_empty() {
+        let readers = project.origins.iter().copied().chain(
+            project
+                .poisson
+                .iter()
+                .flat_map(|(_, _, partition)| partition.readers),
+        );
         let counts = query_uses(
             m,
             &project.cuts,
             &bindings.iter().map(|&(_, id)| id).collect::<Vec<_>>(),
-            &project.origins,
+            readers,
         )?;
+        let (uses, poisson_uses) = counts.split_at(project.origins.len());
         for [cell, transposed, matrix] in transposed_cells {
             if [cell, transposed, matrix]
                 .into_iter()
-                .all(|id| counts[id] == 1)
+                .all(|id| uses[id] == 1)
             {
                 project.facts.push(fact(
                     "portable-exclusive-transposed-cell",
@@ -785,10 +836,20 @@ pub(super) fn optimise(
                 &mut project.selectors,
                 &mut project.terms,
                 &mut project.facts,
-                &counts,
-                m.node_count(),
+                uses,
+                m.node_count() + project.poisson.len(),
                 dtype,
             );
+        }
+        let (groups, _) = poisson_uses.as_chunks::<4>();
+        for (key, ((cells, source, partition), uses)) in
+            project.poisson.iter().zip(groups).enumerate()
+        {
+            if uses.iter().all(|&count| count == 1) {
+                project
+                    .facts
+                    .push(partition.fact(*cells, *source, m.node_count() + key));
+            }
         }
     }
     let winners = engine::optimise(&mut project.terms, &roots, &project.facts, profile)?;

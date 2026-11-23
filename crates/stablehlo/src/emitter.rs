@@ -4719,6 +4719,84 @@ impl<'m> Emitter<'m> {
         Ok(value)
     }
 
+    /// Lower a guarded compact likelihood without evaluating its inactive arm.
+    /// The ordinary `ifelse` continues to lower eagerly with `stablehlo.select`.
+    pub(crate) fn lower_likelihood_choice(
+        &mut self,
+        id: NodeId,
+        predicate: NodeId,
+        grouped: NodeId,
+        original: NodeId,
+    ) -> Option<Result<Value, EmitError>> {
+        if !self.m.is_guarded_likelihood(id) {
+            return None;
+        }
+        if !self.sufficient_statistics
+            || self.target != crate::Target::Cpu
+            || self.host_batch
+            || self.region_depth != 0
+            || !self.call_frame.is_empty()
+        {
+            return Some(self.lower_node(original));
+        }
+        Some(self.likelihood_case(predicate, grouped, original))
+    }
+
+    fn likelihood_case(
+        &mut self,
+        predicate: NodeId,
+        grouped: NodeId,
+        original: NodeId,
+    ) -> Result<Value, EmitError> {
+        let predicate = self.lower_node(predicate)?;
+        if predicate.ty != MlirTy::Scalar || predicate.elem != ElemKind::Bool {
+            return self.lower_node(original);
+        }
+
+        let capture = |id, next| {
+            let mut region = self.clone();
+            region.next = next;
+            region.region_depth += 1;
+            region.body.clear();
+            region.pure_ops.clear();
+            region.expanded.clear();
+            region.runtime_status = None;
+            region.runtime_unmapped_check = false;
+            let value = region.lower_node(id).ok()?;
+            // Both generated arms contain only checked fixed gathers and
+            // Poisson parameters proven by exp. Keep the native expression
+            // if another lowering policy records any region-local status.
+            if region.runtime_status.is_some()
+                || region.runtime_unmapped_check
+                || value.ty != MlirTy::Scalar
+                || value.elem != ElemKind::Real
+            {
+                return None;
+            }
+            let body = region.live_lines(&region.body, &[&value]).join("\n");
+            Some((body, value, region.next))
+        };
+        let Some((native_body, native, next)) = capture(original, self.next) else {
+            return self.lower_node(original);
+        };
+        let Some((compact_body, compact, next)) = capture(grouped, next) else {
+            return self.lower_node(original);
+        };
+        self.next = next;
+        let index = self.pure(format!(
+            "stablehlo.convert {} : (tensor<i1>) -> tensor<i32>",
+            predicate.ssa
+        ));
+        let ty = native.ty.render(self.dtype, native.elem);
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = \"stablehlo.case\"({index}) ({{\n{native_body}\n stablehlo.return {} : {ty}\n}}, \
+             {{\n{compact_body}\n stablehlo.return {} : {ty}\n}}) : (tensor<i32>) -> {ty}",
+            native.ssa, compact.ssa,
+        ));
+        Ok(Value { ssa, ..native })
+    }
+
     /// Lower `broadcast(f, rest...)` (§04 sec:broadcasting): apply the callable
     /// `f` (`args[0]`) elementwise over `rest`, scalars auto-broadcasting.
     ///

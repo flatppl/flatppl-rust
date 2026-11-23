@@ -3,6 +3,7 @@
 mod conjugacy;
 mod demand;
 mod engine;
+mod fixed_poisson;
 mod gaussian;
 mod ordered_scan;
 mod outputs;
@@ -48,6 +49,40 @@ pub fn optimise_with_bundle(
     profile: Profile,
     bundle: &flatppl_infer::ModuleBundle,
 ) -> Option<Module> {
+    optimise_query(module, roots, profile, bundle, true)
+}
+
+/// Apply the StableHLO rules with the emitter's likelihood-reduction setting.
+pub fn optimise_stablehlo(
+    module: &Module,
+    roots: Option<&[Symbol]>,
+    target: Target,
+    dtype: Dtype,
+    sufficient_statistics: bool,
+) -> Option<Module> {
+    optimise_query(
+        module,
+        roots,
+        Profile::StableHlo { target, dtype },
+        &flatppl_infer::ModuleBundle::new(),
+        sufficient_statistics,
+    )
+}
+
+fn optimise_query(
+    module: &Module,
+    roots: Option<&[Symbol]>,
+    profile: Profile,
+    bundle: &flatppl_infer::ModuleBundle,
+    sufficient_statistics: bool,
+) -> Option<Module> {
     let pruned = demand::prune(module, roots, profile, bundle);
-    project::optimise(pruned.as_ref().unwrap_or(module), roots, profile, bundle).or(pruned)
+    project::optimise(
+        pruned.as_ref().unwrap_or(module),
+        roots,
+        profile,
+        bundle,
+        sufficient_statistics,
+    )
+    .or(pruned)
 }

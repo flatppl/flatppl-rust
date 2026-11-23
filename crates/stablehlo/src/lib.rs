@@ -345,23 +345,25 @@ impl Default for EmitOptions {
 /// Optimise a validated query for the selected backend. The returned node is
 /// the updated `outputs` binding's RHS. Sampling retains its authored RNG walk.
 pub fn optimise_query(m: &Module, opts: &EmitOptions) -> Option<(Module, NodeId)> {
-    use flatppl_optimise::{Dtype as Precision, Profile, Target as Backend};
+    use flatppl_optimise::{Dtype as Precision, Target as Backend};
 
     let (outputs, binding) = m.bindings().find(|(_, b)| m.resolve(b.name) == "outputs")?;
     if modes::reaches_sample(m, binding.rhs) {
         return None;
     }
-    let profile = Profile::StableHlo {
-        target: match opts.target {
+    let mut optimised = flatppl_optimise::optimise_stablehlo(
+        m,
+        Some(&[binding.name]),
+        match opts.target {
             Target::Cpu => Backend::Cpu,
             Target::Gpu => Backend::Gpu,
         },
-        dtype: match opts.dtype {
+        match opts.dtype {
             Dtype::F32 => Precision::F32,
             Dtype::F64 => Precision::F64,
         },
-    };
-    let mut optimised = flatppl_optimise::optimise(m, Some(&[binding.name]), profile)?;
+        opts.sufficient_statistics,
+    )?;
     if flatppl_determinizer::has_alias_chains(&optimised) {
         flatppl_determinizer::resolve_alias_chains(&mut optimised);
     }

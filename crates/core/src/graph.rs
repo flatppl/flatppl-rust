@@ -225,6 +225,9 @@ pub fn rebuild_with_children(m: &mut Module, id: NodeId, new_children: &[NodeId]
     if m.is_sample_result(id) {
         m.mark_sample_result(rebuilt);
     }
+    if m.is_guarded_likelihood(id) {
+        m.mark_guarded_likelihood(rebuilt);
+    }
     m.inherit_sample_origin(id, rebuilt);
     rebuilt
 }

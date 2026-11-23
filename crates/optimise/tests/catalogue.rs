@@ -21,8 +21,10 @@ const STABLEHLO: &str = concat!(
     include_str!("../src/rules/sharing.egg"),
     "\n",
     include_str!("../src/rules/hoisting.egg"),
+    "\n",
+    include_str!("../src/rules/fixed_poisson.egg"),
     "\n(unstable-combined-ruleset query-gpu query-portable mathematical selector-facts sharing statistical simplification)\n",
-    "(unstable-combined-ruleset query-cpu query-gpu hoisting)\n",
+    "(unstable-combined-ruleset query-cpu query-gpu hoisting fixed-poisson)\n",
 );
 
 fn check_cases(graph: &EGraph, name: &str, program: &str, schedule: &str) {
@@ -76,6 +78,10 @@ fn stablehlo_catalogue() {
             include_str!("rules/simplification_cases.egg"),
         ),
         ("selection", include_str!("rules/selection_cases.egg")),
+        (
+            "fixed Poisson",
+            include_str!("rules/fixed_poisson_cases.egg"),
+        ),
     ] {
         check_cases(&graph, name, fixture, "query-cpu");
     }

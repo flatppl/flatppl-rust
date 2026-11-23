@@ -1922,6 +1922,9 @@ fn lower_sum(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
 
 fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [c, a, b] = args_exact(id, args)?;
+    if let Some(choice) = e.lower_likelihood_choice(id, c, a, b) {
+        return choice;
+    }
     let c = lower_predicate(e, c, "ifelse condition")?;
     // The two BRANCHES must share an orientation: selecting between a row and a
     // column is not defined, and neither the `broadcast_pair` below nor
