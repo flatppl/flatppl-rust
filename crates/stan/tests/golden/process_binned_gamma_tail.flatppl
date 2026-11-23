@@ -1,0 +1,7 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+rate = elementof(posreals)
+intensity = normalize(truncate(Gamma(1.0, rate), interval(1000, inf)))
+lp = logdensityof(BinnedPoissonProcess([1001, inf], intensity), [1])
+inputs = rate
+outputs = lp

@@ -9,6 +9,6 @@ model {
   if (min(y_obs) < 0) {
     target += negative_infinity();
   } else {
-    y_obs ~ exponential(rate) T[0, ];
+    y_obs ~ exponential(rate);
   }
 }

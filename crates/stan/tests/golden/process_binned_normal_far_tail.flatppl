@@ -1,0 +1,6 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+w = elementof(posreals)
+lp = logdensityof(BinnedPoissonProcess([39.0, 40.0], weighted(w, Normal(0.0, 1.0))), [1])
+inputs = w
+outputs = lp

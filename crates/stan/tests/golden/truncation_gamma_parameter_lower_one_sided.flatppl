@@ -1,0 +1,7 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+r = elementof(posreals)
+a = elementof(reals)
+lp = logdensityof(normalize(truncate(Gamma(2.0, r), interval(a, inf))), 1.5)
+inputs = (r, a)
+outputs = lp

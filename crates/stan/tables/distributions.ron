@@ -15,6 +15,8 @@
 //               "todo"        a Stan form exists but needs structural lowering, not one row: the
 //                             emitter refuses with not-yet. `note` states the planned form.
 //               "none"        no sensible Stan form: the emitter refuses for good.
+//               "structural"  lowered by its own emitter code, not by one template; `note` names the
+//                             module and the forms. Elsewhere the emitter refuses with not-yet.
 //   stan:       Stan family name, called as <stan>_<suffix>. "" when kind is "none".
 //   suffix:     "lpdf" or "lpmf" ("" when kind is "none").
 //   lhs:        template for the Stan variate expression. {y} is the FlatPPL variate.
@@ -56,8 +58,8 @@
     (id: "uniform_interval", flatppl: "Uniform", module: None, params: ["support"],
      pattern: "Uniform(interval(a, b))", vars: ["a", "b"], kind: "builtin",
      stan: "uniform", suffix: "lpdf", lhs: "{y}", args: "{a}, {b}", variate: "real",
-     sizes: [], vectorized: true, lcdf: true, normalized: true, guard: "", functions: "", status: "verified",
-     note: "Finite a < b only. cartpow(interval(a, b), n) maps to the vectorized call."),
+     sizes: [], vectorized: true, lcdf: true, normalized: true, guard: "", floor: "{a}", ceil: "{b}", functions: "", status: "verified",
+     note: "Finite a < b only. cartpow(interval(a, b), n) maps to the vectorized call. uniform_lcdf is -inf above b (Stan 2.39), so no CDF is evaluated outside [a, b]."),
     (id: "uniform_simplex", flatppl: "Uniform", module: None, params: ["support"],
      pattern: "Uniform(stdsimplex(n))", vars: ["n"], kind: "composition",
      stan: "dirichlet", suffix: "lpdf", lhs: "{y}", args: "rep_vector(1, {n})", variate: "simplex[{n}]",
@@ -66,7 +68,7 @@
     (id: "normal", flatppl: "Normal", module: None, params: ["mu", "sigma"],
      pattern: "Normal(mu, sigma)", vars: ["mu", "sigma"], kind: "builtin",
      stan: "normal", suffix: "lpdf", lhs: "{y}", args: "{mu}, {sigma}", variate: "real",
-     sizes: [], vectorized: true, lcdf: true, normalized: true, guard: "", tail: "mirror_lcdf", functions: "", status: "verified", note: ""),
+     sizes: [], vectorized: true, lcdf: true, normalized: true, guard: "", tail: "normal_lphi", functions: "", status: "verified", note: ""),
     (id: "generalized_normal", flatppl: "GeneralizedNormal", module: None, params: ["mean", "alpha", "beta"],
      pattern: "GeneralizedNormal(mean, alpha, beta)", vars: ["mean", "alpha", "beta"], kind: "custom_lpdf",
      stan: "flatppl_generalized_normal", suffix: "lpdf", lhs: "{y}", args: "{mean}, {alpha}, {beta}", variate: "real",
@@ -219,7 +221,7 @@ real flatppl_generalized_normal_lpdf(vector x, real mu, real alpha, real beta) {
     (id: "std_normal", flatppl: "Normal", module: None, params: ["mu", "sigma"],
      pattern: "Normal(0, 1)", vars: [], kind: "composition",
      stan: "std_normal", suffix: "lpdf", lhs: "{y}", args: "", variate: "real",
-     sizes: [], vectorized: true, lcdf: true, normalized: true, guard: "", functions: "", status: "verified", note: "Optional; normal(0, 1) is equivalent."),
+     sizes: [], vectorized: true, lcdf: true, normalized: true, guard: "", tail: "normal_lphi", functions: "", status: "verified", note: "Optional; normal(0, 1) is equivalent."),
     (id: "student_t_locscale", flatppl: "StudentT", module: None, params: ["nu"],
      pattern: "locscale(StudentT(nu), mu, sigma)", vars: ["nu", "mu", "sigma"], kind: "composition",
      stan: "student_t", suffix: "lpdf", lhs: "{y}", args: "{nu}, {mu}, {sigma}", variate: "real",
@@ -534,13 +536,13 @@ real flatppl_bifurcated_normal_lpdf(vector x, real mu, real sigmaL, real sigmaR)
 
     // ---------------------------------------------------------------- measure-algebra laws
     (id: "poisson_process", flatppl: "PoissonProcess", module: None, params: ["intensity"],
-     pattern: "PoissonProcess(intensity)", vars: [], kind: "todo",
+     pattern: "PoissonProcess(intensity)", vars: [], kind: "structural",
      stan: "", suffix: "", lhs: "", args: "", variate: "",
      sizes: [], vectorized: false, lcdf: false, normalized: true, guard: "", functions: "", status: "n/a",
-     note: "Phase 3: extended likelihood, target += sum(log(intensity(x))) - (integral of the intensity), when the integral is closed form."),
+     note: "emit/intensity.rs: target += -totalmass(intensity) + the sum of the intensity's log density over the observed events, with no k! term (spec §06: the variate is the set of points)."),
     (id: "binned_poisson_process", flatppl: "BinnedPoissonProcess", module: None, params: ["bins", "intensity"],
-     pattern: "BinnedPoissonProcess(bins, intensity)", vars: [], kind: "todo",
+     pattern: "BinnedPoissonProcess(bins, intensity)", vars: [], kind: "structural",
      stan: "", suffix: "", lhs: "", args: "", variate: "",
      sizes: [], vectorized: false, lcdf: false, normalized: true, guard: "", functions: "", status: "n/a",
-     note: "Phase 3: per-bin expected counts from the intensity, then counts ~ poisson(expected) (the poisson row)."),
+     note: "emit/intensity.rs: the log mass of the intensity on each bin (the row's lcdf, lccdf, interval helper or the normal log Phi), then counts ~ flatppl_binned_poisson_log(log masses), exact at zero mass."),
 ]
