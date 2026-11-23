@@ -522,7 +522,7 @@ fn fixed_groups_share_one_score_per_shape_in_ordinary_and_prepared_queries() {
 fn a_shared_record_retains_its_scalar_group_scores() {
     // The two moment scores share the same parameter record. The other two
     // groups have separate parameters and can still batch their singleton scores.
-    let source = "a=elementof(reals)\nb=elementof(reals)\nc=elementof(reals)\nloc=[a,a,b,c]\ng=[1,3,2,4,2,1,1]\ninputs=(a,b,c)\noutputs=logdensityof(Normal.(loc[g],1.0),[1.0,2.0,3.0,4.0,2.1,5.0,3.0])";
+    let source = "a=elementof(reals)\nb=elementof(reals)\nc=elementof(reals)\ns=elementof(posreals)\nt=elementof(posreals)\nu=elementof(posreals)\nloc=[a,a,b,c]\nscale=[s,s,t,u]\ng=[1,3,2,4,2,1,1]\ninputs=(a,b,c,s,t,u)\noutputs=logdensityof(Normal.(loc[g],scale[g]),[1.0,2.0,3.0,4.0,2.1,5.0,3.0])";
     let reduced = flatppl_syntax::print(&lower(source, true));
     assert_eq!(
         reduced.matches("builtin_logdensityof(").count(),
@@ -534,6 +534,65 @@ fn a_shared_record_retains_its_scalar_group_scores() {
         1,
         "{reduced}"
     );
+}
+
+#[test]
+fn grouped_normal_pools_occupied_means_only_for_proven_fixed_rows() {
+    use flatppl_determinizer::{
+        ReductionOutcome, ReductionReport, sufficient_statistics_with_report,
+    };
+
+    for (observed, pooled) in [
+        ("[1.0,2.0,3.0,4.0,5.0,6.0]", true),
+        ("[1e-38,2e-38,3e-38,4e-38,5e-38,6e-38]", false),
+        ("[1.0,2e+30,3.0,4.0,5.0,6.0]", false),
+    ] {
+        let source = format!(
+            "mu=elementof(cartpow(reals,5))\ns=elementof(posreals)\ng=[4,1,4,2,1,4]\ninputs=(mu,s)\noutputs=logdensityof(Normal.(mu[g],s),{observed})"
+        );
+        let raw = lower(&source, false);
+        let mut module = raw.clone();
+        let mut report = ReductionReport::default();
+        sufficient_statistics_with_report(&mut module, &mut report);
+        assert_eq!(report.decisions.iter().any(|decision| matches!(&decision.outcome,
+            ReductionOutcome::Reduced { rule: "grouped Normal with common scale", partition: Some(p) }
+            if (p.observations, p.groups, p.singletons) == (6, 3, 1)
+        )), pooled);
+        if pooled {
+            assert_eq!(prepare_unpacked(&raw, &[]).summaries.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn grouped_normal_reuses_summaries_for_the_same_record_fields() {
+    let source = "a=elementof(cartpow(reals,3))\nb=elementof(cartpow(reals,3))\ns=elementof(posreals)\nd=(g=[3,1,2,1,3],y=[0.4,1.0,1.3,2.0,0.3])\ninputs=(a,b,s)\noutputs=logdensityof(Normal.(a[d.g],s),d.y)+logdensityof(Normal.(b[d.g],s),d.y)";
+    assert_eq!(
+        prepare_unpacked(&lower(source, false), &[]).summaries.len(),
+        3
+    );
+}
+
+#[test]
+fn grouped_normal_limits_roundoff_depth_in_fixed_residual_energy() {
+    let groups = ["1", "2"]
+        .into_iter()
+        .cycle()
+        .take(257)
+        .collect::<Vec<_>>()
+        .join(",");
+    let observed = ["1.0", "1.1", "1.2"]
+        .into_iter()
+        .cycle()
+        .take(257)
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = format!(
+        "a=elementof(cartpow(reals,2))\ns=elementof(posreals)\ng=[{groups}]\ninputs=(a,s)\noutputs=logdensityof(Normal.(a[g],s),[{observed}])"
+    );
+    let prepared = prepare_unpacked(&lower(&source, false), &[]);
+    assert!(flatppl_syntax::print(&prepared.preparation).contains("splitblocks"));
+    assert!(!flatppl_syntax::print(&prepared.score).contains("splitblocks"));
 }
 
 #[test]
