@@ -12,11 +12,18 @@ use crate::IntegrationOptions;
 
 #[path = "integration/rectangle.rs"]
 mod rectangle;
+#[path = "integration/signed_pair.rs"]
+mod signed_pair;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IntegralKind {
     Log,
     Mass,
+    Signed {
+        score: NodeId,
+        /// Unnormalised log density and its scalar log normaliser.
+        log_weight: Option<(NodeId, NodeId)>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -96,6 +103,12 @@ impl Emitter<'_> {
             return Err(EmitError::at(
                 id,
                 "numerical integration requires a non-nested integral with one or two coordinates",
+            ));
+        }
+        if args.len() != 7 && matches!(kind, IntegralKind::Signed { .. }) {
+            return Err(EmitError::at(
+                id,
+                "signed quadrature requires two coordinates",
             ));
         }
         let inputs = self.integral_inputs(args);
@@ -949,7 +962,6 @@ impl Emitter<'_> {
     ) -> (Value, Value, Value) {
         let zero = self.scalar(0.0);
         let one = self.scalar(1.0);
-        let half = self.scalar(0.5);
         let inf = self.scalar(f64::INFINITY);
         let nonnegative = self.compare("GE", body, &zero);
         let finite = self.compare("LT", body, &inf);
@@ -960,12 +972,24 @@ impl Emitter<'_> {
         let scale = self.floor(&log);
         let neg_inf = self.scalar(f64::NEG_INFINITY);
         let log = self.select(&positive, &log, &neg_inf);
+        let mass = self.quadrature_linear_mass(body, &scale, None, [jacobian, log_radius, kronrod]);
+        (log, valid, mass)
+    }
+
+    fn quadrature_linear_mass(
+        &mut self,
+        body: &Value,
+        scale: &Value,
+        log_weight: Option<&Value>,
+        [jacobian, log_radius, kronrod]: [&Value; 3],
+    ) -> Value {
+        let half = self.scalar(0.5);
         // Replay a scaled linear quadrature sum so AD sees the raw
         // integrand, including at zero. The per-node discrete scale does
         // not couple a large weight at one node to another node's factor.
         // Dividing by a huge scale can lower to a subnormal reciprocal on
         // XLA. Two balanced multiplications keep both factors representable.
-        let half_scale = self.mul(&scale, &half);
+        let half_scale = self.mul(scale, &half);
         let half_scale = self.neg(&half_scale);
         let half_scale = self.exp(&half_scale);
         let normalized = self.mul(body, &half_scale);
@@ -974,13 +998,24 @@ impl Emitter<'_> {
         // intermediate normalized * width may overflow even if the
         // Kronrod-weighted term and final integral are finite.
         let log_kronrod = self.log(kronrod);
-        let factor = self.add(&scale, jacobian);
+        let factor = log_weight.map_or_else(|| scale.clone(), |weight| self.add(scale, weight));
+        let factor = self.add(&factor, jacobian);
         let factor = self.add(&factor, log_radius);
         let factor = self.add(&factor, &log_kronrod);
-        let factor = self.exp(&factor);
+        let mut factor = self.exp(&factor);
+        if log_weight.is_some() {
+            // A zero score has zero log mass, even when exponentiating
+            // its scale alone would overflow. Keep finite factors at zero
+            // so a later derivative can still see the raw score tangent.
+            let zero = self.scalar(0.0);
+            let infinity = self.scalar(f64::INFINITY);
+            let zero_score = self.compare("EQ", body, &zero);
+            let overflowing = self.compare("EQ", &factor, &infinity);
+            let inactive = self.and(&zero_score, &overflowing);
+            factor = self.select(&inactive, &zero, &factor);
+        }
         let weighted = self.mul(&normalized, &factor);
-        let mass = self.reduce_sum(&weighted);
-        (log, valid, mass)
+        self.reduce_sum(&weighted)
     }
 
     fn quadrature_constants(&mut self, xs: &[f64]) -> Value {

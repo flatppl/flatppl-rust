@@ -1720,6 +1720,11 @@ pub(crate) fn lower_bare_arith<'m>(
     let Ok([a, b]) = <[NodeId; 2]>::try_from(args) else {
         return binary(e, id, args, op);
     };
+    if head == "sub"
+        && let Some(result) = e.lower_signed_rectangle_difference(id, a, b)
+    {
+        return result;
+    }
     let (sa, sb) = (arith_shape(e, a), arith_shape(e, b));
     let shape = |n: NodeId| match e.type_of(n) {
         Some(t) => format!("{t:?}"),
