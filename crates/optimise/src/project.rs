@@ -1,6 +1,6 @@
 //! Project typed expressions, retaining the original arena identity of every boundary.
 
-use crate::engine::{self, Fact, Term};
+use crate::engine::{self, Fact, FactArg, Term};
 use crate::selectors::{self, Selectors};
 use crate::types::{TypeFacts, dimensions, fact};
 use crate::{Dtype, Profile, conjugacy, gaussian};
@@ -301,6 +301,52 @@ impl<'a> Project<'a> {
 
     fn hlo(&self) -> bool {
         matches!(self.profile, Profile::StableHlo { .. })
+    }
+
+    fn transposed_cells(&self) -> Vec<[usize; 3]> {
+        let m = self.m;
+        let mut sites = Vec::new();
+        for (cell, term) in self.terms.iter().enumerate() {
+            let Term::Call(head, args) = term else {
+                continue;
+            };
+            let [transposed, _, _] = args.as_slice() else {
+                continue;
+            };
+            let Term::Call(op, operands) = &self.terms[*transposed] else {
+                continue;
+            };
+            let [matrix] = operands.as_slice() else {
+                continue;
+            };
+            if !matches!(head.as_str(), "get" | "get0")
+                || !matches!(op.as_str(), "transpose" | "adjoint")
+            {
+                continue;
+            }
+            let Node::Call(original) = m.node(self.origins[cell]) else {
+                continue;
+            };
+            if !original.args[1..].iter().all(|&id| {
+                !self.cuts.blocked(m, id)
+                    && !m.is_sample_result(id)
+                    && matches!(m.node(id), Node::Lit(Scalar::Int(_)))
+            }) {
+                continue;
+            }
+            // A computed matrix may share an emitted SSA producer with
+            // another expression. Only count uses of identifiable storage.
+            let Some((source, _)) = storage(m, &self.cuts, self.origins[*matrix]) else {
+                continue;
+            };
+            if self.cuts.abi_input(m, source)
+                || matches!(m.node(source), Node::Call(call)
+                    if matches!(builtin(m, call), Some("external" | "elementof")))
+            {
+                sites.push([cell, *transposed, *matrix]);
+            }
+        }
+        sites
     }
 
     fn literal_rows(&self, id: NodeId) -> Option<Vec<i64>> {
@@ -703,27 +749,47 @@ pub(super) fn optimise(
         .iter()
         .map(|&id| project.project(id, 0))
         .collect::<Option<_>>()?;
-    if let Profile::StableHlo { dtype, .. } = profile
-        && !project.selectors.is_empty()
-        && project
-            .terms
-            .iter()
-            .any(|t| matches!(t,Term::Call(name,_) if name=="get"||name=="get0"))
-    {
+    let transposed_cells = project.transposed_cells();
+    let vector_selectors = match profile {
+        Profile::StableHlo { dtype, .. }
+            if !project.selectors.is_empty()
+                && project.terms.iter().any(
+                    |term| matches!(term,Term::Call(name,_) if name=="get" || name=="get0"),
+                ) =>
+        {
+            Some(dtype)
+        }
+        _ => None,
+    };
+    if !transposed_cells.is_empty() || vector_selectors.is_some() {
         let counts = query_uses(
             m,
             &project.cuts,
             &bindings.iter().map(|&(_, id)| id).collect::<Vec<_>>(),
             &project.origins,
         )?;
-        selectors::seed(
-            &mut project.selectors,
-            &mut project.terms,
-            &mut project.facts,
-            &counts,
-            m.node_count(),
-            dtype,
-        );
+        for [cell, transposed, matrix] in transposed_cells {
+            if [cell, transposed, matrix]
+                .into_iter()
+                .all(|id| counts[id] == 1)
+            {
+                project.facts.push(fact(
+                    "portable-exclusive-transposed-cell",
+                    cell,
+                    [FactArg::Expr(transposed), FactArg::Expr(matrix)],
+                ));
+            }
+        }
+        if let Some(dtype) = vector_selectors {
+            selectors::seed(
+                &mut project.selectors,
+                &mut project.terms,
+                &mut project.facts,
+                &counts,
+                m.node_count(),
+                dtype,
+            );
+        }
     }
     let winners = engine::optimise(&mut project.terms, &roots, &project.facts, profile)?;
     let mut out = m.clone();

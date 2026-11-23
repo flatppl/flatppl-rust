@@ -249,6 +249,7 @@ fn has_candidates(terms: &[Term], facts: &[Fact], profile: Profile) -> bool {
                 "conjugate-unit-predictive" | "conjugate-gamma-poisson" | "conjugate-normal-mean",
                 _,
             ) => return true,
+            ("portable-exclusive-transposed-cell", _) => return true,
             ("gaussian-fixed-cdf", [_, Int(mu), _, Int(x)])
                 if x == mu || f64::from_bits(*x as u64).is_infinite() =>
             {

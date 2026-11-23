@@ -59,6 +59,18 @@
 (relation portable-index-base (String i64))
 (portable-index-base "get" 1)
 (portable-index-base "get0" 0)
+
+; A scalar slice of a real transpose/adjoint reads the corresponding source
+; cell. Exclusivity is measured on the original query, including opaque uses.
+(relation portable-exclusive-transposed-cell (Expr Expr Expr))
+(rule ((portable-exclusive-transposed-cell e t a)
+       (= e (T op t (Integer i) (Integer j))) (portable-index-base op base)
+       (= t (U tr a)) (portable-transpose-head tr)
+       (real-matrix a rows cols) (real-matrix t cols rows) (real-value e)
+       (>= i base) (< i (+ cols base)) (<= i 2147483647)
+       (>= j base) (< j (+ rows base)) (<= j 2147483647))
+      ((union e (T op a (Integer j) (Integer i)))) :ruleset portable)
+
 (rule ((= e (B head rev (Integer k))) (portable-index-base head base)
        (portable-reverse rev x n) (real-value e)
        (<= n 2147483647) (>= k base) (< k (+ n base)))
