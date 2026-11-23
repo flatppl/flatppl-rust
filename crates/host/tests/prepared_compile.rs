@@ -1,4 +1,27 @@
-use flatppl_host::{BatchSpec, Context, Dtype, EmitOptions, Export, Schema};
+use flatppl_host::{BatchSpec, Context, Dtype, EmitOptions, Export, Schema, Target};
+
+#[test]
+fn shared_scale_guard_is_specific_to_gpu_binary32_in_both_exports()
+-> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "a=elementof(cartpow(reals,2))\ns=elementof(posreals)\ng=[1,2,1,2]\ninputs=(a,s)\noutputs=logdensityof(Normal.(a[g],s),[0.4,1.0,1.3,2.0])", None, None)?;
+    for target in [Target::Cpu, Target::Gpu] {
+        for dtype in [Dtype::F32, Dtype::F64] {
+            let options = EmitOptions {
+                dtype,
+                target,
+                ..Default::default()
+            };
+            for export in [query.compile(&options)?, query.compile_prepared(&options)?] {
+                assert_eq!(
+                    export.stablehlo.contains("stablehlo.compare GE,"),
+                    matches!((dtype, target), (Dtype::F32, Target::Gpu))
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
 fn summary_count(preparation: &Export) -> usize {
     match &preparation.output {

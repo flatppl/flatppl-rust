@@ -264,11 +264,11 @@ fn determinize_inner(
                     let _ = flatppl_infer::infer(&mut work);
                 }
                 if !options.disable_sufficient_statistics {
-                    if let Some(report) = report.as_deref_mut() {
-                        crate::sufficient_statistics_with_report(&mut work, report);
-                    } else {
-                        crate::sufficient_statistics(&mut work);
-                    }
+                    crate::sufficient_statistics_for_target(
+                        &mut work,
+                        options.share_normal_scale,
+                        report.as_deref_mut(),
+                    );
                 } else if let Some(report) = report.as_deref_mut() {
                     report.record_disabled(&work);
                 }

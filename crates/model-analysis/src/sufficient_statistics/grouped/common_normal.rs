@@ -44,6 +44,52 @@ fn sum_squares(values: Expr, mut length: usize) -> Expr {
     op("sum", [terms])
 }
 
+// The two quadratics share the scale adjoint before the reciprocal is
+// differentiated. Outside the normal arithmetic range keep direct quotients.
+fn f32_reciprocal(m: &mut Module, sigma: &Expr) -> (Expr, Expr) {
+    let range = 2.0_f64.powi(30);
+    let regular = shared(
+        m,
+        op(
+            "land",
+            [
+                op("ge", [sigma.clone(), num(1.0 / range)]),
+                op("le", [sigma.clone(), num(range)]),
+            ],
+        ),
+    );
+    let safe = op("ifelse", [regular.clone(), sigma.clone(), num(1.0)]);
+    (regular, shared(m, op("divide", [num(1.0), safe])))
+}
+
+fn standardize(
+    value: Expr,
+    sigma: &Expr,
+    reciprocal: Option<&(Expr, Expr)>,
+    apply: fn(&'static str, Vec<Expr>) -> Expr,
+) -> Expr {
+    let Some((regular, inverse)) = reciprocal else {
+        return apply("divide", vec![value, sigma.clone()]);
+    };
+    // With at most 2^24 rows, |x| <= 2^32 and sigma >= 2^-30 bound
+    // sum(n*x^2/sigma) by 2^118 and (x/sigma)^2 by 2^124 in binary32.
+    let magnitude = apply("abs", vec![value.clone()]);
+    let use_inverse = apply(
+        "land",
+        vec![
+            regular.clone(),
+            apply("le", vec![magnitude, num(2.0_f64.powi(32))]),
+        ],
+    );
+    let choose = |a, b| apply("ifelse", vec![use_inverse.clone(), a, b]);
+    let fast = apply(
+        "mul",
+        vec![choose(value.clone(), num(0.0)), inverse.clone()],
+    );
+    let direct = apply("divide", vec![choose(num(0.0), value), sigma.clone()]);
+    apply("add", vec![fast, direct])
+}
+
 pub(super) fn reduce(
     r: &mut Reducer,
     m: &mut Module,
@@ -201,8 +247,13 @@ pub(super) fn reduce(
         )
     };
     let sigma_value = Expr::Node(sigma);
+    let reciprocal = (r.policy == crate::sufficient_statistics::ReductionPolicy::SharedNormalScale)
+        .then(|| f32_reciprocal(m, &sigma_value));
     let delta = map("add", [map("sub", [centers, means.clone()]), corrections]);
-    let z = shared(m, map("divide", [delta, sigma_value.clone()]));
+    let z = shared(
+        m,
+        standardize(delta, &sigma_value, reciprocal.as_ref(), map),
+    );
     let count = vector(ordered.iter().map(|(_, rows)| num(rows.len() as f64)));
     let loss = map(
         "mul",
@@ -243,7 +294,13 @@ pub(super) fn reduce(
     );
     let z = shared(
         m,
-        op("divide", [op("divide", [scale, sigma_value]), num(divisor)]),
+        op(
+            "divide",
+            [
+                standardize(scale, &sigma_value, reciprocal.as_ref(), op),
+                num(divisor),
+            ],
+        ),
     );
     let within = op(
         "mul",

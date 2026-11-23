@@ -658,9 +658,16 @@ struct Reducer {
     fixed_proofs: RefCell<ProofCache>,
     report: Option<ReductionReport>,
     binding: String,
-    enabled: bool,
+    policy: ReductionPolicy,
     rule: Option<(&'static str, Option<GroupPartition>)>,
     fallback: &'static str,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReductionPolicy {
+    Disabled,
+    Portable,
+    SharedNormalScale,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -689,7 +696,7 @@ impl Reducer {
             fixed_proofs: RefCell::default(),
             report: None,
             binding: String::new(),
-            enabled: true,
+            policy: ReductionPolicy::Portable,
             rule: None,
             fallback: "",
         }
@@ -1482,9 +1489,11 @@ impl Reducer {
             .and_then(|_| report::family(m, id, &self.boundary));
         self.rule = None;
         self.fallback = "unsupported representation, support proof, or numerical range";
-        let reduced = self.enabled.then(|| self.reduce(m, id)).flatten();
+        let reduced = (self.policy != ReductionPolicy::Disabled)
+            .then(|| self.reduce(m, id))
+            .flatten();
         if let Some(family) = family {
-            let outcome = if !self.enabled {
+            let outcome = if self.policy == ReductionPolicy::Disabled {
                 ReductionOutcome::Disabled
             } else if reduced.is_some() {
                 let (rule, partition) = self.rule.take().expect("a committed reduction has a rule");
@@ -1541,10 +1550,12 @@ fn reduce(
     allowed: HashSet<Symbol>,
     precision: Option<RealPrecision>,
     report: Option<&mut ReductionReport>,
-    enabled: bool,
+    policy: ReductionPolicy,
 ) -> (usize, Vec<Symbol>) {
     let boundary = query::promoted_input_names(m);
-    let summaries: Vec<_> = summary_bindings(m).filter(|_| enabled).collect();
+    let summaries: Vec<_> = summary_bindings(m)
+        .filter(|_| policy != ReductionPolicy::Disabled)
+        .collect();
     let mut folded = false;
     for (name, rhs) in summaries {
         if let Some(value) = categorical::fold(m, rhs, &boundary) {
@@ -1554,7 +1565,7 @@ fn reduce(
         }
     }
     let mut reducer = Reducer::new(boundary, allowed, precision);
-    reducer.enabled = enabled;
+    reducer.policy = policy;
     reducer.report = report.as_ref().map(|_| ReductionReport::default());
     let bindings: Vec<_> = m
         .bindings()
@@ -1586,15 +1597,21 @@ fn reduce(
 /// expressions. This does not change the query ABI or cache mutable caller data.
 /// Returns the number of reduced factors. Unsupported factors remain unchanged.
 pub fn sufficient_statistics(m: &mut Module) -> usize {
-    sufficient_statistics_inner(m, None)
+    sufficient_statistics_for_target(m, false, None)
 }
 
 /// Append decisions from this pass without changing its output or ABI.
 pub fn sufficient_statistics_with_report(m: &mut Module, report: &mut ReductionReport) -> usize {
-    sufficient_statistics_inner(m, Some(report))
+    sufficient_statistics_for_target(m, false, Some(report))
 }
 
-fn sufficient_statistics_inner(m: &mut Module, report: Option<&mut ReductionReport>) -> usize {
+/// Add a shared reciprocal for regular grouped Normal scales on targets whose
+/// reverse reductions benefit from accumulating the two quadratic terms together.
+pub fn sufficient_statistics_for_target(
+    m: &mut Module,
+    share_normal_scale: bool,
+    report: Option<&mut ReductionReport>,
+) -> usize {
     let allowed = query::promoted_input_names(m)
         .into_iter()
         .filter(|name| {
@@ -1602,7 +1619,12 @@ fn sufficient_statistics_inner(m: &mut Module, report: Option<&mut ReductionRepo
                 .is_some_and(|bid| m.binding_phase(bid) == Some(flatppl_core::Phase::Fixed))
         })
         .collect();
-    reduce(m, allowed, None, report, true).0
+    let policy = if share_normal_scale {
+        ReductionPolicy::SharedNormalScale
+    } else {
+        ReductionPolicy::Portable
+    };
+    reduce(m, allowed, None, report, policy).0
 }
 
 /// Split a FlatPDL query into preparation and scoring without changing ordinary
@@ -1703,7 +1725,13 @@ fn try_prepare_likelihood(
         .into_iter()
         .flat_map(|name| score.alias_chain(name))
         .collect();
-    let (_, added) = reduce(&mut score, allowed.clone(), Some(precision), report, true);
+    let (_, added) = reduce(
+        &mut score,
+        allowed.clone(),
+        Some(precision),
+        report,
+        ReductionPolicy::Portable,
+    );
     let boundary = query::promoted_input_names(&score);
     let mut candidates = summary_bindings(&score).peekable();
     if candidates.peek().is_none() {

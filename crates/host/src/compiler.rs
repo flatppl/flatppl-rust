@@ -447,11 +447,11 @@ impl LoadedModule {
             )
         })?;
         if options.sufficient_statistics {
-            if let Some((report, _)) = report {
-                flatppl_determinizer::sufficient_statistics_with_report(&mut lowered, report);
-            } else {
-                flatppl_determinizer::sufficient_statistics(&mut lowered);
-            }
+            flatppl_determinizer::sufficient_statistics_for_target(
+                &mut lowered,
+                lowering.share_normal_scale,
+                report.map(|(reductions, _)| reductions),
+            );
         }
         Ok(lowered)
     }
