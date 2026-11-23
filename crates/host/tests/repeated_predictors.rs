@@ -1,4 +1,4 @@
-use flatppl_host::{Context, Dtype, EmitOptions};
+use flatppl_host::{BatchSpec, Context, Dtype, EmitOptions};
 
 #[test]
 fn repeated_predictors_prepare_without_runtime_observations()
@@ -54,6 +54,47 @@ fn promoted_predictor_columns_keep_their_runtime_values() -> Result<(), Box<dyn 
             })?
             .stablehlo
     );
+    Ok(())
+}
+
+#[test]
+fn prepared_binary_groups_keep_logits_across_host_batches() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut context = Context::default();
+    for (group, support) in [
+        ("Bernoulli.(p)", "booleans"),
+        ("Binomial.([5,5,5,5,5,5],p)", "nonnegintegers"),
+    ] {
+        let source = format!(
+            "a=elementof(reals)\nx=[-1.0,-1.0,0.0,0.0,1.0,1.0]\n\
+            p=invlogit.(a .+ x)\ny=external(cartpow({support},6))\n\
+            inputs=(a,y)\noutputs=logdensityof({group},y)"
+        );
+        let query = context.parse(&source, None, None)?;
+        let prepared = context.prepare_likelihood(&query, &["y".into()])?;
+        assert!(!prepared.summaries.is_empty());
+        let options = EmitOptions::default();
+        let scalar = prepared.score.compile(&options)?;
+        let axes = scalar
+            .inputs
+            .iter()
+            .map(|f| vec![(f.name == "a").then_some(0)])
+            .collect();
+        let batch = prepared.score.compile_batched(
+            &options,
+            &BatchSpec {
+                shape: vec![4],
+                input_axes: axes,
+            },
+        )?;
+        for export in [scalar, batch] {
+            assert!(
+                !export.stablehlo.contains("stablehlo.log "),
+                "{}",
+                export.stablehlo
+            );
+        }
+    }
     Ok(())
 }
 

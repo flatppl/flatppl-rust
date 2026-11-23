@@ -134,6 +134,85 @@ impl Pointwise {
 }
 
 impl Emitter<'_> {
+    /// Recover a logit through layout operations that only copy its probability.
+    /// Group summaries may select the exact stand-in probability 0.5 (logit 0).
+    pub(crate) fn invlogit_operand(&mut self, p: &Value) -> Option<Value> {
+        self.invlogit_view(p, &mut HashMap::new())
+    }
+
+    fn invlogit_view(
+        &mut self,
+        p: &Value,
+        seen: &mut HashMap<String, Option<Value>>,
+    ) -> Option<Value> {
+        if let Some(result) = seen.get(&p.ssa) {
+            return result.clone();
+        }
+        let op = self.pointwise.get(&p.ssa)?.op.clone();
+        if let Pointwise::Unary(op, z) = op {
+            return (op == "stablehlo.logistic").then(|| self.axes_view(&z, self.axes_of(p)));
+        }
+        seen.insert(p.ssa.clone(), None);
+        let logit = match op {
+            Pointwise::Reshape(input) => {
+                let z = self.invlogit_view(&input, seen)?;
+                self.reshape_axes(&z, p.ty.clone(), self.axes_of(p))
+            }
+            Pointwise::Broadcast(input, dims) if !shape(&p.ty).contains(&None) => {
+                let z = self.invlogit_view(&input, seen)?;
+                self.expand_axes(&z, &dims, p.ty.clone(), self.axes_of(p))
+            }
+            Pointwise::Slice(input, starts, limits, strides) => {
+                let z = self.invlogit_view(&input, seen)?;
+                self.slice(&z, &starts, &limits, &strides)
+            }
+            Pointwise::Transpose(input, perm) => {
+                let z = self.invlogit_view(&input, seen)?;
+                self.transpose(&z, &perm)
+            }
+            Pointwise::Concat(parts, axis) => {
+                let logits = parts
+                    .iter()
+                    .map(|v| self.invlogit_view(v, seen))
+                    .collect::<Option<Vec<_>>>()?;
+                self.concatenate_parts(logits, axis, p.ty.clone(), self.axes_of(p))
+            }
+            Pointwise::Gather(input, axis, indices) => {
+                let cell_axis = axis.checked_sub(self.batch_rank(&input))?;
+                let z = self.invlogit_view(&input, seen)?;
+                let ty = MlirTy::Ranked(vec![Some(indices.len() as u64)]);
+                let cells = indices
+                    .into_iter()
+                    .map(|i| i64::try_from(i).ok().map(Scalar::Int))
+                    .collect::<Option<Vec<_>>>()?;
+                let index = self.folded_constant(cells, ty, Axes::default())?;
+                self.gather_axis(&z, &index, 0, cell_axis)
+            }
+            Pointwise::Select(test, yes, no) => {
+                let half = |e: &Self, v: &Value| {
+                    matches!(
+                        e.constants.get(&v.ssa).map(AsRef::as_ref),
+                        Some([Scalar::Real(0.5)])
+                    )
+                };
+                let (a, b) = match (
+                    self.invlogit_view(&yes, seen),
+                    self.invlogit_view(&no, seen),
+                ) {
+                    (Some(a), Some(b)) => (a, b),
+                    (Some(a), None) if half(self, &no) => (a, self.constant_like(0.0, &no)),
+                    (None, Some(b)) if half(self, &yes) => (self.constant_like(0.0, &yes), b),
+                    _ => return None,
+                };
+                self.select(&test, &a, &b)
+            }
+            _ => return None,
+        };
+        let logit = self.axes_view(&logit, self.axes_of(p));
+        seen.insert(p.ssa.clone(), Some(logit.clone()));
+        Some(logit)
+    }
+
     pub(super) fn remember_pointwise(&mut self, ssa: &str, shape_source: &Value, op: Pointwise) {
         let elem = match &op {
             Pointwise::Compare(..) => ElemKind::Bool,
