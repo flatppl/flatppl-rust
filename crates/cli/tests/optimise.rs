@@ -111,3 +111,30 @@ fn mixed_integer_bounds_keep_the_original_input_and_stronger_comparison() {
         flatppl_syntax::print(&expected)
     );
 }
+
+#[test]
+fn integer_point_events_share_one_comparison_and_preserve_other_intervals() {
+    let scratch = common::Scratch::new("optimise-point-events");
+    let path = scratch.path("events.flatppl");
+    let prefix = "k = external(integers)\nx = external(reals)\ninputs = (k, x)\noutputs = ";
+    let source = "(land(4 <= k, k < 5), lor(9 < k, k < 9), lor(6 == k, k <= 5), land(k >= 6, k != 6), land(4 <= k, k <= 7), land(x >= 1.0, x <= 1.0))";
+    let expected =
+        "(k == 4, k != 9, k <= 6, k > 6, land(4 <= k, k <= 7), land(x >= 1.0, x <= 1.0))";
+    fs::write(&path, format!("{prefix}{source}\n")).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .arg("optimise")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let actual = flatppl_syntax::parse(std::str::from_utf8(&result.stdout).unwrap()).unwrap();
+    let expected = flatppl_syntax::parse(&format!("{prefix}{expected}\n")).unwrap();
+    assert_eq!(
+        flatppl_syntax::print(&actual),
+        flatppl_syntax::print(&expected)
+    );
+}

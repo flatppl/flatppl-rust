@@ -16,19 +16,19 @@
        (one-hot-rows row observations rows)
        (real-matrix matrix rows columns))
       ((project-rows selected matrix row observations rows columns))
-      :ruleset matrix-projection)
+      :ruleset matrix-projection :name "matrix-projection.project-rows")
 
 (rule ((multiply masked selected col)
        (project-rows selected matrix row observations rows columns)
        (one-hot-rows col observations columns))
       ((project-columns masked matrix row col observations rows columns))
-      :ruleset matrix-projection)
+      :ruleset matrix-projection :name "matrix-projection.project-right-columns")
 
 (rule ((multiply masked col selected)
        (project-rows selected matrix row observations rows columns)
        (one-hot-rows col observations columns))
       ((project-columns masked matrix row col observations rows columns))
-      :ruleset matrix-projection)
+      :ruleset matrix-projection :name "matrix-projection.project-left-columns")
 
 ; Compare the dense contraction with one finite check per input cell and
 ; a gather through the sibling sums for each output. The emitter supplies
@@ -43,4 +43,4 @@
        (>= (* (* observations rows) columns)
            (* 2 (+ (* 2 padded) (* observations (+ levels 1))))))
       ((paired-gather matrix row col))
-      :ruleset matrix-projection)
+      :ruleset matrix-projection :name "matrix-projection.paired-gather")

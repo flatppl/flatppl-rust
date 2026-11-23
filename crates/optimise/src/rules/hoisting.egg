@@ -12,7 +12,7 @@
       ((let subset (B head x selector))
        (real-vector subset k)
        (union late (U "neg" subset)))
-  :ruleset hoisting)
+  :ruleset hoisting :name "hoisting.negate-after-selection")
 
 (rule ((= early (U "neg" subset))
        (fixed-gather subset head x selector n k id)
@@ -22,4 +22,4 @@
        (real-vector full n)
        (union early (B head full selector))
        (real-vector early k))
-  :ruleset hoisting)
+  :ruleset hoisting :name "hoisting.negate-before-selection")

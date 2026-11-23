@@ -2,7 +2,7 @@
 
 use flatppl_core::{Idx, NodeId};
 
-use crate::engine::integer_plan_rows;
+use crate::{RulePolicy, engine::integer_plan_rows};
 
 pub enum MatrixProjectionFact {
     Product(NodeId, NodeId, NodeId),
@@ -24,6 +24,15 @@ pub struct MatrixProjection {
 pub fn plan_matrix_projection(
     output: NodeId,
     facts: &[MatrixProjectionFact],
+) -> Option<MatrixProjection> {
+    plan_matrix_projection_with_rules(output, facts, &RulePolicy::default())
+}
+
+/// Compose matrix selectors using the caller's egglog rules.
+pub fn plan_matrix_projection_with_rules(
+    output: NodeId,
+    facts: &[MatrixProjectionFact],
+    rules: &RulePolicy,
 ) -> Option<MatrixProjection> {
     let id = |id: NodeId| id.index() as i64;
     let mut facts = facts
@@ -58,6 +67,7 @@ pub fn plan_matrix_projection(
         "matrix-projection",
         &facts,
         "paired-gather",
+        rules,
     )?;
     let [plan] = plans.as_slice() else {
         return None;

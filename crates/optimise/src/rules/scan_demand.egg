@@ -8,7 +8,7 @@
 ; Terminal consumers need only the final row.
 (rule ((scan-use-summary scan 0 1 0 total))
       ((scan-output-plan scan 0))
-  :ruleset scan-demand)
+  :ruleset scan-demand :name "scan-demand.terminal-choice")
 
 ; A proper subset of field histories saves buffers. Keep the full value when
 ; a whole scan escapes or terminal and history readers share the same scan.
@@ -16,4 +16,4 @@
        (> fields 0)
        (< fields total))
       ((scan-output-plan scan 1))
-  :ruleset scan-demand)
+  :ruleset scan-demand :name "scan-demand.history-choice")

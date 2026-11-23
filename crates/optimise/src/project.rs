@@ -4,12 +4,12 @@ use crate::engine::{self, Fact, FactArg, Term};
 use crate::fixed_poisson::Partition;
 use crate::selectors::{self, Selectors};
 use crate::types::{TypeFacts, dimensions, fact};
-use crate::{Dtype, Profile, Target, conjugacy, gaussian};
+use crate::{Dtype, Profile, RulePolicy, Target, concat, conjugacy, gaussian};
 use flatppl_core::graph::{build_call, resolve_ref_one};
 use flatppl_core::query::{Component, component};
 use flatppl_core::{
-    Call, CallHead, DEFAULT_MAX_DEPTH, Dim, Idx, Inputs, Module, Node, NodeId, Phase, RefNs,
-    Scalar, Symbol, Type,
+    Call, CallHead, DEFAULT_MAX_DEPTH, Dim, Idx, Inputs, Mass, Module, Node, NodeId, Phase, RefNs,
+    Scalar, ScalarType, Symbol, Type,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -18,6 +18,28 @@ fn builtin<'a>(m: &'a Module, c: &Call) -> Option<&'a str> {
         CallHead::Builtin(s) => Some(m.resolve(s)),
         _ => None,
     }
+}
+
+/// Order the original interval endpoints only when both targets represent them exactly.
+fn interval_bound(terms: &[Term], id: usize) -> Option<i64> {
+    let (term, negative) = match &terms[id] {
+        Term::Call(head, args) if head == "neg" && args.len() == 1 => (&terms[args[0]], true),
+        term => (term, false),
+    };
+    let value = match *term {
+        Term::Integer(n) => f64::from(i32::try_from(n).ok()?),
+        Term::Real(bits) => f64::from_bits(bits as u64),
+        _ => return None,
+    };
+    if !value.is_finite() || f64::from(value as f32) != value {
+        return None;
+    }
+    let value = if negative { -value } else { value };
+    if value == 0.0 {
+        return Some(0);
+    }
+    let bits = value.to_bits() as i64;
+    Some(if bits < 0 { bits ^ i64::MAX } else { bits })
 }
 
 fn trigger(m: &Module, profile: Profile) -> bool {
@@ -29,9 +51,12 @@ fn trigger(m: &Module, profile: Profile) -> bool {
             Some(
                 "identity"
                 | "normalize"
+                | "truncate"
                 | "lengthof"
                 | "transpose"
                 | "adjoint"
+                | "rowstack"
+                | "colstack"
                 | "reverse"
                 | "ifelse"
                 | "land"
@@ -219,6 +244,16 @@ fn storage(m: &Module, cuts: &Cuts, mut node: NodeId) -> Option<(NodeId, Vec<Com
     None
 }
 
+// Two separately authored computations may share one emitted SSA value.
+// A query use count proves exclusive access only for identifiable storage.
+fn input_storage(m: &Module, cuts: &Cuts, node: NodeId) -> bool {
+    storage(m, cuts, node).is_some_and(|(source, _)| {
+        cuts.abi_input(m, source)
+            || matches!(m.node(source), Node::Call(call)
+            if matches!(builtin(m, call), Some("external" | "elementof")))
+    })
+}
+
 fn query_uses(
     m: &Module,
     cuts: &Cuts,
@@ -285,6 +320,7 @@ struct Project<'a> {
     types: TypeFacts,
     facts: Vec<Fact>,
     selectors: Selectors,
+    concats: Vec<(usize, concat::Witness, Vec<usize>)>,
     poisson: Vec<(usize, usize, Partition)>,
     fixed_poisson: bool,
 }
@@ -303,6 +339,7 @@ impl<'a> Project<'a> {
             types: TypeFacts::default(),
             facts: vec![],
             selectors: Selectors::default(),
+            concats: vec![],
             poisson: vec![],
             fixed_poisson: sufficient_statistics
                 && matches!(
@@ -350,15 +387,7 @@ impl<'a> Project<'a> {
             }) {
                 continue;
             }
-            // A computed matrix may share an emitted SSA producer with
-            // another expression. Only count uses of identifiable storage.
-            let Some((source, _)) = storage(m, &self.cuts, self.origins[*matrix]) else {
-                continue;
-            };
-            if self.cuts.abi_input(m, source)
-                || matches!(m.node(source), Node::Call(call)
-                    if matches!(builtin(m, call), Some("external" | "elementof")))
-            {
+            if input_storage(m, &self.cuts, self.origins[*matrix]) {
                 sites.push([cell, *transposed, *matrix]);
             }
         }
@@ -456,14 +485,14 @@ impl<'a> Project<'a> {
                         matches!(m.node(a), Node::Const(op)
                     if matches!(m.resolve(*op),"add"|"sub"|"mul"|"div"|"neg"))
                     }) => {}
-                "identity" | "normalize" | "densityof" | "logdensityof" | "totalmass"
-                | "lengthof" | "transpose" | "adjoint" | "reverse" | "get" | "get0" | "vector"
-                | "row_gram" | "col_gram" | "self_outer" | "diagmat" | "diag" | "sum" | "trace"
-                | "tile" | "splitblocks" | "joinblocks" | "addaxes" | "rowstack" | "colstack"
-                | "neg" | "add" | "sub" | "mul" | "div" | "pow" | "lnot" | "land" | "lor"
-                | "lxor" | "equal" | "unequal" | "lt" | "le" | "gt" | "ge" | "ifelse"
-                | "isfinite" | "isinf" | "isnan" | "iid" | "joint" | "cartprod" | "eye"
-                | "zeros" | "fill" => {}
+                "identity" | "normalize" | "truncate" | "interval" | "cat" | "densityof"
+                | "logdensityof" | "totalmass" | "lengthof" | "transpose" | "adjoint"
+                | "reverse" | "get" | "get0" | "vector" | "row_gram" | "col_gram"
+                | "self_outer" | "diagmat" | "diag" | "sum" | "trace" | "tile" | "splitblocks"
+                | "joinblocks" | "addaxes" | "rowstack" | "colstack" | "neg" | "add" | "sub"
+                | "mul" | "div" | "pow" | "lnot" | "land" | "lor" | "lxor" | "equal"
+                | "unequal" | "lt" | "le" | "gt" | "ge" | "ifelse" | "isfinite" | "isinf"
+                | "isnan" | "iid" | "joint" | "cartprod" | "eye" | "zeros" | "fill" => {}
                 _ => return None,
             }
             return Some(name.to_owned());
@@ -595,15 +624,21 @@ impl<'a> Project<'a> {
         }
         let term = &self.terms[i];
         let input = self.cuts.abi_input(m, id);
-        let integer = !self.hlo()
-            || input
+        let stored_integer = input
             || matches!(term, Term::Integer(_))
             || matches!(term, Term::Call(h,_) if h=="lengthof");
+        let integer = !self.hlo() || stored_integer;
         if (!stochastic || stan_matrix)
             && let Some(ty) = m.type_of(id)
         {
             self.types
                 .seed(&mut self.facts, ty, i, integer, self.profile);
+            if stored_integer
+                && !matches!(term, Term::Integer(_))
+                && *ty == Type::Scalar(ScalarType::Integer)
+            {
+                self.facts.push(fact("portable-stored-integer", i, []));
+            }
         }
         if !stochastic
             && self.hlo()
@@ -625,6 +660,26 @@ impl<'a> Project<'a> {
             }
         }
         if allowed {
+            if let Term::Call(head, args) = term {
+                match (head.as_str(), args.as_slice()) {
+                    ("interval", [low, high]) => {
+                        for &bound in [low, high] {
+                            if let Some(key) = interval_bound(&self.terms, bound) {
+                                self.facts
+                                    .push(fact("measure-bound", bound, [FactArg::Int(key)]));
+                            }
+                        }
+                    }
+                    ("truncate", [base, _])
+                        if matches!(m.type_of(self.origins[*base]),
+                        Some(Type::Measure { domain, mass }) if *mass != Mass::Deferred &&
+                            matches!(domain.as_ref(), Type::Scalar(ScalarType::Integer | ScalarType::Real))) =>
+                    {
+                        self.facts.push(fact("measure-scalar", *base, []));
+                    }
+                    _ => {}
+                }
+            }
             if self.fixed_poisson
                 && let Term::Call(head, children) = term
                 && head == "sum"
@@ -639,6 +694,38 @@ impl<'a> Project<'a> {
             // The matcher reads the original fields of one certified kernel.
             // It can inspect its written scale, but never a replaced value.
             conjugacy::seed(m, id, i, |n| self.cuts.follow(m, n, false), &mut self.facts);
+            // Portable output keeps authored bindings. Read their restrictions
+            // as evidence for score queries without replacing the measure name.
+            if !self.hlo()
+                && matches!(m.node(id), Node::Ref(r) if r.ns == RefNs::SelfMod)
+                && matches!(m.type_of(id), Some(Type::Measure { domain, .. })
+                    if matches!(domain.as_ref(), Type::Scalar(ScalarType::Integer | ScalarType::Real)))
+                && let Some(rhs) = self.cuts.resolve(m, id)
+                && let Node::Call(call) = m.node(rhs)
+                && matches!(builtin(m, call), Some("truncate" | "normalize"))
+            {
+                let value = self.project(rhs, depth + 1)?;
+                self.facts
+                    .push(fact("measure-alias", i, [FactArg::Expr(value)]));
+            }
+            if let Some(witness) = concat::witness(m, id, |n| self.cuts.resolve(m, n)) {
+                let args = witness
+                    .parts
+                    .iter()
+                    .map(|&n| self.project(n, depth + 1))
+                    .collect::<Option<Vec<_>>>()?;
+                self.concats.push((i, witness, args));
+            }
+            if let Some((head, vector)) =
+                concat::fixed_stack_vector(m, id, |n| self.cuts.resolve(m, n))
+            {
+                let source = self.project(vector, depth + 1)?;
+                self.facts.push(fact(
+                    "fixed-singleton-stack",
+                    i,
+                    [FactArg::Str(head), FactArg::Expr(source)],
+                ));
+            }
             if let Some(witness)=gaussian::witness(m,id) && let Node::Call(call)=m.node(id) &&
                 // A promoted record or kernel replaces the structure from which
                 // these fields were read. Individual fields still project as inputs.
@@ -761,8 +848,9 @@ pub(super) fn optimise(
     profile: Profile,
     bundle: &flatppl_infer::ModuleBundle,
     sufficient_statistics: bool,
+    rules: &RulePolicy,
 ) -> Option<Module> {
-    if !trigger(m, profile) {
+    if rules.is_all_disabled() || !trigger(m, profile) {
         return None;
     }
     let mut project = Project::new(m, profile, sufficient_statistics);
@@ -794,6 +882,7 @@ pub(super) fn optimise(
         .map(|&id| project.project(id, 0))
         .collect::<Option<_>>()?;
     let transposed_cells = project.transposed_cells();
+    let affine_transports = gaussian::partial_transports(&project.facts);
     let vector_selectors = match profile {
         Profile::StableHlo { dtype, .. }
             if !project.selectors.is_empty()
@@ -805,20 +894,49 @@ pub(super) fn optimise(
         }
         _ => None,
     };
-    if !transposed_cells.is_empty() || vector_selectors.is_some() || !project.poisson.is_empty() {
-        let readers = project.origins.iter().copied().chain(
-            project
-                .poisson
-                .iter()
-                .flat_map(|(_, _, partition)| partition.readers),
-        );
+    if !transposed_cells.is_empty()
+        || vector_selectors.is_some()
+        || !project.poisson.is_empty()
+        || !project.concats.is_empty()
+        || !affine_transports.is_empty()
+    {
+        let readers = project
+            .origins
+            .iter()
+            .copied()
+            .chain(project.concats.iter().map(|(_, w, _)| w.cat))
+            .chain(
+                project
+                    .poisson
+                    .iter()
+                    .flat_map(|(_, _, partition)| partition.readers),
+            );
         let counts = query_uses(
             m,
             &project.cuts,
             &bindings.iter().map(|&(_, id)| id).collect::<Vec<_>>(),
             readers,
         )?;
-        let (uses, poisson_uses) = counts.split_at(project.origins.len());
+        let (uses, other) = counts.split_at(project.origins.len());
+        let (cat_uses, poisson_uses) = other.split_at(project.concats.len());
+        for (site, point) in affine_transports {
+            if uses[point] == 1 && project.cuts.abi_input(m, project.origins[point]) {
+                gaussian::seed_exclusive_transport(&mut project.facts, site);
+            }
+        }
+        for ((read, witness, parts), &cat) in project.concats.iter().zip(cat_uses) {
+            let counts: Vec<_> = [uses[*read], cat]
+                .into_iter()
+                .chain(parts.iter().map(|&part| {
+                    if input_storage(m, &project.cuts, project.origins[part]) {
+                        uses[part]
+                    } else {
+                        0
+                    }
+                }))
+                .collect();
+            concat::seed(witness, *read, parts, &counts, &mut project.facts);
+        }
         for [cell, transposed, matrix] in transposed_cells {
             if [cell, transposed, matrix]
                 .into_iter()
@@ -852,7 +970,7 @@ pub(super) fn optimise(
             }
         }
     }
-    let winners = engine::optimise(&mut project.terms, &roots, &project.facts, profile)?;
+    let winners = engine::optimise(&mut project.terms, &roots, &project.facts, profile, rules)?;
     let mut out = m.clone();
     let chosen = project.rebuild(&mut out, &roots, &winners)?;
     outputs.write(&mut out, &chosen);

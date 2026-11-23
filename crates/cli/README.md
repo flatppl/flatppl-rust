@@ -35,3 +35,30 @@ Install from the repository:
 ```sh
 cargo install --git https://github.com/flatppl/flatppl-rust flatppl-cli --features hs3
 ```
+
+## Egglog rules for teaching output
+
+Use `flatppl egglog-rules` to list the names of rules and rulesets. The `optimise`,
+`determinize`, `stablehlo`, and `stan` commands accept a repeatable
+`--disable-egglog` option. Each occurrence takes `rule:<id>`, `ruleset:<id>`, or
+`all`. The list covers every stage. A selector affects only the stages that use
+the selected rules. The `stan` command requires the `stan` Cargo feature.
+
+For example, keep both negations in a lesson while simplifying other
+expressions, then render the result as Markdown.
+
+```sh
+cat > lesson.flatppl <<'EOF'
+detected = external(booleans)
+reading = external(reals)
+confirmed = lnot(lnot(detected))
+reported = identity(reading)
+EOF
+flatppl optimise lesson.flatppl --disable-egglog rule:portable.double-negation -o teaching.flatppl
+flatppl convert teaching.flatppl teaching.md
+```
+
+Use `flatppl convert lesson.flatppl teaching.md` to render the authored graph
+directly. `--disable-egglog all` suppresses every Egglog rule for the command.
+Ordinary compilation steps, including projection and mandatory target lowering,
+still run.

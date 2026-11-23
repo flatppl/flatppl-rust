@@ -18,6 +18,12 @@ impl Emitter<'_> {
             return Err(EmitError::at(id, "index into an empty axis"));
         }
         let upper = extent.saturating_sub(1).saturating_add(base as u64);
+        if self.scan_index_in_bounds(index, base, upper) {
+            // The lookup still contributes its status slot and error-code metadata.
+            let valid = self.bool_value_const(true);
+            self.record_runtime_error(&valid, 1);
+            return Ok(index.clone());
+        }
         if let Some(valid) = self.constant_indices_in_bounds(index, base, upper) {
             if !valid {
                 let order = if base == 1 { "1-based" } else { "0-based" };

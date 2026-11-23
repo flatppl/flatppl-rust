@@ -7,7 +7,8 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use egglog::sort::S;
 use egglog::{Core, EGraph, Error, FullState, RawValues, Read, Value, Write};
 
-use crate::{Dtype, Profile, Target};
+use crate::policy::load_program;
+use crate::{Dtype, Profile, RulePolicy, Target};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum Term {
@@ -51,9 +52,11 @@ impl Catalogue {
         // Measure rules require original constructor fields or scoped scoring
         // witnesses. The predicate/reduction rules introduce no new heads
         // reachable from the remaining catalogues.
-        let measures = facts
-            .iter()
-            .any(|fact| fact.name.starts_with("gaussian-") || fact.name.starts_with("conjugate-"));
+        let measures = facts.iter().any(|fact| {
+            fact.name.starts_with("gaussian-")
+                || fact.name.starts_with("conjugate-")
+                || fact.name.starts_with("measure-")
+        });
         let predicates_and_reductions = matches!(profile, Profile::StableHlo { .. })
             && terms.iter().any(|term| {
                 matches!(term, Term::Call(name, _) if matches!(name.as_str(),
@@ -91,14 +94,17 @@ thread_local! {
     };
 }
 
-fn catalogue(config: Catalogue, rows: usize) -> EGraph {
+fn catalogue(config: Catalogue, rows: usize, rules: &RulePolicy) -> EGraph {
+    if !rules.is_default() {
+        return build_catalogue(config, rules);
+    }
     CATALOGUES.with_borrow_mut(|catalogues| {
         let cached = &mut catalogues[config.index()];
         if cached
             .as_ref()
             .is_none_or(|(_, used)| used + rows > 4 * MAX_INPUT_ROWS)
         {
-            *cached = Some((build_catalogue(config), 0));
+            *cached = Some((build_catalogue(config, rules), 0));
         }
         let (template, used) = cached.as_mut().expect("initialized rule catalogue");
         *used += rows;
@@ -106,20 +112,22 @@ fn catalogue(config: Catalogue, rows: usize) -> EGraph {
     })
 }
 
-fn build_catalogue(config: Catalogue) -> EGraph {
+fn build_catalogue(config: Catalogue, rules: &RulePolicy) -> EGraph {
     let mut graph = EGraph::default().with_num_threads(1);
     let mut load = |name: &str, program: &str| {
-        graph
-            .parse_and_run_program(Some(format!("{name}.egg")), program)
+        load_program(&mut graph, format!("{name}.egg"), program, rules)
             .unwrap_or_else(|error| panic!("invalid embedded egglog catalogue {name}: {error}"));
     };
     load("schema", include_str!("rules/schema.egg"));
     load("portable", include_str!("rules/portable.egg"));
-    let mut portable = String::from("(unstable-combined-ruleset query-portable analysis portable");
+    load("concat", include_str!("rules/concat.egg"));
+    let mut portable =
+        String::from("(unstable-combined-ruleset query-portable analysis portable concat");
     if config.measures {
         load("gaussian", include_str!("rules/gaussian.egg"));
         load("conjugacy", include_str!("rules/conjugacy.egg"));
-        portable.push_str(" gaussian conjugacy");
+        load("measure_algebra", include_str!("rules/measure_algebra.egg"));
+        portable.push_str(" gaussian conjugacy measure-algebra");
     }
     portable.push(')');
     load("portable-schedule", &portable);
@@ -161,14 +169,18 @@ pub(super) fn optimise(
     roots: &[usize],
     facts: &[Fact],
     profile: Profile,
+    rules: &RulePolicy,
 ) -> Option<Vec<usize>> {
-    if roots.is_empty()
+    if rules.is_all_disabled()
+        || roots.is_empty()
         || terms.len() + facts.len() > MAX_INPUT_ROWS
         || !has_candidates(terms, facts, profile)
     {
         return None;
     }
-    optimise_query(terms, roots, facts, profile).ok().flatten()
+    optimise_query(terms, roots, facts, profile, rules)
+        .ok()
+        .flatten()
 }
 
 /// Run an emitter catalogue over bounded integer facts supplied by the
@@ -179,13 +191,13 @@ pub(super) fn integer_plan_rows(
     ruleset: &str,
     facts: &[(&str, &[i64])],
     result: &str,
+    rules: &RulePolicy,
 ) -> Option<Vec<Vec<i64>>> {
-    if facts.len() > MAX_INPUT_ROWS {
+    if !rules.enables_ruleset(ruleset) || facts.len() > MAX_INPUT_ROWS {
         return None;
     }
     let mut graph = EGraph::default().with_num_threads(1);
-    graph
-        .parse_and_run_program(Some(filename.to_owned()), program)
+    load_program(&mut graph, filename.to_owned(), program, rules)
         .unwrap_or_else(|error| panic!("invalid embedded emitter catalogue {filename}: {error}"));
     graph
         .update(|mut state| {
@@ -244,9 +256,10 @@ fn optimise_query(
     roots: &[usize],
     facts: &[Fact],
     profile: Profile,
+    policy: &RulePolicy,
 ) -> Result<Option<Vec<usize>>, Error> {
     let config = Catalogue::for_query(profile, terms, facts);
-    let mut graph = catalogue(config, terms.len() + facts.len());
+    let mut graph = catalogue(config, terms.len() + facts.len(), policy);
     graph.update(|mut state| {
         let mut values = Vec::with_capacity(terms.len());
         for term in terms.iter() {
@@ -276,11 +289,13 @@ fn optimise_query(
     };
     let mut matches = 0usize;
     let saturated = saturate(&mut graph, rules, &mut matches);
-    CATALOGUES.with_borrow_mut(|catalogues| {
-        if let Some((_, used)) = &mut catalogues[config.index()] {
-            *used = used.saturating_add(matches.min(MAX_MATCHES));
-        }
-    });
+    if policy.is_default() {
+        CATALOGUES.with_borrow_mut(|catalogues| {
+            if let Some((_, used)) = &mut catalogues[config.index()] {
+                *used = used.saturating_add(matches.min(MAX_MATCHES));
+            }
+        });
+    }
     if !saturated? {
         return Ok(None);
     }
@@ -307,11 +322,12 @@ fn has_candidates(terms: &[Term], facts: &[Fact], profile: Profile) -> bool {
     let mut discardable = HashSet::new();
     for fact in facts {
         match (fact.name, fact.args.as_slice()) {
-            (
-                "conjugate-unit-predictive" | "conjugate-gamma-poisson" | "conjugate-normal-mean",
-                _,
-            ) => return true,
-            ("portable-exclusive-transposed-cell", _) => return true,
+            (name, _) if name.starts_with("conjugate-") => return true,
+            (_, _) if crate::gaussian::has_candidate(fact, terms) => return true,
+            ("portable-exclusive-transposed-cell" | "concat-read" | "fixed-singleton-stack", _) => {
+                return true;
+            }
+            ("measure-alias", _) => return true,
             ("gaussian-fixed-cdf", [_, Int(mu), _, Int(x)])
                 if x == mu || f64::from_bits(*x as u64).is_infinite() =>
             {
@@ -364,7 +380,10 @@ fn has_candidates(terms: &[Term], facts: &[Fact], profile: Profile) -> bool {
         match (name.as_str(), args.as_slice()) {
             ("identity", [_]) => true,
             ("lengthof", [x]) => op(*x) == "vector" || discardable.contains(x),
-            ("logdensityof" | "densityof" | "totalmass", [m, ..]) => op(*m) == "normalize",
+            ("logdensityof" | "densityof" | "totalmass", [m, ..]) => {
+                op(*m) == "normalize" || matches!(&terms[*m], Term::Call(head, args)
+                    if head == "truncate" && args.first().is_some_and(|&base| op(base) == "truncate"))
+            }
             ("reverse", [x]) => op(*x) == "reverse" || singleton_vectors.contains(x),
             ("lnot", [x]) => op(*x) == "lnot" || boolean(*x),
             ("transpose" | "adjoint", [x]) => {
@@ -381,7 +400,7 @@ fn has_candidates(terms: &[Term], facts: &[Fact], profile: Profile) -> bool {
                     || (matches!(name.as_str(), "land" | "lor") && (
                         matches!(&terms[*x], Term::Call(op, args) if op == "lnot" && args == &[*y])
                         || matches!(&terms[*y], Term::Call(op, args) if op == "lnot" && args == &[*x])
-                        || (ordered(op(*x)) && ordered(op(*y)) && related_predicates(terms, *x, *y))
+                        || (comparison(op(*x)) && comparison(op(*y)) && related_predicates(terms, *x, *y))
                     ))
             }
             ("ifelse", [c, a, b]) => a == b || boolean(*c) || (boolean(*a) && boolean(*b)),
@@ -422,6 +441,10 @@ fn ordered(op: &str) -> bool {
     matches!(op, "lt" | "le" | "gt" | "ge")
 }
 
+fn comparison(op: &str) -> bool {
+    ordered(op) || matches!(op, "equal" | "unequal")
+}
+
 fn related_predicates(terms: &[Term], x: usize, y: usize) -> bool {
     let (Term::Call(left, a), Term::Call(right, b)) = (&terms[x], &terms[y]) else {
         return [&terms[x], &terms[y]].iter().any(|term| {
@@ -432,7 +455,6 @@ fn related_predicates(terms: &[Term], x: usize, y: usize) -> bool {
     if compound(left) || compound(right) {
         return true;
     }
-    let comparison = |op: &str| ordered(op) || matches!(op, "equal" | "unequal");
     let finiteness = |op: &str| matches!(op, "isfinite" | "isinf" | "isnan");
     let bound = |x: usize| matches!(terms[x], Term::Integer(_));
     match (a.as_slice(), b.as_slice()) {
@@ -440,8 +462,7 @@ fn related_predicates(terms: &[Term], x: usize, y: usize) -> bool {
         ([a, b], [c, d]) if comparison(left) && comparison(right) => {
             (a == c && b == d)
                 || (a == d && b == c)
-                || (ordered(left)
-                    && ordered(right)
+                || ((ordered(left) || ordered(right))
                     && ((a == c && bound(*b) && bound(*d))
                         || (a == d && bound(*b) && bound(*c))
                         || (b == c && bound(*a) && bound(*d))
@@ -784,8 +805,9 @@ fn children(term: &Term) -> &[usize] {
 struct CostModel {
     elements: Vec<u64>,
     selectors: Vec<u64>,
-    conjugate_measure: Vec<bool>,
-    folded_cdf: Vec<bool>,
+    measure_work: Vec<u64>,
+    folded_native: Vec<bool>,
+    removed_transports: HashSet<usize>,
     poisson_rows: Vec<u64>,
     element_bytes: u64,
 }
@@ -798,27 +820,37 @@ impl CostModel {
     ) -> Result<Self, Error> {
         let mut elements = vec![1; classes.len()];
         let mut selectors = vec![0; classes.len()];
-        let mut conjugate_measure = vec![false; classes.len()];
-        let mut folded_cdf = vec![false; classes.len()];
+        let mut measure_work = vec![0; classes.len()];
+        let mut folded_native = vec![false; classes.len()];
+        let mut removed_transports = HashSet::new();
         let mut poisson_rows = vec![];
         if config.measures {
-            state.constructor_enodes("gaussian-folded-cdf", |row| {
+            state.constructor_enodes("gaussian-folded-native", |row| {
                 if let Some(&class) = classes.get(&row.children[0]) {
-                    folded_cdf[class] = true;
+                    folded_native[class] = true;
                 }
             })?;
-            state.constructor_enodes("conjugate-original-measure", |row| {
-                if let Some(&class) = classes.get(&row.children[0]) {
-                    conjugate_measure[class] = true;
+            state.constructor_enodes("gaussian-removed-unit-transport", |row| {
+                if let Ok(site) = usize::try_from(state.value_to_base::<i64>(row.children[1])) {
+                    removed_transports.insert(site);
                 }
             })?;
+            for name in ["conjugate-original-measure", "measure-observation-work"] {
+                state.constructor_enodes(name, |row| {
+                    if let Some(&class) = classes.get(&row.children[0]) {
+                        let work = state.value_to_base::<i64>(row.children[1]).max(0) as u64;
+                        measure_work[class] = measure_work[class].max(work);
+                    }
+                })?;
+            }
         }
         let Profile::StableHlo { dtype, .. } = config.profile else {
             return Ok(Self {
                 elements,
                 selectors,
-                conjugate_measure,
-                folded_cdf,
+                measure_work,
+                folded_native,
+                removed_transports,
                 poisson_rows,
                 element_bytes: 0,
             });
@@ -859,8 +891,9 @@ impl CostModel {
         Ok(Self {
             elements,
             selectors,
-            conjugate_measure,
-            folded_cdf,
+            measure_work,
+            folded_native,
+            removed_transports,
             poisson_rows,
             element_bytes,
         })
@@ -885,16 +918,16 @@ impl CostModel {
                     // compact plan, including constants and reverse gathers.
                     moving(self.poisson_rows[*plan], 6)
                 }
-                ("logdensityof" | "densityof", [measure, ..])
-                    if self.conjugate_measure[*measure] =>
-                {
-                    // The projected measure hides the prior, kernel and chain.
-                    3
+                // A named measure can be shared while each observation still
+                // evaluates its marginal likelihood or restriction predicates.
+                ("logdensityof" | "densityof" | "totalmass", [measure, ..]) => {
+                    self.measure_work[*measure]
                 }
                 _ => 0,
             }
             .saturating_add(1),
-            Term::Leaf(_) if self.folded_cdf[class] => 1,
+            Term::Leaf(site) if self.removed_transports.contains(site) => 2,
+            Term::Leaf(_) if self.folded_native[class] => 1,
             _ => 0,
         };
         work.saturating_add(selector_bytes)
@@ -913,7 +946,8 @@ mod tests {
             name: "type-id",
             args: vec![FactArg::Expr(0)],
         };
-        assert!(optimise(&mut terms, &[1], &[invalid], Profile::Portable).is_none());
+        let rules = RulePolicy::default();
+        assert!(optimise(&mut terms, &[1], &[invalid], Profile::Portable, &rules).is_none());
         assert_eq!(terms, original);
     }
 

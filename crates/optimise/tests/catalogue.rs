@@ -5,10 +5,14 @@ const BASE: &str = concat!(
     "\n",
     include_str!("../src/rules/portable.egg"),
     "\n",
+    include_str!("../src/rules/concat.egg"),
+    "\n",
     include_str!("../src/rules/gaussian.egg"),
     "\n",
     include_str!("../src/rules/conjugacy.egg"),
-    "\n(unstable-combined-ruleset query-portable analysis portable gaussian conjugacy)\n",
+    "\n",
+    include_str!("../src/rules/measure_algebra.egg"),
+    "\n(unstable-combined-ruleset query-portable analysis portable concat gaussian conjugacy measure-algebra)\n",
 );
 
 const STABLEHLO: &str = concat!(
@@ -58,6 +62,7 @@ fn portable_catalogue() {
     graph.parse_and_run_program(None, BASE).unwrap();
     for (name, fixture) in [
         ("portable", include_str!("rules/portable_cases.egg")),
+        ("concat", include_str!("rules/concat_cases.egg")),
         ("gaussian", include_str!("rules/gaussian_cases.egg")),
         ("conjugacy", include_str!("rules/conjugacy_cases.egg")),
     ] {

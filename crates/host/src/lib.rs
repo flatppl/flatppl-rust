@@ -35,7 +35,9 @@ pub use flatppl_determinizer::{
 };
 pub use flatppl_formula;
 pub use flatppl_hs3::{Auxiliary, Observations, PyhfOptions};
-pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions, Target};
+pub use flatppl_stablehlo::{
+    BatchSpec, Dtype, EmitOptions, IntegrationOptions, RulePolicy, RuleSelector, Target,
+};
 pub use formula::{FormulaModel, FormulaTableSource, PreparedFormulaPrediction};
 pub use incremental::{IncrementalScoreQueries, IncrementalTermQuery, ScoreRevisions, ScoreTicket};
 pub use inspect::{BindingKind, Bound, Domain, DomainField, InputInfo};

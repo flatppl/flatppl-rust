@@ -1,6 +1,6 @@
 //! Evidence for closed conjugate predictive density queries.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use flatppl_core::graph::expect_builtin_call;
 use flatppl_core::{
@@ -67,16 +67,18 @@ fn positive_normal(value: f64) -> Option<f64> {
     (value >= f64::from(f32::MIN_POSITIVE)).then_some(value)
 }
 
-fn binary_point(
+fn supported_outcomes(
     m: &Module,
     point: NodeId,
+    trials: i64,
     resolve: &impl Fn(NodeId) -> Option<NodeId>,
-) -> Option<()> {
+) -> Option<BTreeSet<i64>> {
     // The generic beta-binomial log-gamma expression can have poles beyond
-    // its support. Prove binary outcomes without trusting a runtime input's
+    // its support. Prove each outcome without trusting a runtime input's
     // nominal value set or erasing its authored condition.
     let mut pending = vec![point];
     let mut seen = HashSet::new();
+    let mut outcomes = BTreeSet::new();
     while let Some(id) = pending.pop() {
         let id = resolve(id)?;
         if !seen.insert(id) {
@@ -85,7 +87,11 @@ fn binary_point(
         if seen.len() > 32 || m.is_sample_result(id) || m.sample_origin(id).is_some() {
             return None;
         }
-        if matches!(m.node(id), Node::Lit(Scalar::Int(0 | 1))) {
+        if let Node::Lit(Scalar::Int(value)) = m.node(id) {
+            if !(0..=trials).contains(value) {
+                return None;
+            }
+            outcomes.insert(*value);
             continue;
         }
         let &[condition, yes, no] = positional(m, id, "ifelse")? else {
@@ -98,19 +104,65 @@ fn binary_point(
         }
         pending.extend([yes, no]);
     }
-    Some(())
+    (!outcomes.is_empty()).then_some(outcomes)
 }
 
-fn well_conditioned_binomial(a: f64, b: f64, p: f64) -> bool {
-    // The fallback subtracts two log-beta values, each built from three
-    // log-gammas. Keep their f32 magnitudes modest and reserve several
-    // rounding units before either atom's log probability can round to zero.
+fn binomial_rounding_margin(a: f64, b: f64, trials: i64) -> Option<f64> {
+    // The binomial coefficient and two log-beta terms are differences of
+    // log-gammas. Keep their f32 magnitudes modest and reserve rounding
+    // margin before an atom's log probability can round to zero.
     // For x >= 2, x * ln(x) bounds log-gamma. For x < 1, the recurrence
     // bounds it by -ln(x). The absolute value stays below 1 on [1, 2].
-    let largest = a + b + 1.0;
+    let trials = trials as f64;
+    let largest = (a + b + trials).max(trials + 1.0);
     let magnitude = (largest * largest.ln()).max(-a.min(b).ln()).max(1.0);
-    let rounding_margin = 8.0 * f64::from(f32::EPSILON) * magnitude;
-    magnitude <= 128.0 && p.min(1.0 - p) > rounding_margin
+    (magnitude <= 128.0).then_some(8.0 * f64::from(f32::EPSILON) * magnitude)
+}
+
+fn beta_binomial_masses(
+    m: &Module,
+    point: NodeId,
+    trials: i64,
+    a: f64,
+    b: f64,
+    resolve: &impl Fn(NodeId) -> Option<NodeId>,
+) -> Option<FactArg> {
+    let margin = binomial_rounding_margin(a, b, trials)?;
+    let outcomes = supported_outcomes(m, point, trials, resolve)?;
+    // Each additional outcome contributes one test and one select. A lone
+    // atom may replace a literal, while an authored conditional must still run.
+    if outcomes.len() > 8
+        || (outcomes.len() == 1 && !matches!(m.node(resolve(point)?), Node::Lit(Scalar::Int(_))))
+    {
+        return None;
+    }
+    // P(0) = (b)_n / (a + b)_n. Each successive mass follows from
+    // P(k+1) / P(k) = (n-k)(a+k) / ((k+1)(b+n-k-1)).
+    let mut mass = (0..trials)
+        .map(|i| (b + i as f64) / (a + b + i as f64))
+        .product::<f64>();
+    let mut selected = Vec::with_capacity(outcomes.len());
+    let last = *outcomes.last()?;
+    for k in 0..=last {
+        if outcomes.contains(&k) {
+            let log_mass = mass.ln();
+            if !mass.is_finite() || mass < f64::from(f32::MIN_POSITIVE) || log_mass >= -margin {
+                return None;
+            }
+            selected.push((k, (-log_mass).to_bits() as i64));
+        }
+        if k == last {
+            break;
+        }
+        mass *= ((trials - k) as f64 * (a + k as f64))
+            / ((k + 1) as f64 * (b + (trials - k - 1) as f64));
+    }
+    use FactArg::{Call, Int};
+    let (last, preceding) = selected.split_last()?;
+    let tail = Call("ConjugateLastMass", vec![Int(last.1)]);
+    Some(preceding.iter().rev().fold(tail, |tail, &(k, log)| {
+        Call("ConjugateMass", vec![Int(k), Int(log), tail])
+    }))
 }
 
 fn predictive_scale(prior: f64, noise: f64) -> Option<f64> {
@@ -127,6 +179,82 @@ fn predictive_scale(prior: f64, noise: f64) -> Option<f64> {
     }
     let scale = total.sqrt();
     (scale as f32 == (total as f32).sqrt()).then_some(scale)
+}
+
+fn laplace_scale(rate: f64) -> Option<f64> {
+    let twice = 2.0 * rate;
+    let narrow = twice as f32;
+    let scale = twice.sqrt().recip();
+    (narrow.is_normal() && f64::from(narrow) == twice && scale as f32 == narrow.sqrt().recip())
+        .then_some(scale)
+}
+
+fn student_parameters(shape: f64, beta: f64) -> Option<(f64, f64, f64)> {
+    let nu = 2.0 * shape;
+    let ratio = beta / shape;
+    let scale = ratio.sqrt();
+    let narrow = (beta as f32) / (shape as f32);
+    // The normalizer has a finite recurrence for integer degrees of freedom.
+    // Bound its work and preserve the original standardized point in f32.
+    let degrees = nu as i64;
+    if nu != degrees as f64
+        || !(1..=64).contains(&degrees)
+        || !narrow.is_normal()
+        || scale as f32 != narrow.sqrt()
+    {
+        return None;
+    }
+    // B(1/2, 1/2) = pi, B(1, 1/2) = 2 and B(x+1, 1/2) = B(x, 1/2)*x/(x+1/2).
+    let (first, base) = if degrees % 2 == 0 {
+        (1.0, 2.0)
+    } else {
+        (0.5, std::f64::consts::PI)
+    };
+    let log_beta = (0..(degrees - 1) / 2).fold(base.ln(), |sum, step| {
+        let x = first + step as f64;
+        sum + (x / (x + 0.5)).ln()
+    });
+    let norm = scale.ln() + nu.sqrt().ln() + log_beta;
+    Some((nu, scale, norm))
+}
+
+fn variance_predictive(
+    m: &Module,
+    term: usize,
+    prior: NodeId,
+    location: NodeId,
+    resolve: &impl Fn(NodeId) -> Option<NodeId>,
+) -> Option<Fact> {
+    use FactArg::{Expr, Int};
+    let location = fixed_real(m, location, resolve)?.to_bits() as i64;
+    if let Some(exponential) = expect_builtin_call(m, prior, "Exponential") {
+        let [rate] = parameters(m, exponential, ["rate"])?;
+        let rate = positive_normal(fixed_real(m, rate, resolve)?)?;
+        return Some(Fact {
+            name: "conjugate-exponential-variance",
+            args: vec![
+                Expr(term),
+                Int(location),
+                Int(laplace_scale(rate)?.to_bits() as i64),
+            ],
+        });
+    }
+    let inverse_gamma = expect_builtin_call(m, prior, "InverseGamma")?;
+    let [shape, beta] = parameters(m, inverse_gamma, ["shape", "scale"])?;
+    let shape = positive_normal(fixed_real(m, shape, resolve)?)?;
+    let beta = positive_normal(fixed_real(m, beta, resolve)?)?;
+    let (nu, scale, norm) = student_parameters(shape, beta)?;
+    Some(Fact {
+        name: "conjugate-inverse-gamma-variance",
+        args: vec![
+            Expr(term),
+            Int(location),
+            Int(scale.to_bits() as i64),
+            Int(nu.to_bits() as i64),
+            Int(((nu + 1.0) / 2.0).to_bits() as i64),
+            Int(norm.to_bits() as i64),
+        ],
+    })
 }
 
 pub(super) fn seed(
@@ -189,35 +317,61 @@ fn predictive(
         return None;
     }
 
-    let binomial = expect_builtin_call(m, likelihood, "Binomial");
-    let (domain, parameter, noise, prior_family, prior_parameters) =
-        if let Some(normal) = expect_builtin_call(m, likelihood, "Normal") {
-            let [mu, sigma] = parameters(m, normal, ["mu", "sigma"])?;
-            (ScalarType::Real, mu, Some(sigma), "Normal", ["mu", "sigma"])
-        } else if let Some(bernoulli) = expect_builtin_call(m, likelihood, "Bernoulli") {
-            let [p] = parameters(m, bernoulli, ["p"])?;
-            (ScalarType::Integer, p, None, "Beta", ["alpha", "beta"])
-        } else if let Some(binomial) = binomial {
+    use FactArg::{Expr, Int};
+    let direct = |id| matches!(m.node(id), Node::Ref(reference) if reference == latent);
+    let scalar =
+        |domain| normalized_scalar(m, likelihood, domain) && normalized_scalar(m, measure, domain);
+    if let Some(normal) = expect_builtin_call(m, likelihood, "Normal") {
+        if !scalar(ScalarType::Real) {
+            return None;
+        }
+        let [mu, sigma] = parameters(m, normal, ["mu", "sigma"])?;
+        if !direct(mu) {
+            let &[variance] = positional(m, resolve(sigma)?, "sqrt")? else {
+                return None;
+            };
+            return direct(variance)
+                .then(|| variance_predictive(m, term, prior, mu, &resolve))
+                .flatten();
+        }
+        let [location, scale] =
+            parameters(m, expect_builtin_call(m, prior, "Normal")?, ["mu", "sigma"])?;
+        let location = fixed_real(m, location, &resolve)?;
+        let scale = positive_normal(fixed_real(m, scale, &resolve)?)?;
+        let sigma = positive_normal(fixed_real(m, sigma, &resolve)?)?;
+        let scale = predictive_scale(scale, sigma)?;
+        return Some(Fact {
+            name: "conjugate-normal-mean",
+            args: vec![
+                Expr(term),
+                Int(location.to_bits() as i64),
+                Int(scale.to_bits() as i64),
+            ],
+        });
+    }
+    let (parameter, trials, prior_family, prior_parameters) =
+        if let Some(binomial) = expect_builtin_call(m, likelihood, "Binomial") {
             let [trials, p] = parameters(m, binomial, ["n", "p"])?;
             let trials = resolve(trials)?;
-            if !matches!(m.node(trials), Node::Lit(Scalar::Int(1)))
-                || m.phase_of(trials) != Some(Phase::Fixed)
+            let Node::Lit(Scalar::Int(n @ 1..)) = m.node(trials) else {
+                return None;
+            };
+            if m.phase_of(trials) != Some(Phase::Fixed)
                 || m.is_sample_result(trials)
                 || m.sample_origin(trials).is_some()
             {
                 return None;
             }
-            binary_point(m, point, &resolve)?;
-            (ScalarType::Integer, p, None, "Beta", ["alpha", "beta"])
+            (p, Some(*n), "Beta", ["alpha", "beta"])
+        } else if let Some(bernoulli) = expect_builtin_call(m, likelihood, "Bernoulli") {
+            let [p] = parameters(m, bernoulli, ["p"])?;
+            (p, None, "Beta", ["alpha", "beta"])
         } else {
             let poisson = expect_builtin_call(m, likelihood, "Poisson")?;
             let [rate] = parameters(m, poisson, ["rate"])?;
-            (ScalarType::Integer, rate, None, "Gamma", ["shape", "rate"])
+            (rate, None, "Gamma", ["shape", "rate"])
         };
-    if !normalized_scalar(m, likelihood, domain)
-        || !normalized_scalar(m, measure, domain)
-        || !matches!(m.node(parameter), Node::Ref(reference) if reference == latent)
-    {
+    if !scalar(ScalarType::Integer) || !direct(parameter) {
         return None;
     }
     let [a, b] = parameters(
@@ -225,26 +379,21 @@ fn predictive(
         expect_builtin_call(m, prior, prior_family)?,
         prior_parameters,
     )?;
-    let a = fixed_real(m, a, &resolve)?;
+    let a = positive_normal(fixed_real(m, a, &resolve)?)?;
     let b = positive_normal(fixed_real(m, b, &resolve)?)?;
-    use FactArg::{Expr, Int};
-    if let Some(sigma) = noise {
-        let sigma = positive_normal(fixed_real(m, sigma, &resolve)?)?;
-        let scale = predictive_scale(b, sigma)?;
-        return Some(Fact {
-            name: "conjugate-normal-mean",
-            args: vec![
-                Expr(term),
-                Int(a.to_bits() as i64),
-                Int(scale.to_bits() as i64),
-            ],
-        });
-    }
-    let a = positive_normal(a)?;
     if prior_family == "Gamma" {
         return Some(Fact {
             name: "conjugate-gamma-poisson",
             args: vec![Expr(term), Int(a.to_bits() as i64), Int(b.to_bits() as i64)],
+        });
+    }
+    if let Some(trials @ 2..) = trials {
+        return Some(Fact {
+            name: "conjugate-beta-binomial",
+            args: vec![
+                Expr(term),
+                beta_binomial_masses(m, point, trials, a, b, &resolve)?,
+            ],
         });
     }
     // Match the scaled calculation used by the native Beta–Bernoulli path.
@@ -252,8 +401,11 @@ fn predictive(
     // to its existing guarded lowering.
     let scale = a.max(b);
     let p = (a / scale) / ((a / scale) + (b / scale));
-    if binomial.is_some() && !well_conditioned_binomial(a, b, p) {
-        return None;
+    if let Some(trials) = trials {
+        supported_outcomes(m, point, trials, &resolve)?;
+        if p.min(1.0 - p) <= binomial_rounding_margin(a, b, trials)? {
+            return None;
+        }
     }
     let a32 = (a as f32) / (scale as f32);
     let b32 = (b as f32) / (scale as f32);

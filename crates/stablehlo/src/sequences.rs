@@ -509,7 +509,7 @@ impl Emitter<'_> {
         self.scan_demand
             .as_ref()
             .expect("checked scan demand scope")
-            .get_or_init(|| flatppl_optimise::scan_output_demand(self.m))
+            .get_or_init(|| flatppl_optimise::scan_output_demand_with_rules(self.m, &self.rules))
     }
 
     pub(super) fn lower_scan_terminal(
@@ -910,10 +910,40 @@ impl Emitter<'_> {
             debug_assert!(!terminal && selected.is_none());
             buffers = values;
         } else if n > first {
+            let width = if reduce {
+                1
+            } else {
+                self.scan_block_width(body, &state, xs, n)
+            };
+            debug_assert!(!terminal || width == 1);
+            let index_range = if !reduce
+                && !self.target.serial_scans()
+                && !self.host_batch
+                && self.region_depth == 0
+                && self.call_frame.is_empty()
+                && self.runtime_batch_rank == 0
+                && self.rules.enables_ruleset("ordered-scan-index")
+                && xs.fields.is_none()
+                && xs.layout.is_none()
+                && let [value] = xs.values.as_slice()
+            {
+                self.consecutive_scan_index(value, n)
+                    .and_then(|(first, last)| {
+                        flatppl_optimise::plan_ordered_scan_index_with_rules(
+                            first,
+                            last,
+                            n,
+                            width,
+                            &self.rules,
+                        )
+                    })
+            } else {
+                None
+            };
             let counter = self.int_value_const(0);
             let mut inits = vec![counter];
-            for (sequence, _) in seqs.iter().zip(&traversed).filter(|(_, t)| **t) {
-                inits.extend(sequence.values.clone());
+            if index_range.is_none() {
+                inits.extend(xs.values.iter().cloned());
             }
             let start = inits.len();
             inits.extend(state.values.clone());
@@ -923,18 +953,12 @@ impl Emitter<'_> {
                 .iter()
                 .map(|v| v.ty.render(self.dtype, v.elem))
                 .collect::<Vec<_>>();
-            let width = if reduce {
-                1
-            } else {
-                self.scan_block_width(body, &state, xs, n)
-            };
-            debug_assert!(!terminal || width == 1);
             let advance = |e: &mut Self,
                            args: &[Value],
                            index: &Value|
              -> Result<Vec<Value>, EmitError> {
                 let mut sequence_items = Vec::with_capacity(seqs.len());
-                let mut at = 1;
+                let mut scan_index = None;
                 let item = if reduce {
                     let one = e.int_value_const(1);
                     e.add(index, &one)
@@ -951,12 +975,20 @@ impl Emitter<'_> {
                     } else {
                         item.clone()
                     };
-                    let mut items = Vec::with_capacity(sequence.values.len());
-                    for (value, original) in args[at..].iter().zip(&sequence.values) {
-                        let value = e.axes_view(value, e.axes_of(original));
-                        items.push(e.scan_slice(&value, &index));
+                    if let Some((first, last)) = index_range {
+                        let item = e.scan_index_value(&index, first);
+                        scan_index = Some((item.ssa.clone(), first, last));
+                        sequence_items.push(sequence.with_values(&[item]));
+                        continue;
                     }
-                    at += sequence.values.len();
+                    let items = args[1..start]
+                        .iter()
+                        .zip(&sequence.values)
+                        .map(|(value, original)| {
+                            let value = e.axes_view(value, e.axes_of(original));
+                            e.scan_slice(&value, &index)
+                        })
+                        .collect::<Vec<_>>();
                     sequence_items.push(sequence.with_values(&items));
                 }
                 let mut carries = Vec::with_capacity(state.values.len());
@@ -975,9 +1007,10 @@ impl Emitter<'_> {
                     arguments.push(value.clone());
                     types.push(ty.clone());
                 }
-                let output = e
-                    .call_components(body, &entries, &arguments, &types)?
-                    .align(&state, id)?;
+                let previous_index = std::mem::replace(&mut e.scan_index, scan_index);
+                let output = e.call_components(body, &entries, &arguments, &types);
+                e.scan_index = previous_index;
+                let output = output?.align(&state, id)?;
                 let mut next = Vec::with_capacity(args.len());
                 let one = e.int_value_const(1);
                 next.push(e.add(&args[0], &one));
@@ -1196,7 +1229,7 @@ impl Emitter<'_> {
             }
         }
         if allow_wide {
-            flatppl_optimise::ordered_scan_width(length, seen.len())
+            flatppl_optimise::ordered_scan_width_with_rules(length, seen.len(), &self.rules)
         } else {
             4
         }
@@ -1281,6 +1314,50 @@ impl Emitter<'_> {
             }
         }
         self.folded_constant(values, xs.ty.clone(), self.axes_of(xs))
+    }
+
+    fn consecutive_scan_index(&self, value: &Value, len: u64) -> Option<(i64, i64)> {
+        if len < 2 || value.elem != ElemKind::Int || shape(&value.ty) != [Some(len)] {
+            return None;
+        }
+        let values = self.constants.get(&value.ssa)?;
+        let len = usize::try_from(len).ok()?;
+        if values.len() != len || len > super::constants::MAX_FOLDED_ELEMENTS {
+            return None;
+        }
+        let Scalar::Int(first) = values[0] else {
+            return None;
+        };
+        let last = first.checked_add(i64::try_from(len - 1).ok()?)?;
+        (self.int_fits(first)
+            && self.int_fits(last)
+            && values
+                .iter()
+                .zip(first..=last)
+                .all(|(value, expect)| matches!(value, Scalar::Int(i) if *i == expect)))
+        .then_some((first, last))
+    }
+
+    fn scan_index_value(&mut self, position: &Value, first: i64) -> Value {
+        let first = self.int_value_const(first);
+        let ty = position.ty.render(self.dtype, ElemKind::Int);
+        // Even a constant tail position must retain the scan's runtime
+        // out-of-bounds behavior when the full index range cannot be proved.
+        let ssa = self.pure(format!(
+            "stablehlo.add {}, {} : {ty}",
+            position.ssa, first.ssa
+        ));
+        Value {
+            ssa,
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Int,
+        }
+    }
+
+    pub(crate) fn scan_index_in_bounds(&self, index: &Value, base: i64, upper: u64) -> bool {
+        self.scan_index.as_ref().is_some_and(|(ssa, first, last)| {
+            ssa == &index.ssa && *first >= base && u64::try_from(*last).is_ok_and(|i| i <= upper)
+        })
     }
 
     pub(super) fn scan_slice(&mut self, input: &Value, index: &Value) -> Value {

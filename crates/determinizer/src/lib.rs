@@ -27,8 +27,10 @@ pub use crossmodule::{Grafted, Import, graft_imports};
 pub use disintegrate::{rewrite_restrict, split_disintegrate};
 pub use driver::{
     SamplingObserver, desugar_restrict_and_disintegrate, determinize, determinize_with,
-    determinize_with_options, determinize_with_options_and_report, determinize_with_roots,
-    determinize_with_sampling_report,
+    determinize_with_options, determinize_with_options_and_report,
+    determinize_with_options_and_rules, determinize_with_options_report_and_rules,
+    determinize_with_roots, determinize_with_sampling_report,
+    determinize_with_sampling_report_and_rules,
 };
 pub use flatppl_model_analysis::{
     AnalysisError, ConjugateMatch, ConjugateRowId, CoordinatePrecision, GroupPartition,
@@ -41,6 +43,7 @@ pub use flatppl_model_analysis::{
 
 pub use flatppl_model_analysis::posterior::gaussian_block::update as gaussian_posterior_block;
 pub use flatppl_model_analysis::posterior::{conjugate_product, conjugate_update};
+pub use flatppl_optimise::{RulePolicy, RuleSelector};
 pub use marginal::{exponentially_modified_normal_logpdf, match_conjugate_marginal};
 pub use preparation::{
     prepare_likelihood, prepare_likelihood_with_options, prepare_likelihood_with_report,

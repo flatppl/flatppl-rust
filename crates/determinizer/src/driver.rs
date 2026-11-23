@@ -13,6 +13,7 @@ use crate::refuse::RefuseError;
 pub(crate) use flatppl_core::graph::rebuild_with_children;
 use flatppl_core::{BindingId, CallHead, Idx, Module, Node, NodeId, Scalar, Symbol};
 use flatppl_infer::ModuleBundle;
+use flatppl_optimise::RulePolicy;
 
 /// The measure-algebra vocabulary: op names whose presence signals a node that
 /// must be eliminated before the module is FlatPDL-conformant. This list matches
@@ -97,7 +98,18 @@ pub fn determinize_with_options(
     roots: Option<&[Symbol]>,
     options: &crate::LoweringOptions<'_>,
 ) -> Result<Module, RefuseError> {
-    determinize_inner(m, bundle, roots, options, None, None)
+    determinize_with_options_and_rules(m, bundle, roots, options, &RulePolicy::default())
+}
+
+/// Transform `m` using a caller-selected policy for portable egglog rewrites.
+pub fn determinize_with_options_and_rules(
+    m: &Module,
+    bundle: &ModuleBundle,
+    roots: Option<&[Symbol]>,
+    options: &crate::LoweringOptions<'_>,
+    rules: &RulePolicy,
+) -> Result<Module, RefuseError> {
+    determinize_inner(m, bundle, roots, options, None, None, rules)
 }
 
 /// Trace the actual lowering-time reductions without changing the result.
@@ -108,7 +120,26 @@ pub fn determinize_with_options_and_report(
     options: &crate::LoweringOptions<'_>,
     report: &mut crate::ReductionReport,
 ) -> Result<Module, RefuseError> {
-    determinize_inner(m, bundle, roots, options, Some(report), None)
+    determinize_with_options_report_and_rules(
+        m,
+        bundle,
+        roots,
+        options,
+        report,
+        &RulePolicy::default(),
+    )
+}
+
+/// Trace lowering-time reductions with a caller-selected egglog rule policy.
+pub fn determinize_with_options_report_and_rules(
+    m: &Module,
+    bundle: &ModuleBundle,
+    roots: Option<&[Symbol]>,
+    options: &crate::LoweringOptions<'_>,
+    report: &mut crate::ReductionReport,
+    rules: &RulePolicy,
+) -> Result<Module, RefuseError> {
+    determinize_inner(m, bundle, roots, options, Some(report), None, rules)
 }
 
 /// Inspect source measures after dependency resolution and inference, before
@@ -121,7 +152,36 @@ pub fn determinize_with_sampling_report(
     reductions: &mut crate::ReductionReport,
     inspect: &mut dyn SamplingObserver,
 ) -> Result<Module, RefuseError> {
-    determinize_inner(m, bundle, roots, options, Some(reductions), Some(inspect))
+    determinize_with_sampling_report_and_rules(
+        m,
+        bundle,
+        roots,
+        options,
+        reductions,
+        inspect,
+        &RulePolicy::default(),
+    )
+}
+
+/// Trace sampled measure identities with a caller-selected egglog rule policy.
+pub fn determinize_with_sampling_report_and_rules(
+    m: &Module,
+    bundle: &ModuleBundle,
+    roots: Option<&[Symbol]>,
+    options: &crate::LoweringOptions<'_>,
+    reductions: &mut crate::ReductionReport,
+    inspect: &mut dyn SamplingObserver,
+    rules: &RulePolicy,
+) -> Result<Module, RefuseError> {
+    determinize_inner(
+        m,
+        bundle,
+        roots,
+        options,
+        Some(reductions),
+        Some(inspect),
+        rules,
+    )
 }
 
 /// Observe the same source and instantiated measures consumed by lowering.
@@ -142,6 +202,7 @@ fn determinize_inner(
     options: &crate::LoweringOptions<'_>,
     mut report: Option<&mut crate::ReductionReport>,
     mut observer: Option<&mut dyn SamplingObserver>,
+    rules: &RulePolicy,
 ) -> Result<Module, RefuseError> {
     let mut work = m.clone();
     let mut imports = crate::crossmodule::GraftState::default();
@@ -199,8 +260,12 @@ fn determinize_inner(
         // Requested outputs are not the full set of source dependencies until
         // every query has consumed its draw provenance.
         if std::mem::take(&mut optimise_source)
-            && let Some(optimised) =
-                flatppl_optimise::optimise(&work, None, flatppl_optimise::Profile::Portable)
+            && let Some(optimised) = flatppl_optimise::optimise_with_rules(
+                &work,
+                None,
+                flatppl_optimise::Profile::Portable,
+                rules,
+            )
         {
             work = optimised;
         }

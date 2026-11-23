@@ -19,6 +19,6 @@
 (relation erasable (Expr))
 
 (ruleset analysis)
-(rule ((= x (Boolean b))) ((bool-value x) (erasable x)) :ruleset analysis)
-(rule ((= x (Integer i))) ((int-value x)) :ruleset analysis)
-(rule ((= x (Real bits))) ((real-value x) (erasable x)) :ruleset analysis)
+(rule ((= x (Boolean b))) ((bool-value x) (erasable x)) :ruleset analysis :name "analysis.literal-boolean")
+(rule ((= x (Integer i))) ((int-value x)) :ruleset analysis :name "analysis.literal-integer")
+(rule ((= x (Real bits))) ((real-value x) (erasable x)) :ruleset analysis :name "analysis.literal-real")
