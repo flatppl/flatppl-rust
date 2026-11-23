@@ -91,6 +91,43 @@ outputs = 2.0 * p.a + sum(p.b .* p.b) + p.c.d * p.a
 }
 
 #[test]
+fn reverse_quadrature_preserves_nested_record_captures() {
+    use flatppl_autodiff::{
+        NUMERICAL_SOURCE_OPTIONS, determinize_query_with_options, gradient_with_options,
+        prepare_source_with_options, vjp_with_options,
+    };
+
+    let source = "
+p = elementof(cartprod(hi = nonnegreals, block = cartprod(a = reals, v = cartpow(reals, 2), m = cartpow(reals, [2, 2]))))
+present = elementof(booleans)
+weight(x, p) = 1.0 + (p.block.a + p.block.v[2] * x + p.block.m[2, 1] * x^2)^2
+score = log(totalmass(weighted(weight, Lebesgue(interval(0.0, p.hi)), p)))
+inputs = (p, present)
+outputs = ifelse(present, score, p.block.a)
+";
+    let lower = |source: &str| {
+        let mut module = flatppl_syntax::parse(source).unwrap();
+        let diagnostics = flatppl_infer::infer(&mut module);
+        assert!(
+            diagnostics.iter().all(|d| d.severity != Severity::Error),
+            "{diagnostics:?}"
+        );
+        determinize_query_with_options(&module, &ModuleBundle::new(), &NUMERICAL_SOURCE_OPTIONS)
+            .unwrap()
+    };
+    let module = lower(source);
+    for transform in [gradient_with_options, vjp_with_options] {
+        let mut result = transform(&module, &["p"], &NUMERICAL_SOURCE_OPTIONS).unwrap();
+        flatppl_determinizer::is_flatpdl_with_options(&result, &NUMERICAL_SOURCE_OPTIONS).unwrap();
+        prepare_source_with_options(&mut result, &NUMERICAL_SOURCE_OPTIONS).unwrap();
+        let printed = flatppl_syntax::print(&result);
+        let reparsed = lower(&printed);
+        flatppl_determinizer::is_flatpdl_with_options(&reparsed, &NUMERICAL_SOURCE_OPTIONS)
+            .unwrap();
+    }
+}
+
+#[test]
 fn directional_products_preserve_record_outputs_and_nested_vectors() {
     let module = lower(
         "

@@ -103,7 +103,7 @@ flatppl stablehlo gradient.flatppl --numerical-integrals
 
 Numerical AD integrates the derivative of the integrand and adds terms for
 moving bounds and supported scalar cutoffs. Reverse differentiation supports
-scalar, fixed-vector, and fixed-matrix captures. The Rust
+scalar, fixed-vector, fixed-matrix, and nested record captures. The Rust
 `*_with_options` entry points accept `NUMERICAL_SOURCE_OPTIONS`.
 Call `prepare_source_with_options` before printing. To compile the
 derivative directly to StableHLO, add `--ad-wrt` to the `stablehlo` command

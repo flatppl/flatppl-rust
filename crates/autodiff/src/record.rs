@@ -169,7 +169,12 @@ fn selected_field<'a>(
         .map(|(name, ty)| (*name, ty))
 }
 
-fn project(module: &mut Module, record: NodeId, name: Symbol) -> NodeId {
+pub(super) fn project(module: &mut Module, record: NodeId, name: Symbol) -> NodeId {
+    if let Some(constructor) = expect_builtin_call(module, record, "record")
+        && let Some(field) = constructor.named.iter().find(|field| field.name == name)
+    {
+        return field.value;
+    }
     let key = module.alloc(Node::Lit(Scalar::Str(module.resolve(name).into())));
     build_call(module, "get", &[record, key])
 }

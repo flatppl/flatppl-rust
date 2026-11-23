@@ -155,7 +155,8 @@ pub fn gradient(module: &Module, wrt: &[&str]) -> Result<Module, Error> {
 /// Apply [`gradient`] to a module that uses the requested deterministic extensions.
 ///
 /// Numerical integrals differentiate the integrand and its moving boundaries.
-/// Reverse mode supports real scalar, fixed vector, and fixed matrix captures.
+/// Reverse mode supports real scalar, fixed vector, and fixed matrix captures,
+/// including records with these leaves.
 pub fn gradient_with_options(
     module: &Module,
     wrt: &[&str],
@@ -178,7 +179,8 @@ pub fn vjp(module: &Module, wrt: &[&str]) -> Result<Module, Error> {
 /// Apply [`vjp`] to a module that uses the requested deterministic extensions.
 ///
 /// Numerical integrals differentiate the integrand and its moving boundaries.
-/// Reverse mode supports real scalar, fixed vector, and fixed matrix captures.
+/// Reverse mode supports real scalar, fixed vector, and fixed matrix captures,
+/// including records with these leaves.
 pub fn vjp_with_options(
     module: &Module,
     wrt: &[&str],
@@ -428,7 +430,7 @@ fn reverse_values_with_mask(
                 continue;
             };
             let mut contribution = if let Some((scope, adjoints)) = &integral {
-                scope.pullback(emitter, step, slot, bar, adjoints)?
+                scope.pullback(emitter, step, slot, (bar, masked), adjoints)?
             } else if let Some(scope) = aggregate {
                 scope.pullback(emitter, rules, slot, bar, masked)?
             } else {
@@ -451,9 +453,11 @@ fn reverse_values_with_mask(
             } else if masked && math::scalar_reduction(step.op) {
                 contribution =
                     tensor::zero_when_masked(&mut emitter.module, bar, contribution, true);
-            } else if masked && (!structural(step.op) || multivariate_density(step.op)) {
-                let pointwise =
-                    step.pointwise(plan.module) || multivariate_density(step.op) || scope.is_some();
+            } else if masked
+                && scope.is_none()
+                && (!structural(step.op) || multivariate_density(step.op))
+            {
+                let pointwise = step.pointwise(plan.module) || multivariate_density(step.op);
                 contribution =
                     tensor::zero_when_masked(&mut emitter.module, bar, contribution, pointwise);
             }

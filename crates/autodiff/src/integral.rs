@@ -1,7 +1,7 @@
 //! Differentiate the mathematical integral, independently of the quadrature mesh.
 
-use flatppl_core::graph::{build_call, expect_builtin_call, rebuild_with_children};
-use flatppl_core::{CallHead, Dim, INTEGRATION_POINT, LOG_INTEGRAL, MASS_INTEGRAL, Scalar};
+use flatppl_core::graph::{build_call, build_record, expect_builtin_call, rebuild_with_children};
+use flatppl_core::{CallHead, Dim, INTEGRATION_POINT, LOG_INTEGRAL, MASS_INTEGRAL, Scalar, Type};
 
 use crate::{Emitter, Error, HashMap, HashSet, Key, Mode, Module, Node, NodeId, Plan, Query, Step};
 use crate::{combine_contributions, forward_values, real, reverse_values, rules::Rules, tensor};
@@ -135,20 +135,37 @@ impl<'a> Scope<'a> {
         emitter: &mut Emitter,
         step: &Step<'_>,
         slot: usize,
-        cotangent: NodeId,
+        (cotangent, masked): (NodeId, bool),
         adjoints: &HashMap<Key, NodeId>,
     ) -> Result<NodeId, Error> {
-        let fixed = self.axes.len() * 2 + self.active_cuts.len();
-        let factor = if slot < fixed {
-            self.boundary(emitter, step.node, slot)
-        } else {
-            let key = step.targets[slot].unwrap();
-            let &adjoint = adjoints.get(&key).ok_or_else(|| {
-                Error::new(Some(step.node), "missing active integrand derivative")
-            })?;
-            self.capture_pullback(emitter, step.node, step.args[slot], adjoint)?
+        let scale = |module: &mut Module, factor| {
+            let value = build_call(module, "mul", &[cotangent, factor]);
+            if masked {
+                tensor::zero_when_masked(module, cotangent, value, true)
+            } else {
+                value
+            }
         };
-        Ok(build_call(&mut emitter.module, "mul", &[cotangent, factor]))
+        let fixed = self.axes.len() * 2 + self.active_cuts.len();
+        if slot < fixed {
+            let factor = self.boundary(emitter, step.node, slot);
+            return Ok(scale(&mut emitter.module, factor));
+        }
+        let key = step.targets[slot].unwrap();
+        let &adjoint = adjoints
+            .get(&key)
+            .ok_or_else(|| Error::new(Some(step.node), "missing active integrand derivative"))?;
+        let arg = step.args[slot];
+        self.plan
+            .module
+            .type_of(arg)
+            .and_then(|ty| self.capture_pullback(emitter, step.node, arg, ty, adjoint, &scale))
+            .ok_or_else(|| {
+                Error::new(
+                    Some(arg),
+                    "a numerical integral pullback needs a real scalar, fixed vector or matrix, or a record of these",
+                )
+            })
     }
 
     fn capture_pullback(
@@ -156,8 +173,24 @@ impl<'a> Scope<'a> {
         emitter: &mut Emitter,
         primal: NodeId,
         arg: NodeId,
+        ty: &Type,
         adjoint: NodeId,
-    ) -> Result<NodeId, Error> {
+        scale: &impl Fn(&mut Module, NodeId) -> NodeId,
+    ) -> Option<NodeId> {
+        if let Type::Record(fields) = ty {
+            let terms = fields
+                .iter()
+                .map(|(name, ty)| {
+                    let field = crate::record::project(&mut emitter.module, arg, *name);
+                    let adjoint = crate::record::project(&mut emitter.module, adjoint, *name);
+                    Some((
+                        *name,
+                        self.capture_pullback(emitter, primal, field, ty, adjoint, scale)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(build_record(&mut emitter.module, &terms));
+        }
         let integrate = |emitter: &mut Emitter, indices: &[u32]| {
             let mut args = vec![adjoint];
             args.extend(
@@ -170,16 +203,19 @@ impl<'a> Scope<'a> {
         };
         // Quadrature emits a scalar. Project each component of the shared
         // adjoint and restore the capture's shape outside the binder.
-        match tensor::real_shape(self.plan.module, arg) {
-            Some([]) => Ok(self.integrate(emitter, primal, adjoint)),
-            Some(shape) if shape.contains(&Dim::Static(0)) => emitter.zero_like(arg),
-            Some([Dim::Static(n)]) => {
+        let factor = match tensor::real_shape_of(ty)? {
+            [] => self.integrate(emitter, primal, adjoint),
+            shape if shape.contains(&Dim::Static(0)) => {
+                let zero = real(&mut emitter.module, 0.0);
+                tensor::fill_typed(emitter, zero, arg, ty)?
+            }
+            [Dim::Static(n)] => {
                 let terms = (1..=*n)
                     .map(|i| integrate(emitter, &[i]))
                     .collect::<Vec<_>>();
-                Ok(build_call(&mut emitter.module, "vector", &terms))
+                build_call(&mut emitter.module, "vector", &terms)
             }
-            Some([Dim::Static(rows), Dim::Static(cols)]) => {
+            [Dim::Static(rows), Dim::Static(cols)] => {
                 let mut vectors = Vec::new();
                 for i in 1..=*rows {
                     let terms = (1..=*cols)
@@ -188,13 +224,11 @@ impl<'a> Scope<'a> {
                     vectors.push(build_call(&mut emitter.module, "vector", &terms));
                 }
                 let vectors = build_call(&mut emitter.module, "vector", &vectors);
-                Ok(build_call(&mut emitter.module, "rowstack", &[vectors]))
+                build_call(&mut emitter.module, "rowstack", &[vectors])
             }
-            _ => Err(Error::new(
-                Some(arg),
-                "a numerical integral pullback needs a real scalar, fixed vector, or fixed matrix capture",
-            )),
-        }
+            _ => return None,
+        };
+        Some(scale(&mut emitter.module, factor))
     }
 
     pub(super) fn pushforward(
