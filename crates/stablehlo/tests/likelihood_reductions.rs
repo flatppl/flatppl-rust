@@ -30,6 +30,10 @@ fn emit(source: &str, dtype: Dtype) -> String {
     .unwrap()
 }
 
+fn evaluates_logit(line: &str) -> bool {
+    line.contains("stablehlo.logistic ") || line.contains("stablehlo.exponential ")
+}
+
 #[test]
 fn repeated_fixed_designs_gather_only_occupied_bernoulli_logits() {
     let base = "b=elementof(reals)\nx=rowstack([[1,2,1],[2,1,2]])\n\
@@ -41,10 +45,8 @@ fn repeated_fixed_designs_gather_only_occupied_bernoulli_logits() {
             Dtype::F64 => "f64",
         };
         let extent = |ir: &str, dims: &str| {
-            ir.lines().any(|line| {
-                line.contains("stablehlo.logistic ")
-                    && line.ends_with(&format!("tensor<{dims}x{t}>"))
-            })
+            ir.lines()
+                .any(|line| evaluates_logit(line) && line.ends_with(&format!("tensor<{dims}x{t}>")))
         };
         assert!(extent(&emit(base, dtype), "2"));
         for source in [
@@ -90,7 +92,7 @@ fn fixed_integer_scans_feed_counts_only_when_the_proof_succeeds() {
         assert!(
             compact
                 .lines()
-                .any(|s| s.contains("stablehlo.logistic ") && s.contains("<2x"))
+                .any(|s| evaluates_logit(s) && s.contains("<2x"))
         );
         for source in [
             base.replace("inputs=b", "inputs=(b,x)"),
