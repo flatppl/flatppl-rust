@@ -1,5 +1,6 @@
 //! Typed rewrites of an inferred FlatPPL model or a determinized query.
 
+mod categorical_counts;
 mod concat;
 mod conjugacy;
 mod demand;
@@ -13,10 +14,11 @@ mod project;
 mod selectors;
 mod types;
 
+pub use categorical_counts::{SimplexRowCheck, plan_simplex_rows};
 pub use demand::{ScanOutputDemand, scan_output_demand};
 use flatppl_core::{Module, Symbol};
 pub use matrix_projection::{MatrixProjection, MatrixProjectionFact, plan_matrix_projection};
-pub use ordered_scan::ordered_scan_width;
+pub use ordered_scan::{ordered_scan_width, plan_ordered_scan_index};
 
 /// The shared language and each emitter have separate rule schedules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

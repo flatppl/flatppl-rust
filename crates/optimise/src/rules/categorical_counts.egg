@@ -1,0 +1,12 @@
+; A fixed selector certificate records the ordered set of occupied rows.
+; Repeating a row cannot change an idempotent min or max of its check values.
+; Full ordered coverage may use the source row checks directly.
+(relation fixed-row-partition (i64 i64 i64 i64))
+(relation check-occupied-rows (i64 i64))
+(ruleset simplex-row-checks)
+
+(rule ((fixed-row-partition extent selected occupied identity)
+       (> occupied 0) (<= occupied extent)
+       (>= selected 64) (>= selected (* 3 occupied)))
+      ((check-occupied-rows occupied identity))
+  :ruleset simplex-row-checks)

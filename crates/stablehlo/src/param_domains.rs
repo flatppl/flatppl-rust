@@ -15,6 +15,7 @@
 //! their declared sets are not enforced at the ABI.
 
 use flatppl_infer::ParamSet;
+use flatppl_optimise::{SimplexRowCheck, plan_simplex_rows};
 
 use super::constants::element_count;
 use super::*;
@@ -499,8 +500,39 @@ impl Emitter<'_> {
         let p = self.convert(&gathered.rows, ElemKind::Real);
         let row_least = self.reduce_axis("stablehlo.minimum", pos_inf_literal(self.dtype), &p, 1);
         let row_total = self.reduce_sum_last_axis(&p);
-        let least = self.gather(&row_least, &gathered.index, 0);
-        let total = self.gather(&row_total, &gathered.index, 0);
+        let selector = if self.sufficient_statistics
+            && self.target == crate::Target::Cpu
+            && let [Some(rows), Some(_)] = shape(&p.ty)
+            && let [Some(occurrences)] = shape(&gathered.index.ty)
+        {
+            match plan_simplex_rows(*rows, *occurrences, |at| {
+                match self.fixed_scalar_at(&gathered.index, at)? {
+                    Scalar::Int(row) => Some(row),
+                    _ => None,
+                }
+            }) {
+                Some(SimplexRowCheck::All) => None,
+                Some(SimplexRowCheck::Select(rows)) => {
+                    let ty = MlirTy::Ranked(vec![Some(rows.len() as u64)]);
+                    let values = rows.into_iter().map(Scalar::Int).collect();
+                    Some(
+                        self.folded_constant(values, ty, Axes::default())
+                            .unwrap_or_else(|| gathered.index.clone()),
+                    )
+                }
+                None => Some(gathered.index.clone()),
+            }
+        } else {
+            Some(gathered.index.clone())
+        };
+        let (least, total) = if let Some(selector) = selector {
+            (
+                self.gather(&row_least, &selector, 0),
+                self.gather(&row_total, &selector, 0),
+            )
+        } else {
+            (row_least, row_total)
+        };
         let zero = self.scalar(0.0);
         let least = self.per_call(&least, false);
         let negative = self.compare("LT", &least, &zero);

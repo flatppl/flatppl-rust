@@ -22,3 +22,19 @@
        (<= (* (+ width tail) nodes) 768))
       ((ordered-block-choice width))
   :ruleset ordered-scan)
+
+(ruleset ordered-scan-index)
+
+; The emitter proves the sequence has unit positive stride and fits the target
+; integer width. Only an already-unrolled scan can reuse its block counter
+; across several otherwise independent index-vector reads.
+(relation ordered-scan-range (i64 i64 i64))
+(relation ordered-scan-width (i64 i64))
+(relation ordered-index-choice (i64 i64))
+(rule ((ordered-scan-range length first last)
+       (ordered-scan-width length width)
+       (> width 1)
+       (<= width length)
+       (= (- last first) (- length 1)))
+      ((ordered-index-choice first last))
+  :ruleset ordered-scan-index)

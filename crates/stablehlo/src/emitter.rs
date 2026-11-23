@@ -246,6 +246,8 @@ pub struct Emitter<'m> {
     scan_demand: Option<OnceLock<flatppl_optimise::ScanOutputDemand>>,
     /// Terminal values are not interchangeable with full scan histories.
     scan_terminals: HashMap<NodeId, Value>,
+    /// The scalar item and its inclusive bounds during a scan callback.
+    scan_index: Option<(String, i64, i64)>,
     /// The fan-out batch shape, set by [`crate::registry::lower_sample`] around
     /// a batched `builtin_sample(rng, ctor, input, n)` (spec §07 size dims).
     /// When `Some`, [`Emitter::rng`] OVERRIDES the per-element `out_ty` the
@@ -303,6 +305,7 @@ impl<'m> Emitter<'m> {
             final_scan_keys: HashMap::new(),
             scan_demand: None,
             scan_terminals: HashMap::new(),
+            scan_index: None,
             batch_shape: None,
             columns: HashMap::new(),
         }
