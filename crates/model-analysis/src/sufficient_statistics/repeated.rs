@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use super::{Expr, Factor, Reducer, call, map, materialize, op, per_cell, resolve};
+use super::{
+    Expr, Factor, Reducer, call, map, materialize, op, per_cell, resolve, resolve_record_field,
+};
 use flatppl_core::{Dim, Module, Node, NodeId, Scalar, ScalarType, Type, ValueSet};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,7 +82,7 @@ impl Predictor {
         count: u32,
         depth: usize,
     ) -> Option<usize> {
-        let id = resolve(m, id, &r.boundary);
+        let id = resolve_record_field(m, id, &r.boundary);
         if let Some(&plan) = self.visited.get(&id) {
             return Some(plan);
         }
@@ -215,6 +217,25 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
     if predictor.columns.is_empty() {
         return None;
     }
+    // Large fixed Normal partitions share a vectorized centered score. Require
+    // four rows per representative on average and bound compile-time buckets.
+    // Runtime observations can require a separate setup expression per group.
+    let fixed_normal = m.resolve(f.constructor) == "Normal"
+        && f.parameters
+            .iter()
+            .any(|&(name, value)| m.resolve(name) == "sigma" && r.scalar(m, value).is_some())
+        && call(
+            m,
+            resolve_record_field(m, f.observed, &r.boundary),
+            "vector",
+        )
+        .is_some()
+        && r.fixed(m, f.observed);
+    let max_groups = if fixed_normal {
+        (count as usize / 4).clamp(64, 4096)
+    } else {
+        64
+    };
     let mut lookup = HashMap::new();
     let mut rows = Vec::new();
     let mut indices = Vec::new();
@@ -229,7 +250,7 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
             rows.push(i);
             next
         });
-        if rows.len() > 64 {
+        if rows.len() > max_groups {
             return None;
         }
         indices.push(at as i64 + 1);
@@ -249,9 +270,18 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
         .map(|(name, old, plan)| {
             let values = predictor.rebuild(&mut candidate, plan, &rows, &mut cache);
             if matches!(candidate.type_of(values), Some(Type::Scalar(_))) {
-                return (name, values);
+                return Some((name, values));
             }
-            let old_type = m.type_of(old).unwrap().clone();
+            let old_type = m.type_of(old)?;
+            let Type::Array { shape, elem } = old_type else {
+                return None;
+            };
+            if **shape != [Dim::Static(count)]
+                || !matches!(candidate.type_of(values), Some(Type::Array {shape, elem: rebuilt})
+                    if **shape == [Dim::Static(rows.len() as u32)] && rebuilt == elem)
+            {
+                return None;
+            }
             if let Some(ValueSet::CartPow(set, _)) = m.valueset_of(old) {
                 candidate.set_valueset(
                     values,
@@ -262,13 +292,13 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
                 &mut candidate,
                 op("get", [Expr::Node(values), Expr::Node(selectors)]),
             );
-            candidate.set_type(value, old_type);
+            candidate.set_type(value, old_type.clone());
             if let Some(set) = m.valueset_of(old) {
                 candidate.set_valueset(value, set.clone());
             }
-            (name, value)
+            Some((name, value))
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     let factor = Factor {
         constructor: f.constructor,
         parameters,

@@ -131,3 +131,68 @@ fn unsupported_predictors_leave_the_original_score_unchanged()
     );
     Ok(())
 }
+
+#[test]
+fn fixed_normal_design_groups_repeated_instrument_calibrations()
+-> Result<(), Box<dyn std::error::Error>> {
+    use flatppl_host::ReductionOutcome;
+
+    let calibrations = |repeats: usize, last_label: usize, inputs: &str| {
+        let labels = (0..65 * repeats)
+            .map(|row| {
+                if row % 13 == 12 {
+                    last_label
+                } else {
+                    row % 13 + 1
+                }
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let settings = (0..65 * repeats)
+            .map(|row| ["-1.5", "-0.5", "0.0", "0.5", "1.5"][row / 13 % 5])
+            .collect::<Vec<_>>()
+            .join(",");
+        let readings = (0..65 * repeats)
+            .map(|row| format!("{}.25", row % 7))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "a=elementof(cartpow(reals,13))\nb=elementof(reals)\ns=elementof(posreals)\n\
+                 calibration=record(instrument=[{labels}],setting=[{settings}])\n\
+                 readings=[{readings}]\ninputs=({inputs})\n\
+                 mean=a[calibration.instrument] .+ b .* calibration.setting\n\
+                 outputs=logdensityof(Normal.(mean,s),readings)"
+        )
+    };
+    let mut context = Context::default();
+    for (repeats, last, inputs, expected) in [
+        (4, 13, "a,b,s", true),
+        (2, 13, "a,b,s", false),
+        (4, 14, "a,b,s", false),
+        (4, 13, "a,b,s,calibration", false),
+    ] {
+        let query = context.parse(&calibrations(repeats, last, inputs), None, None)?;
+        let report = context.analyze_query(&query, &[], false, true)?;
+        let partition =
+            report
+                .reductions
+                .decisions
+                .iter()
+                .find_map(|decision| match &decision.outcome {
+                    ReductionOutcome::Reduced {
+                        rule: "repeated predictor rows",
+                        partition,
+                    } => partition.as_ref(),
+                    _ => None,
+                });
+        assert_eq!(
+            partition.map(|p| (p.observations, p.groups, p.singletons)),
+            expected.then_some((260, 65, 0))
+        );
+    }
+    let query = context.parse(&calibrations(4, 13, "a,b,s,readings"), None, None)?;
+    let report = context.analyze_query(&query, &["readings".into()], true, true)?;
+    assert!(report.preparation_refusal.is_some());
+    Ok(())
+}
