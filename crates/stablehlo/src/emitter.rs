@@ -49,6 +49,8 @@ pub(crate) use integration::IntegralKind;
 mod ext_linalg;
 #[path = "factor_solve.rs"]
 mod factor_solve;
+#[path = "fixed_design.rs"]
+mod fixed_design;
 #[path = "hermitian.rs"]
 mod hermitian;
 #[path = "kronecker.rs"]
@@ -176,6 +178,8 @@ pub struct Emitter<'m> {
     restrict_enzyme_compatible: bool,
     check_parameters: bool,
     pub(crate) sufficient_statistics: bool,
+    /// A tentative fixed-design reduction can materialize small integer histories.
+    fold_design_scans: bool,
     integration: Option<crate::IntegrationOptions>,
     target: crate::Target,
     /// The program is replayed over host batch axes after lowering.
@@ -260,6 +264,7 @@ impl<'m> Emitter<'m> {
             restrict_enzyme_compatible: crate::EmitOptions::default().restrict_enzyme_compatible,
             check_parameters: true,
             sufficient_statistics: true,
+            fold_design_scans: false,
             integration: None,
             target: crate::Target::Cpu,
             host_batch: false,

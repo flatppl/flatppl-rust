@@ -30,6 +30,85 @@ fn emit(source: &str, dtype: Dtype) -> String {
     .unwrap()
 }
 
+#[test]
+fn repeated_fixed_designs_gather_only_occupied_bernoulli_logits() {
+    let base = "b=elementof(reals)\nx=rowstack([[1,2,1],[2,1,2]])\n\
+        y=rowstack([[1,0,1],[1,0,0]])\ninputs=b\n\
+        outputs=logdensityof(Bernoulli.(invlogit.(b .* x)),y)";
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let t = match dtype {
+            Dtype::F32 => "f32",
+            Dtype::F64 => "f64",
+        };
+        let extent = |ir: &str, dims: &str| {
+            ir.lines().any(|line| {
+                line.contains("stablehlo.logistic ")
+                    && line.ends_with(&format!("tensor<{dims}x{t}>"))
+            })
+        };
+        assert!(extent(&emit(base, dtype), "2"));
+        for source in [
+            base.replace("inputs=b", "inputs=(b,x)"),
+            base.replace("inputs=b", "inputs=(b,y)"),
+            base.replace("[[1,2,1],[2,1,2]]", "[[1,2,3],[4,5,6]]"),
+            base.replace("[[1,0,1],[1,0,0]]", "[[1,0,1],[2,0,0]]"),
+            base.replace(
+                "inputs=b",
+                "d=elementof(cartpow(reals,[2,3]))\ninputs=(b,d)",
+            )
+            .replace("b .* x", "b .* x .+ d"),
+        ] {
+            assert!(extent(&emit(&source, dtype), "2x3"), "{source}");
+        }
+        let module = model(base);
+        for options in [
+            EmitOptions {
+                dtype,
+                target: flatppl_stablehlo::Target::Gpu,
+                ..Default::default()
+            },
+            EmitOptions {
+                dtype,
+                sufficient_statistics: false,
+                ..Default::default()
+            },
+        ] {
+            let ir = flatppl_stablehlo::emit(&module, Mode::LogDensity, &options).unwrap();
+            assert!(extent(&ir, "2x3"));
+        }
+    }
+}
+
+#[test]
+fn fixed_integer_scans_feed_counts_only_when_the_proof_succeeds() {
+    let base = "b=elementof(reals)\nx=[1,0,1,0,-1,0]\n\
+        v=scan((a,t)->a+t,7,x)\ninputs=b\n\
+        outputs=logdensityof(Bernoulli.(invlogit.(b .* v)),[1,0,1,1,0,0])";
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let compact = emit(base, dtype);
+        assert!(!compact.contains("stablehlo.while"));
+        assert!(
+            compact
+                .lines()
+                .any(|s| s.contains("stablehlo.logistic ") && s.contains("<2x"))
+        );
+        for source in [
+            base.replace("inputs=b", "inputs=(b,x)"),
+            base.replace("a+t", "a-t"),
+            base.replace("x=[1,0,1,0,-1,0]", "x=[1,1,1,1,1,1]"),
+            base.replace(
+                "outputs=logdensityof(Bernoulli.(invlogit.(b .* v)),[1,0,1,1,0,0])",
+                "outputs=b+sum(v)",
+            ),
+        ] {
+            assert!(emit(&source, dtype).contains("stablehlo.while"), "{source}");
+        }
+    }
+    let overflow = base.replace(",7,x", ",2147483646,x");
+    assert!(emit(&overflow, Dtype::F32).contains("stablehlo.while"));
+    assert!(!emit(&overflow, Dtype::F64).contains("stablehlo.while"));
+}
+
 fn returned_constant(ir: &str, dtype: Dtype) -> f64 {
     let returned = ir
         .lines()
