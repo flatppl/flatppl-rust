@@ -476,7 +476,7 @@ fn count_and_inverse_matrix_preparation_keep_the_scoring_abi()
 #[test]
 fn regression_preparation_keeps_matrix_and_affine_designs_outside_scoring()
 -> Result<(), Box<dyn std::error::Error>> {
-    for (dimension, count) in [(2, 5), (3, 2)] {
+    for (dimension, count) in [(2, 17), (3, 2)] {
         let mut context = Context::default();
         let source = format!(
             "beta=elementof(cartpow(reals,{dimension}))\nsigma=elementof(posreals)\nX=external(cartpow(interval(-100,100),[{count},{dimension}]))\ny=external(cartpow(interval(-100,100),{count}))\ninputs=(beta,sigma,X,y)\noutputs=logdensityof(Normal.(X*beta,sigma),y)"

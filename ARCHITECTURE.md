@@ -294,8 +294,11 @@ arithmetic inside per-cell lambdas retain ordinary scoring.
 Literal observations and derived data vectors use
 partitions with total selector length equal to the observation count. No
 operation scans every observation once per possible group, and unused groups
-add no scoring terms on the fixed-partition path. Runtime Bernoulli scoring batches
-the group terms. Preparation reuses monotonically allocated summary names.
+add no scoring terms on the fixed-partition path. Fixed groups with matching scalar
+score expressions share one broadcast and reduction per shape. A scalar or record
+result must retain its exact cell type along the group axis. Remaining groups
+keep their scalar scores. Runtime Bernoulli scoring batches the group terms.
+Preparation reuses monotonically allocated summary names.
 Runtime Normal and LogNormal partitions also prepare guarded centered moments.
 Gathered parameters must share their selector, origin and array extent. Scalar
 parameters remain invariant. The pass bounds both forward and reverse arithmetic
@@ -394,6 +397,14 @@ per data binding. Scoring accepts the summaries, keeps other original inputs,
 and retains raw data needed by unreduced factors or other outputs. No identity
 cache can silently retain a caller's changed arrays. Both queries must use the
 same numeric precision.
+
+`LoadedModule::compile_prepared` can split the lowered query using only
+fixed data from the module's snapshot. A successful split adds a zero-input
+`preparation` query to the export. The host runs it once per binding, checks
+its runtime status, and passes its tensor results in order after the declared
+inputs of each score call. Both programs use the selected precision and target.
+`compile_batched_prepared` takes an unmapped axis row for each trailing tensor.
+Queries without eligible summaries use ordinary emission.
 
 `LoweringOptions::disable_sufficient_statistics` disables the shared rewrite.
 `EmitOptions::sufficient_statistics` controls both shared lowering and the

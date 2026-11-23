@@ -35,7 +35,7 @@ pub use flatppl_model_analysis::{
     IncrementalScorePlan, IncrementalTerm, InputArray, InputCell, InputPath, ModelAnalysis,
     NormalCoordinate, NormalCoordinateQueries, NormalCoordinatesQueries, OutputTerm,
     PreparationOptions, PreparedLikelihood, ReductionDecision, ReductionOutcome, ReductionReport,
-    sufficient_statistics, sufficient_statistics_with_report,
+    prepare_fixed_likelihood, sufficient_statistics, sufficient_statistics_with_report,
 };
 
 pub use flatppl_model_analysis::posterior::gaussian_block::update as gaussian_posterior_block;

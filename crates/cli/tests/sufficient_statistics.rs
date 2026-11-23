@@ -242,3 +242,35 @@ fn fixed_category_files_fold_after_loading_and_promoted_labels_stay_live() {
     }
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn fixed_record_groups_reduce_after_loading_and_promoted_records_stay_live() {
+    let directory =
+        std::env::temp_dir().join(format!("flatppl-record-groups-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("query.flatppl");
+    std::fs::write(
+        directory.join("data.json"),
+        r#"{"rows":{"g":[2,1,1,3,2],"y":[4.0,0.0,2.0,1.0,3.0]}}"#,
+    )
+    .unwrap();
+    for (inputs, fixed) in [("mu", true), ("(mu,d)", false)] {
+        let query = format!(
+            "mu=elementof(cartpow(reals,4))\nd=load_data(\"data.json\",cartprod(rows=cartprod(g=cartpow(posintegers,5),y=cartpow(reals,5))))\nrows=d.rows\ninputs={inputs}\noutputs=logdensityof(Normal.(mu[rows.g],1.0),rows.y)"
+        );
+        std::fs::write(&source, query).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+            .args(["determinize", "--explain-reductions"])
+            .arg(&source)
+            .output()
+            .unwrap();
+        let report = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{report}");
+        assert_eq!(
+            report.contains("5 observations, 3 occupied groups, 1 singletons"),
+            fixed,
+            "{report}"
+        );
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}

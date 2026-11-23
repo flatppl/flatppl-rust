@@ -751,7 +751,9 @@ impl NativeModule {
         Ok(serde_json::to_string(&self.inner.math(format)).expect("rows contain only JSON values"))
     }
 
-    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu", sufficient_statistics=true))]
+    /// A prepared export may carry a zero-input `preparation` program. Pass
+    /// its checked tensor results after the declared arguments of the score.
+    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu", sufficient_statistics=true, prepare_fixed_data=false))]
     #[allow(clippy::too_many_arguments)]
     fn export(
         &self,
@@ -762,6 +764,7 @@ impl NativeModule {
         batch: Option<BatchArguments>,
         target: &str,
         sufficient_statistics: bool,
+        prepare_fixed_data: bool,
     ) -> PyResult<String> {
         let dtype = match dtype {
             "float32" => Dtype::F32,
@@ -785,12 +788,13 @@ impl NativeModule {
             check_parameters: true,
             sufficient_statistics,
         };
+        let batch = batch.map(|(shape, input_axes)| BatchSpec { shape, input_axes });
         let exported = py
-            .detach(|| match batch {
-                Some((shape, input_axes)) => self
-                    .inner
-                    .compile_batched(&options, &BatchSpec { shape, input_axes }),
-                None => self.inner.compile(&options),
+            .detach(|| match (batch.as_ref(), prepare_fixed_data) {
+                (Some(batch), true) => self.inner.compile_batched_prepared(&options, batch),
+                (Some(batch), false) => self.inner.compile_batched(&options, batch),
+                (None, true) => self.inner.compile_prepared(&options),
+                (None, false) => self.inner.compile(&options),
             })
             .map_err(error)?;
         Ok(serde_json::to_string(&exported).expect("exports contain only JSON values"))

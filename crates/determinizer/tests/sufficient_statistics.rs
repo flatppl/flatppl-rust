@@ -497,6 +497,46 @@ fn grouped_gathers_prepare_only_occupied_partitions() {
 }
 
 #[test]
+fn fixed_groups_share_one_score_per_shape_in_ordinary_and_prepared_queries() {
+    let source = "mu=elementof(cartpow(reals,6))\ns=elementof(posreals)\ng=[4,1,3,4,2,5,1,4,3]\ninputs=(mu,s)\noutputs=logdensityof(Normal.(mu[g],s),[1.0,-2.0,3.0,2.0,0.0,-1.0,1.5,4.0,5.0])";
+    let ordinary = lower(source, true);
+    let prepared = prepare_unpacked(&lower(source, false), &[]);
+    assert_eq!(summary_count(&ordinary), prepared.summaries.len());
+    for module in [ordinary, prepared.score] {
+        let source = flatppl_syntax::print(&module);
+        // Groups 4, 1 and 3 use moments. Groups 2 and 5 are primitive
+        // singleton scores. Group 6 is unused.
+        assert_eq!(
+            source.matches("builtin_logdensityof").count(),
+            2,
+            "{source}"
+        );
+        let wire = flatppl_flatpir::try_write(&module).unwrap();
+        let mut restored = flatppl_flatpir::read(&wire).unwrap();
+        flatppl_infer::infer(&mut restored);
+        assert!(flatppl_determinizer::is_flatpdl(&restored).is_ok());
+    }
+}
+
+#[test]
+fn a_shared_record_retains_its_scalar_group_scores() {
+    // The two moment scores share the same parameter record. The other two
+    // groups have separate parameters and can still batch their singleton scores.
+    let source = "a=elementof(reals)\nb=elementof(reals)\nc=elementof(reals)\nloc=[a,a,b,c]\ng=[1,3,2,4,2,1,1]\ninputs=(a,b,c)\noutputs=logdensityof(Normal.(loc[g],1.0),[1.0,2.0,3.0,4.0,2.1,5.0,3.0])";
+    let reduced = flatppl_syntax::print(&lower(source, true));
+    assert_eq!(
+        reduced.matches("builtin_logdensityof(").count(),
+        2,
+        "{reduced}"
+    );
+    assert_eq!(
+        reduced.matches("builtin_logdensityof.(").count(),
+        1,
+        "{reduced}"
+    );
+}
+
+#[test]
 fn grouped_scalar_families_reuse_their_ordinary_guards() {
     for (law, event) in [
         ("LogNormal.(a[g],b[g])", "interval(0.1,10)"),

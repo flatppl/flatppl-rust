@@ -25,6 +25,11 @@ pub struct Export {
     /// Device-side error status, separate from the authored output structure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<RuntimeStatus>,
+    /// Run this zero-input query once per binding and check its runtime status.
+    /// Pass its tensor results in order after the leaves of `inputs` on every
+    /// score call. They are shared across any batch dimensions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<Box<Export>>,
 }
 
 #[derive(Serialize)]
@@ -79,7 +84,7 @@ struct Leaf {
 
 pub fn emit_query(
     mut module: Module,
-    source: &Module,
+    source: Option<&Module>,
     options: &EmitOptions,
     batch: Option<&BatchSpec>,
 ) -> Result<Export, EmitError> {
@@ -139,17 +144,8 @@ pub fn emit_query(
     }
     check_query_inputs(&module, &[output_node], &names, &[])?;
     let roots = input_roots(&module, &names);
-    let mut arguments = Vec::new();
-    let mut inputs = Vec::new();
-    for (name, node) in &declared {
-        let ty = inferred(&module, *node)?;
-        let value = layout(&mut module, *node, ty, &roots, true, dtype, &mut arguments)?;
-        inputs.push(Field {
-            name: name.clone(),
-            value,
-        });
-    }
     // Canonicalization may inline output bindings. Describe their authored names.
+    let source = source.unwrap_or(&module);
     let declared_output = binding(source, "outputs")
         .ok_or_else(|| EmitError::whole("declare at least one output"))?;
     let multiple_outputs = builtin(source, declared_output, "tuple");
@@ -160,6 +156,16 @@ pub fn emit_query(
             _ => None,
         })
         .collect();
+    let mut arguments = Vec::new();
+    let mut inputs = Vec::new();
+    for (name, node) in &declared {
+        let ty = inferred(&module, *node)?;
+        let value = layout(&mut module, *node, ty, &roots, true, dtype, &mut arguments)?;
+        inputs.push(Field {
+            name: name.clone(),
+            value,
+        });
+    }
     let output_type = inferred(&module, output_node)?;
     let mut results = Vec::new();
     let mut output = layout(
@@ -303,7 +309,62 @@ pub fn emit_query(
         output_names,
         batch_shape: batch.map_or_else(Vec::new, |batch| batch.shape.clone()),
         runtime_status,
+        preparation: None,
     })
+}
+
+pub(crate) fn emit_prepared(
+    prepared: flatppl_determinizer::PreparedLikelihood,
+    source: &Module,
+    options: &EmitOptions,
+    batch: Option<&BatchSpec>,
+) -> Result<Export, EmitError> {
+    let preparation = emit_query(prepared.preparation, None, options, None)?;
+    let outputs = match &preparation.output {
+        Schema::Tuple { items } => items.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+    let summaries = &prepared.summaries;
+    if !preparation.inputs.is_empty() || outputs.len() != summaries.len() {
+        return Err(EmitError::whole("invalid fixed-data preparation signature"));
+    }
+    let mut score = emit_query(prepared.score, Some(source), options, batch)?;
+    let declared = score
+        .inputs
+        .len()
+        .checked_sub(summaries.len())
+        .ok_or_else(|| EmitError::whole("the score lacks its summary inputs"))?;
+    for ((field, name), output) in score.inputs[declared..].iter().zip(summaries).zip(outputs) {
+        let (
+            Schema::Tensor {
+                index,
+                dtype,
+                shape,
+                ..
+            },
+            Schema::Tensor {
+                dtype: result_dtype,
+                shape: result_shape,
+                ..
+            },
+        ) = (&field.value, output)
+        else {
+            return Err(EmitError::whole("each prepared summary must be a tensor"));
+        };
+        if batch.is_some_and(|batch| batch.input_axes[*index].iter().any(Option::is_some)) {
+            return Err(EmitError::whole(
+                "prepared summaries must be unmapped across batch dimensions",
+            ));
+        }
+        if field.name != *name || dtype != result_dtype || shape != result_shape {
+            return Err(EmitError::whole(format!(
+                "prepared summary {name} does not match its score argument"
+            )));
+        }
+    }
+    score.inputs.truncate(declared);
+    score.preparation = Some(Box::new(preparation));
+    Ok(score)
 }
 
 fn bind_inputs(

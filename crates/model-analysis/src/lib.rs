@@ -26,7 +26,7 @@ pub use normal_coordinates::{
 
 pub use sufficient_statistics::{
     GroupPartition, IidNormalPlan, PreparationError, PreparationOptions, PreparedLikelihood,
-    ReductionDecision, ReductionOutcome, ReductionReport, plan_iid_normal, prepare_likelihood,
-    prepare_likelihood_with_options, prepare_likelihood_with_report, sufficient_statistics,
-    sufficient_statistics_with_report,
+    ReductionDecision, ReductionOutcome, ReductionReport, plan_iid_normal,
+    prepare_fixed_likelihood, prepare_likelihood, prepare_likelihood_with_options,
+    prepare_likelihood_with_report, sufficient_statistics, sufficient_statistics_with_report,
 };
