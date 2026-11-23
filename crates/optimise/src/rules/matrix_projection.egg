@@ -1,0 +1,46 @@
+; Each index names a typed value at a StableHLO lowering site.
+(relation result (i64))
+(relation product (i64 i64 i64))
+(relation multiply (i64 i64 i64))
+(relation one-hot-rows (i64 i64 i64))
+(relation real-matrix (i64 i64 i64))
+(relation ones (i64 i64))
+(relation sum-tree (i64 i64 i64))
+
+(relation project-rows (i64 i64 i64 i64 i64 i64))
+(relation project-columns (i64 i64 i64 i64 i64 i64 i64))
+(relation paired-gather (i64 i64 i64))
+(ruleset matrix-projection)
+
+(rule ((product selected row matrix)
+       (one-hot-rows row observations rows)
+       (real-matrix matrix rows columns))
+      ((project-rows selected matrix row observations rows columns))
+      :ruleset matrix-projection)
+
+(rule ((multiply masked selected col)
+       (project-rows selected matrix row observations rows columns)
+       (one-hot-rows col observations columns))
+      ((project-columns masked matrix row col observations rows columns))
+      :ruleset matrix-projection)
+
+(rule ((multiply masked col selected)
+       (project-rows selected matrix row observations rows columns)
+       (one-hot-rows col observations columns))
+      ((project-columns masked matrix row col observations rows columns))
+      :ruleset matrix-projection)
+
+; Compare the dense contraction with one finite check per input cell and
+; a gather through the sibling sums for each output. The emitter supplies
+; bounded literal dimensions.
+(rule ((result out)
+       (product out masked weights)
+       (project-columns masked matrix row col observations rows columns)
+       (ones weights columns)
+       (sum-tree matrix padded levels)
+       (> rows 1)
+       (> columns 1)
+       (>= (* (* observations rows) columns)
+           (* 2 (+ (* 2 padded) (* observations (+ levels 1))))))
+      ((paired-gather matrix row col))
+      :ruleset matrix-projection)

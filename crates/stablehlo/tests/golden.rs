@@ -10063,6 +10063,69 @@ outputs = lp
     assert!(is_delimiter_balanced(&out));
 }
 
+#[test]
+fn fixed_paired_matrix_selection_keeps_a_dense_exceptional_branch() {
+    let source = "\
+flatppl_compat = \"0.1\"
+a = elementof(cartpow(reals, [4, 5]))
+row = [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4]
+col = [4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3]
+rlevel = [1, 2, 3, 4]
+clevel = [1, 2, 3, 4, 5]
+rows = ifelse.(addaxes(row, 0, 1) .== addaxes(rlevel, 1, 0), 1.0, 0.0)
+cols = ifelse.(addaxes(col, 0, 1) .== addaxes(clevel, 1, 0), 1.0, 0.0)
+inputs = a
+outputs = ((rows * a) .* cols) * ones(5)
+";
+    let emit = |src: &str, target| {
+        let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+        flatppl_stablehlo::emit(
+            &d,
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions {
+                target,
+                ..Default::default()
+            },
+        )
+        .expect("valid projection")
+    };
+    use flatppl_stablehlo::Target;
+
+    for src in [
+        source.to_owned(),
+        source.replace("(rows * a) .* cols", "cols .* (rows * a)"),
+    ] {
+        let hlo = emit(&src, Target::Cpu);
+        let (guard, branches) = hlo.split_once("\"stablehlo.if\"").expect("finite guard");
+        assert!(guard.contains("stablehlo.compare LE"));
+        let (fast, dense) = branches.split_once("}, {").expect("two branches");
+        assert!(fast.contains("stablehlo.gather"));
+        assert!(!fast.contains("stablehlo.dot_general"));
+        assert_eq!(dense.matches("stablehlo.dot_general").count(), 2);
+    }
+
+    for (src, target) in [
+        (source.to_owned(), Target::Gpu),
+        (
+            source.replace("outputs = ", "projected = ") + "outputs = (projected .+ 2.0)[1]\n",
+            Target::Cpu,
+        ),
+        (
+            source.replace("inputs = a", "inputs = (a, cols)"),
+            Target::Cpu,
+        ),
+        (source.replace("col = [4, 1", "col = [6, 1"), Target::Cpu),
+        (
+            source.replace("* ones(5)", "* [1.0, 1.0, 1.0, 1.0, 2.0]"),
+            Target::Cpu,
+        ),
+    ] {
+        let hlo = emit(&src, target);
+        assert!(!hlo.contains("\"stablehlo.if\""));
+        assert!(hlo.matches("stablehlo.dot_general").count() >= 2);
+    }
+}
+
 // ---- §07 transpose/adjoint and the transposed-vector products ---------------
 //
 // §07 "Linear algebra": "Matrix multiplication and addition use the standard `*`

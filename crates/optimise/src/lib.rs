@@ -5,6 +5,7 @@ mod demand;
 mod engine;
 mod fixed_poisson;
 mod gaussian;
+mod matrix_projection;
 mod ordered_scan;
 mod outputs;
 mod project;
@@ -12,6 +13,7 @@ mod selectors;
 mod types;
 
 use flatppl_core::{Module, Symbol};
+pub use matrix_projection::{MatrixProjection, MatrixProjectionFact, plan_matrix_projection};
 pub use ordered_scan::ordered_scan_width;
 
 /// The shared language and each emitter have separate rule schedules.

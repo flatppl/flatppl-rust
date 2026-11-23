@@ -1774,6 +1774,9 @@ pub(crate) fn lower_bare_arith<'m>(
 /// and this is the only caller that reaches them from surface `*`.
 fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [a, b] = args_exact(id, args)?;
+    if let Some(value) = e.lower_matrix_projection(id, a, b) {
+        return Ok(value);
+    }
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
     let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (e.cell_ty(&a), e.cell_ty(&b)) else {

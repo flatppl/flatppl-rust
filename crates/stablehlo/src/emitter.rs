@@ -67,6 +67,9 @@ mod lu;
 mod matrix_eigen;
 #[path = "matrix_exp.rs"]
 mod matrix_exp;
+#[path = "matrix_projection.rs"]
+mod matrix_projection;
+
 #[path = "matrix_svd.rs"]
 mod matrix_svd;
 #[path = "packed_gathers.rs"]
