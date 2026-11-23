@@ -1,6 +1,7 @@
 //! Standard-module entry points for Hermitian eigenpairs and factor solves.
 
 use super::*;
+use flatppl_core::ScalarType;
 
 type Pair = (Value, Value);
 
@@ -38,8 +39,12 @@ impl Emitter<'_> {
         } else {
             None
         };
-        let mut result =
-            self.matrix_hermitian(id, (values[0].clone(), values[1].clone()), vectors)?;
+        let real = matches!(
+            self.type_of(arg),
+            Some(Type::Array { elem, .. }) if matches!(elem.as_ref(), Type::Scalar(ScalarType::Real | ScalarType::Integer))
+        );
+        let [re, im] = values;
+        let mut result = self.matrix_hermitian(id, (re, im), vectors, real)?;
         if let Some(parent) = parent {
             let frame = self.broadcast_frame.clone();
             result.values = self.finish_broadcast(&result.values, &frame, parent.len());
