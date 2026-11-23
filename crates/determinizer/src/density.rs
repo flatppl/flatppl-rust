@@ -5000,10 +5000,10 @@ fn gate_density(m: &mut Module, cond: NodeId, density: NodeId) -> NodeId {
 /// point in every cell, sized off the query point `v` so a dynamic length is covered
 /// too.
 ///
-/// `None` where the support or the variate names no such point (a record or table
-/// variate, an unproven support): no sanitisation then.
+/// `None` when no such point can be derived from the support and variate.
 fn support_witness_point(m: &mut Module, measure: NodeId, v: NodeId) -> Option<NodeId> {
-    if let Some([xlo, xhi, ylo, yhi]) = integral::rectangular_bounds(m, measure) {
+    if let Some(rectangle) = integral::rectangular_bounds(m, measure) {
+        let [xlo, xhi, ylo, yhi] = rectangle.bounds;
         let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
         let midpoint = |m: &mut Module, lo, hi| {
             let a = build_call(m, "mul", &[half, lo]);
@@ -5012,7 +5012,7 @@ fn support_witness_point(m: &mut Module, measure: NodeId, v: NodeId) -> Option<N
         };
         let x = midpoint(m, xlo, xhi);
         let y = midpoint(m, ylo, yhi);
-        return Some(build_call(m, "vector", &[x, y]));
+        return Some(rectangle.variate(m, [x, y]));
     }
     let (ty, support) = match (m.type_of(measure), m.valueset_of(measure)) {
         (Some(ty), Some(support))
@@ -7796,7 +7796,10 @@ fn lower_lebesgue(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
             )
         })?
     };
-    let cond = if let Some([xlo, xhi, ylo, yhi]) = integral::rectangular_support_bounds(m, support)
+    let cond = if let Some(integral::Rectangle {
+        bounds: [xlo, xhi, ylo, yhi],
+        fields: None,
+    }) = integral::rectangular_support_bounds(m, support)
     {
         // A broadcast can bind numeric endpoints, but its cells cannot take
         // the set itself as an argument. Keep the membership structure here.

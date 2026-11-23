@@ -338,10 +338,11 @@ fn lebesgue_mass(
             axes.extend([x, lo, hi]);
             x
         } else {
-            let [xlo, xhi, ylo, yhi] = rectangle.expect("a rectangle or interval was verified");
+            let rectangle = rectangle.expect("a rectangle or interval was verified");
+            let [xlo, xhi, ylo, yhi] = rectangle.bounds;
             let y = point(m);
             axes.extend([x, xlo, xhi, y, ylo, yhi]);
-            build_call(m, "vector", &[x, y])
+            rectangle.variate(m, [x, y])
         };
         let body = if !parameters.is_empty() || weight_is_variate_dependent(m, weight) {
             let body = build_callback_call(m, weight, coordinates, &parameters)?;
@@ -361,19 +362,35 @@ fn lebesgue_mass(
     })())
 }
 
+pub(super) struct Rectangle {
+    pub(super) bounds: [NodeId; 4],
+    pub(super) fields: Option<[Symbol; 2]>,
+}
+
+impl Rectangle {
+    pub(super) fn variate(&self, m: &mut Module, coordinates: [NodeId; 2]) -> NodeId {
+        match self.fields {
+            Some([x, y]) => build_record(m, &[(x, coordinates[0]), (y, coordinates[1])]),
+            None => build_call(m, "vector", &coordinates),
+        }
+    }
+}
+
 /// Preserve live bounds so quadrature can differentiate through their limits.
-pub(super) fn rectangular_bounds(m: &Module, measure: NodeId) -> Option<[NodeId; 4]> {
+pub(super) fn rectangular_bounds(m: &Module, measure: NodeId) -> Option<Rectangle> {
     let (measure, _) = resolve_ref_chain(m, measure);
     let base = expect_builtin_call(m, measure, "Lebesgue")?;
     let support = named_or_positional(m, base, "support")?;
     rectangular_support_bounds(m, support)
 }
 
-pub(super) fn rectangular_support_bounds(m: &Module, support: NodeId) -> Option<[NodeId; 4]> {
+pub(super) fn rectangular_support_bounds(m: &Module, support: NodeId) -> Option<Rectangle> {
     let (support, _) = resolve_ref_chain(m, support);
     let product = expect_builtin_call(m, support, "cartprod")?;
-    let (&[x, y], true) = (product.args.as_ref(), product.named.is_empty()) else {
-        return None;
+    let (x, y, fields) = match (product.args.as_ref(), product.named.as_ref()) {
+        (&[x, y], []) => (x, y, None),
+        ([], [x, y]) if x.name != y.name => (x.value, y.value, Some([x.name, y.name])),
+        _ => return None,
     };
     let interval = |node| {
         let (node, _) = resolve_ref_chain(m, node);
@@ -388,7 +405,10 @@ pub(super) fn rectangular_support_bounds(m: &Module, support: NodeId) -> Option<
     };
     let [xlo, xhi] = interval(x)?;
     let [ylo, yhi] = interval(y)?;
-    Some([xlo, xhi, ylo, yhi])
+    Some(Rectangle {
+        bounds: [xlo, xhi, ylo, yhi],
+        fields,
+    })
 }
 
 /// Integrate the raw callback of a weighted scalar reference. Unlike a log
