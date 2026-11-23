@@ -66,6 +66,25 @@ fn hermitian_values_and_vector_columns_retain_batch_axes() {
 }
 
 #[test]
+fn unbatched_real_jacobi_rotates_rows_and_columns_in_the_upper_triangle() {
+    for output in ["e.eigh(A).vectors", "e.eigvalsh(A)"] {
+        let ir = emit(&format!(
+            "e=standard_module(\"ext-linear-algebra\",\"0.1\")\n\
+             A=external(cartpow(reals,[5,5]))\ninputs=A\noutputs={output}"
+        ));
+        assert!(ir.contains("dense<10> : tensor<i64>")); // 5 × 4 / 2 pairs
+        assert!(ir.lines().any(|line| {
+            line.contains("stablehlo.gather") && line.ends_with("-> tensor<5x2xf32>")
+        }));
+        for shape in ["tensor<5x1xf32>", "tensor<1x5xf32>"] {
+            assert!(ir.lines().any(|line| {
+                line.contains("stablehlo.dynamic_update_slice") && line.contains(shape)
+            }));
+        }
+    }
+}
+
+#[test]
 fn empty_rank_is_an_authored_output_even_when_status_has_the_same_ssa() {
     let ir = emit(
         "e=standard_module(\"ext-linear-algebra\",\"0.1\")\n\

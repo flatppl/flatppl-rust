@@ -65,11 +65,195 @@ impl Emitter<'_> {
         self.reduce_sum_last_axis(&value)
     }
 
+    /// The scaled Jacobi tangent avoids squaring a large diagonal difference.
+    fn jacobi_rotation(
+        &mut self,
+        difference: &Value,
+        coupling: &Value,
+        active: &Value,
+    ) -> (Value, Value, Value) {
+        let one = self.scalar(1.0);
+        let zero = self.scalar(0.0);
+        let safe_gamma = self.select(active, coupling, &one);
+        let two = self.scalar(2.0);
+        let twice_gamma = self.mul(&two, &safe_gamma);
+        let magnitude = self.abs(difference);
+        let coupling_magnitude = self.abs(&twice_gamma);
+        let scale = self.max(&magnitude, &coupling_magnitude);
+        let d = self.div(&magnitude, &scale);
+        let g = self.div(&twice_gamma, &scale);
+        let d2 = self.mul(&d, &d);
+        let g2 = self.mul(&g, &g);
+        let radius = self.add(&d2, &g2);
+        let radius = self.sqrt(&radius);
+        let denominator = self.add(&d, &radius);
+        let tangent = self.div(&g, &denominator);
+        let negative = self.compare("LT", difference, &zero);
+        let minus_tangent = self.neg(&tangent);
+        let tangent = self.select(&negative, &minus_tangent, &tangent);
+        let tangent = self.select(active, &tangent, &zero);
+        let t2 = self.mul(&tangent, &tangent);
+        let norm = self.add(&one, &t2);
+        let norm = self.sqrt(&norm);
+        let cosine = self.div(&one, &norm);
+        (cosine, tangent, safe_gamma)
+    }
+
+    fn jacobi_panel_entry(&mut self, panel: &Value, row: &Value, col: &Value) -> Value {
+        let ty = MlirTy::Ranked(vec![Some(1), Some(1)]);
+        let panel_ty = panel.ty.render(self.dtype, panel.elem);
+        let slice_ty = ty.render(self.dtype, panel.elem);
+        let index_ty = row.ty.render(self.dtype, row.elem);
+        let ssa = self.pure(format!(
+            "stablehlo.dynamic_slice {}, {}, {}, sizes = [1, 1] : ({panel_ty}, {index_ty}, {index_ty}) -> {slice_ty}",
+            panel.ssa, row.ssa, col.ssa,
+        ));
+        let entry = Value {
+            ssa,
+            ty,
+            elem: panel.elem,
+        };
+        self.reshape(&entry, MlirTy::Scalar)
+    }
+
+    fn jacobi_update(&mut self, a: &Value, v: &Value, start: [&Value; 2]) -> Value {
+        let [row, col] = start;
+        let matrix_ty = a.ty.render(self.dtype, a.elem);
+        let slice_ty = v.ty.render(self.dtype, v.elem);
+        let index_ty = row.ty.render(self.dtype, row.elem);
+        let ssa = self.pure(format!(
+            "stablehlo.dynamic_update_slice {}, {}, {}, {} : ({matrix_ty}, {slice_ty}, {index_ty}, {index_ty}) -> {matrix_ty}",
+            a.ssa, v.ssa, row.ssa, col.ssa,
+        ));
+        Value { ssa, ..a.clone() }
+    }
+
+    fn rotate_columns(
+        &mut self,
+        panel: &Value,
+        n: u64,
+        cosine: &Value,
+        sine: &Value,
+    ) -> (Value, Value) {
+        let x = self.slice(panel, &[0, 0], &[n, 1], &[1, 1]);
+        let y = self.slice(panel, &[0, 1], &[n, 2], &[1, 1]);
+        let cx = self.mul(cosine, &x);
+        let sy = self.mul(sine, &y);
+        let sx = self.mul(sine, &x);
+        let cy = self.mul(cosine, &y);
+        (self.sub(&cx, &sy), self.add(&sx, &cy))
+    }
+
+    fn symmetric_jacobi(
+        &mut self,
+        n: u64,
+        a: &Value,
+        vectors: Option<&Value>,
+        epsilon: f64,
+    ) -> Vec<Value> {
+        let mut matrices = vec![a.clone()];
+        matrices.extend(vectors.cloned());
+        if n > 1 {
+            let zero = self.int_value_const(0);
+            let one = self.int_value_const(1);
+            let limit = self.int_value_const(n as i64);
+            let eps = self.scalar(epsilon);
+            let tolerance = self.scalar(64.0 * n as f64 * epsilon);
+            let rows = self.axis_indices(a, 0);
+            let cols = self.axis_indices(a, 1);
+            let diagonal = self.compare("EQ", &rows, &cols);
+            let zero_real = self.scalar(0.0);
+            matrices.push(self.bool_value_const(true));
+            matrices = self.matrix_loop(32, 0, &matrices, |e, _, state| {
+                let (unfinished, matrices) = state.split_last().unwrap();
+                e.matrix_if_values(unfinished, state, |e| {
+                    // One final sweep after reaching the rotation tolerance retains
+                    // the tangent of a separated eigenvector at exactly zero coupling.
+                    let magnitude = e.abs(&matrices[0]);
+                    let off = e.select(&diagonal, &zero_real, &magnitude);
+                    let off = e.reduce_max(&off);
+                    let unfinished = e.compare("GT", &off, &eps);
+                    // Visit the strict upper triangle in row-major order.
+                    let mut initial = vec![zero.clone(), one.clone()];
+                    initial.extend_from_slice(matrices);
+                    let result = e.matrix_loop(n * (n - 1) / 2, 0, &initial, |e, _, state| {
+                        let (p, q, a) = (&state[0], &state[1], &state[2]);
+                        // Keep only these columns live on the reverse-loop tape.
+                        let indices = e.vector(&[p.clone(), q.clone()]);
+                        let panel = e.gather_axis(a, &indices, 0, 1);
+                        let alpha = e.jacobi_panel_entry(&panel, p, &zero);
+                        let beta = e.jacobi_panel_entry(&panel, q, &one);
+                        let gamma = e.jacobi_panel_entry(&panel, p, &one);
+                        let absolute = e.abs(&gamma);
+                        let difference = e.sub(&beta, &alpha);
+                        let gap = e.abs(&difference);
+                        let coupled = e.compare("GT", &absolute, &eps);
+                        let separated = e.compare("GT", &gap, &tolerance);
+                        let active = e.or(&coupled, &separated);
+                        // The signed tangent is smooth at zero coupling for a separated
+                        // diagonal pair. Its derivative rotates the corresponding eigenspaces.
+                        let (c, t, _) = e.jacobi_rotation(&difference, &gamma, &active);
+                        let s = e.mul(&c, &t);
+                        let (cp, cq) = ([&zero, p], [&zero, q]);
+                        let (x, y) = e.rotate_columns(&panel, n, &c, &s);
+                        // Gᵀ A G has symmetric rows and columns. The pivot block
+                        // becomes diag(α − tγ, β + tγ) on an active rotation.
+                        let shift = e.mul(&t, &gamma);
+                        let alpha = e.sub(&alpha, &shift);
+                        let beta = e.add(&beta, &shift);
+                        let origin = e.scalar(0.0);
+                        let off = e.select(&active, &origin, &gamma);
+                        let rows = e.axis_indices(&x, 0);
+                        let at_p = e.compare("EQ", &rows, p);
+                        let at_q = e.compare("EQ", &rows, q);
+                        let x = e.select(&at_p, &alpha, &x);
+                        let x = e.select(&at_q, &off, &x);
+                        let y = e.select(&at_p, &off, &y);
+                        let y = e.select(&at_q, &beta, &y);
+                        let a = e.jacobi_update(a, &x, cp);
+                        let a = e.jacobi_update(&a, &y, cq);
+                        let xr = e.transpose(&x, &[1, 0]);
+                        let yr = e.transpose(&y, &[1, 0]);
+                        let a = e.jacobi_update(&a, &xr, [p, &zero]);
+                        let both = e.jacobi_update(&a, &yr, [q, &zero]);
+                        let next_q = e.add(q, &one);
+                        let end_row = e.compare("EQ", &next_q, &limit);
+                        let next_p = e.add(p, &one);
+                        let first_q = e.add(&next_p, &one);
+                        let mut next = vec![
+                            e.select(&end_row, &next_p, p),
+                            e.select(&end_row, &first_q, &next_q),
+                            both,
+                        ];
+                        if let Some(v) = state.get(3) {
+                            let panel = e.gather_axis(v, &indices, 0, 1);
+                            let (x, y) = e.rotate_columns(&panel, n, &c, &s);
+                            let v = e.jacobi_update(v, &x, cp);
+                            next.push(e.jacobi_update(&v, &y, cq));
+                        }
+                        next
+                    });
+                    result.into_iter().skip(2).chain([unfinished]).collect()
+                })
+            });
+            matrices.pop();
+        }
+        // Return the same component layout as the Hermitian iteration.
+        matrices
+            .into_iter()
+            .flat_map(|v| {
+                let zero = self.constant_like(0.0, &v);
+                [v, zero]
+            })
+            .collect()
+    }
+
     pub(super) fn matrix_hermitian(
         &mut self,
         id: NodeId,
         input: Pair,
         vectors: bool,
+        real: bool,
     ) -> Result<HermitianEigen, EmitError> {
         let MlirTy::Ranked(dims) = self.cell_ty(&input.0) else {
             return Err(EmitError::at(
@@ -143,78 +327,65 @@ impl Emitter<'_> {
         if vectors {
             initial.extend([identity.clone(), zero_matrix]);
         }
-        let result = self.matrix_loop(32, 0, &initial, |e, _, state| {
-            e.matrix_loop(n * n, 0, state, |e, index, state| {
-                let state: Vec<_> = state.iter().map(|v| e.axes_view(v, axes.clone())).collect();
-                let size = e.int_value_const(n as i64);
-                let p = e.trunc_div(index, &size);
-                let q = e.rem(index, &size);
-                let a = (state[0].clone(), state[1].clone());
-                let alpha = e.hermitian_entry(&a.0, &p, &p);
-                let beta = e.hermitian_entry(&a.0, &q, &q);
-                let gamma = (
-                    e.hermitian_entry(&a.0, &p, &q),
-                    e.hermitian_entry(&a.1, &p, &q),
-                );
-                let gr = e.abs(&gamma.0);
-                let gi = e.abs(&gamma.1);
-                let gamma_scale = e.max(&gr, &gi);
-                let nonzero = e.compare("GT", &gamma_scale, &zero);
-                let safe = e.select(&nonzero, &gamma_scale, &one);
-                let gr = e.div(&gamma.0, &safe);
-                let gi = e.div(&gamma.1, &safe);
-                let gr2 = e.mul(&gr, &gr);
-                let gi2 = e.mul(&gi, &gi);
-                let norm2 = e.add(&gr2, &gi2);
-                let absolute = e.svd_safe_sqrt(&norm2);
-                let absolute = e.mul(&absolute, &gamma_scale);
-                let eps = e.scalar(epsilon);
-                let correlated = e.compare("GT", &absolute, &eps);
-                let ordered = e.compare("LT", &p, &q);
-                let active = e.and(&ordered, &correlated);
-                let safe_gamma = e.select(&active, &absolute, &one);
-                let difference = e.sub(&beta, &alpha);
-                let two = e.scalar(2.0);
-                let twice_gamma = e.mul(&two, &safe_gamma);
-                let magnitude = e.abs(&difference);
-                let rotation_scale = e.max(&magnitude, &twice_gamma);
-                let d = e.div(&magnitude, &rotation_scale);
-                let g = e.div(&twice_gamma, &rotation_scale);
-                let d2 = e.mul(&d, &d);
-                let g2 = e.mul(&g, &g);
-                let radius = e.add(&d2, &g2);
-                let radius = e.sqrt(&radius);
-                let denominator = e.add(&d, &radius);
-                let tangent = e.div(&g, &denominator);
-                let negative = e.compare("LT", &difference, &zero);
-                let minus_tangent = e.neg(&tangent);
-                let tangent = e.select(&negative, &minus_tangent, &tangent);
-                let tangent = e.select(&active, &tangent, &zero);
-                let t2 = e.mul(&tangent, &tangent);
-                let norm = e.add(&one, &t2);
-                let norm = e.sqrt(&norm);
-                let cosine = e.div(&one, &norm);
-                let sine = e.mul(&cosine, &tangent);
-                let phase = (e.div(&gamma.0, &safe_gamma), e.div(&gamma.1, &safe_gamma));
-                let right = e.svd_rotate(&a, &p, &q, &cosine, &sine, &phase);
-                let adjoint = e.hermitian_adjoint(&right);
-                let both = e.svd_rotate(&adjoint, &p, &q, &cosine, &sine, &phase);
-                let both = e.hermitian_adjoint(&both);
-                let mut next = vec![both.0, both.1];
-                if vectors {
-                    let v = e.svd_rotate(
-                        &(state[2].clone(), state[3].clone()),
-                        &p,
-                        &q,
-                        &cosine,
-                        &sine,
-                        &phase,
+        let local = real && batch == 0;
+        let result = if local {
+            self.symmetric_jacobi(n, &initial[0], initial.get(2), epsilon)
+        } else {
+            self.matrix_loop(32, 0, &initial, |e, _, state| {
+                e.matrix_loop(n * n, 0, state, |e, index, state| {
+                    let state: Vec<_> =
+                        state.iter().map(|v| e.axes_view(v, axes.clone())).collect();
+                    let size = e.int_value_const(n as i64);
+                    let p = e.trunc_div(index, &size);
+                    let q = e.rem(index, &size);
+                    let a = (state[0].clone(), state[1].clone());
+                    let alpha = e.hermitian_entry(&a.0, &p, &p);
+                    let beta = e.hermitian_entry(&a.0, &q, &q);
+                    let gamma = (
+                        e.hermitian_entry(&a.0, &p, &q),
+                        e.hermitian_entry(&a.1, &p, &q),
                     );
-                    next.extend([v.0, v.1]);
-                }
-                next
+                    let gr = e.abs(&gamma.0);
+                    let gi = e.abs(&gamma.1);
+                    let gamma_scale = e.max(&gr, &gi);
+                    let nonzero = e.compare("GT", &gamma_scale, &zero);
+                    let safe = e.select(&nonzero, &gamma_scale, &one);
+                    let gr = e.div(&gamma.0, &safe);
+                    let gi = e.div(&gamma.1, &safe);
+                    let gr2 = e.mul(&gr, &gr);
+                    let gi2 = e.mul(&gi, &gi);
+                    let norm2 = e.add(&gr2, &gi2);
+                    let absolute = e.svd_safe_sqrt(&norm2);
+                    let absolute = e.mul(&absolute, &gamma_scale);
+                    let eps = e.scalar(epsilon);
+                    let correlated = e.compare("GT", &absolute, &eps);
+                    let ordered = e.compare("LT", &p, &q);
+                    let active = e.and(&ordered, &correlated);
+                    let difference = e.sub(&beta, &alpha);
+                    let (cosine, tangent, safe_gamma) =
+                        e.jacobi_rotation(&difference, &absolute, &active);
+                    let sine = e.mul(&cosine, &tangent);
+                    let phase = (e.div(&gamma.0, &safe_gamma), e.div(&gamma.1, &safe_gamma));
+                    let right = e.svd_rotate(&a, &p, &q, &cosine, &sine, &phase);
+                    let adjoint = e.hermitian_adjoint(&right);
+                    let both = e.svd_rotate(&adjoint, &p, &q, &cosine, &sine, &phase);
+                    let both = e.hermitian_adjoint(&both);
+                    let mut next = vec![both.0, both.1];
+                    if vectors {
+                        let v = e.svd_rotate(
+                            &(state[2].clone(), state[3].clone()),
+                            &p,
+                            &q,
+                            &cosine,
+                            &sine,
+                            &phase,
+                        );
+                        next.extend([v.0, v.1]);
+                    }
+                    next
+                })
             })
-        });
+        };
         let state: Vec<_> = result
             .iter()
             .map(|v| self.axes_view(v, axes.clone()))
@@ -244,7 +415,7 @@ impl Emitter<'_> {
         let sorted = self.compare("EQ", &ranks, &cols);
         let permutation = self.convert(&sorted, ElemKind::Real);
         let permutation_t = self.svd_transpose(&permutation);
-        let values = self.mul(&values, &scale);
+        let values = self.mul(&values, if local { &safe_scale } else { &scale });
         let values = self.matvec(&permutation_t, &values);
         let nan = self.scalar(f64::NAN);
         let values = self.select(&valid, &values, &nan);
