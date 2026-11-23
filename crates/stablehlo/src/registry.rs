@@ -2549,6 +2549,8 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let one = e.scalar(1.0);
 
     let n_minus_k = e.sub(&n, &v);
+    let no_successes = e.compare("EQ", &v, &zero);
+    let no_failures = e.compare("EQ", &n_minus_k, &zero);
     // logC(n, k) = -log1p(n) - log B(k + 1, n - k + 1): no large log-gammas cancel.
     let log_choose_nk = fixed_log_choose.unwrap_or_else(|| {
         let k_plus_one = e.add(&v, &one);
@@ -2556,7 +2558,10 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
         let log_beta = e.log_beta(&k_plus_one, &n_minus_k_plus_one);
         let log1p_n = e.log1p(&n);
         let neg_log1p_n = e.neg(&log1p_n);
-        e.sub(&neg_log1p_n, &log_beta)
+        let coefficient = e.sub(&neg_log1p_n, &log_beta);
+        // C(n, 0) and C(n, n) are one. Roundoff here can erase either logit tail.
+        let endpoint = e.or(&no_successes, &no_failures);
+        e.select(&endpoint, &zero, &coefficient)
     });
 
     if let Some(logit) = e.invlogit_operand(&prob) {
@@ -2569,13 +2574,11 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let prob = e.select(&supported, &prob, &half);
     // A zero exponent contributes log(1), even when its probability is zero.
     // Guard before log so its unused singular derivative cannot poison AD.
-    let no_successes = e.compare("EQ", &v, &zero);
     let safe_prob = e.select(&no_successes, &one, &prob);
     let log_p = e.log(&safe_prob);
     let k_log_p = e.mul(&v, &log_p);
 
     // log1p(-p), not log(1 - p), for the reason in [`beta_logpdf`].
-    let no_failures = e.compare("EQ", &n_minus_k, &zero);
     let safe_prob_complement = e.select(&no_failures, &zero, &prob);
     let neg_prob = e.neg(&safe_prob_complement);
     let log_one_minus_p = e.log1p(&neg_prob);
