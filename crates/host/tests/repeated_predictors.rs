@@ -196,3 +196,60 @@ fn fixed_normal_design_groups_repeated_instrument_calibrations()
     assert!(report.preparation_refusal.is_some());
     Ok(())
 }
+
+#[test]
+fn affine_fixed_record_uses_regression_statistics() -> Result<(), Box<dyn std::error::Error>> {
+    let path =
+        std::env::temp_dir().join(format!("flatppl-repeated-qr-{}.json", std::process::id()));
+    std::fs::write(&path, r#"{"x":[0,1,0,1,0,1],"y":[1,2,1.5,2.5,0.5,3]}"#)?;
+    let data = format!("load_data({path:?},cartprod(x=cartpow(reals,6),y=cartpow(reals,6)))");
+    let mut context = Context::default();
+    let query = context.parse(
+        &format!(
+            "a=elementof(reals)\nb=elementof(reals)\ns=elementof(posreals)\ndata={data}\n\
+         inputs=(a,b,s)\noutputs=logdensityof(Normal.(a .+ b .* data.x,s),data.y)"
+        ),
+        None,
+        None,
+    )?;
+    let report = context.analyze_query(&query, &[], true, true)?;
+    assert!(report.reductions.decisions.iter().any(|decision| matches!(
+        decision.outcome,
+        flatppl_host::ReductionOutcome::Reduced {
+            rule: "regression statistics",
+            ..
+        }
+    )));
+    let score = query.compile_prepared(&EmitOptions {
+        dtype: Dtype::F32,
+        ..Default::default()
+    })?;
+    let preparation = score.preparation.expect("fixed two-column QR preparation");
+    assert!(
+        matches!(preparation.output, flatppl_host::Schema::Tuple { items }
+        if items.iter().any(|item| matches!(item, flatppl_host::Schema::Tensor { shape, .. }
+            if shape == &[3, 3])))
+    );
+    for (mean, preparing) in [
+        ("a .+ b .* x", true),
+        ("exp.(a .+ b .* data.x)", false),
+        ("(a .+ b .* data.x) .* (b .+ a .* data.x)", false),
+    ] {
+        let source = format!(
+            "a=elementof(reals)\nb=elementof(reals)\ns=elementof(posreals)\n\
+             x=[0.0,1.0,0.0,1.0,0.0,1.0]\ndata={data}\ny=[1.0,2.0,1.5,2.5,0.5,3.0]\n\
+             inputs=(a,b,s)\noutputs=logdensityof(Normal.({mean},s),y)"
+        );
+        let query = context.parse(&source, None, None)?;
+        let report = context.analyze_query(&query, &[], preparing, true)?;
+        assert!(report.reductions.decisions.iter().any(|decision| matches!(
+            decision.outcome,
+            flatppl_host::ReductionOutcome::Reduced {
+                rule: "repeated predictor rows",
+                ..
+            }
+        )));
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}

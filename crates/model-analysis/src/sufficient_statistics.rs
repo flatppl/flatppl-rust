@@ -825,10 +825,8 @@ impl Reducer {
             self.count += 1;
             return Some(materialize(m, result));
         }
-        if let Some(result) = regression::reduce(self, m, id) {
-            self.rule = Some(("regression statistics", None));
-            self.count += 1;
-            return Some(materialize(m, result));
+        if let Some(result) = self.reduce_regression(m, id) {
+            return Some(result);
         }
         if let Some(result) = multivariate::reduce(self, m, id) {
             self.rule = Some(("multivariate statistics", None));
@@ -856,6 +854,13 @@ impl Reducer {
         let result = poisson::reduce(self, m, &factor)?;
         self.rule = Some(("centered Poisson statistics", None));
         Some(result)
+    }
+
+    fn reduce_regression(&mut self, m: &mut Module, id: NodeId) -> Option<NodeId> {
+        let result = regression::reduce(self, m, id)?;
+        self.rule = Some(("regression statistics", None));
+        self.count += 1;
+        Some(materialize(m, result))
     }
 
     fn reduce_moments(&mut self, m: &mut Module, id: NodeId) -> Option<NodeId> {

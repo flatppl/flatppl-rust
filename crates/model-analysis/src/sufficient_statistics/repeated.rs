@@ -53,6 +53,8 @@ struct Predictor {
     plans: Vec<Plan>,
     columns: Vec<Column>,
     visited: HashMap<NodeId, usize>,
+    projected_field: bool,
+    has_gather_or_nonlinearity: bool,
 }
 
 fn pointwise(name: &str) -> Option<&'static str> {
@@ -82,7 +84,9 @@ impl Predictor {
         count: u32,
         depth: usize,
     ) -> Option<usize> {
-        let id = resolve_record_field(m, id, &r.boundary);
+        let root = resolve(m, id, &r.boundary);
+        let id = resolve_record_field(m, root, &r.boundary);
+        self.projected_field |= root != id;
         if let Some(&plan) = self.visited.get(&id) {
             return Some(plan);
         }
@@ -131,6 +135,7 @@ impl Predictor {
                 return None;
             }
             let selector = self.visit(m, r, indices, count, depth + 1)?;
+            self.has_gather_or_nonlinearity = true;
             Plan::Gather(if origin == 0 { "get0" } else { "get" }, array, selector)
         } else {
             let c = call(m, id, "broadcast")?;
@@ -139,6 +144,12 @@ impl Predictor {
                 return None;
             };
             let operation = pointwise(m.resolve(*head))?;
+            let scalar_product =
+                operation == "mul" && args.iter().any(|&v| r.scalar(m, v).is_some());
+            if !matches!(operation, "add" | "sub" | "neg") && !scalar_product && !r.data_only(m, id)
+            {
+                self.has_gather_or_nonlinearity = true;
+            }
             let operands = args
                 .iter()
                 .map(|&value| self.visit(m, r, value, count, depth + 1))
@@ -257,6 +268,19 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
     }
     if rows.len() == count as usize {
         return None;
+    }
+    // Ordinary lowering precedes fixed-data preparation. Leave new scalar
+    // coefficient designs intact until preparation can try regression first.
+    if m.resolve(f.constructor) == "Normal"
+        && (predictor.projected_field || rows.len() > 64)
+        && !predictor.has_gather_or_nonlinearity
+    {
+        if !r.preparing {
+            return None;
+        }
+        if let Some(value) = r.reduce_regression(m, id) {
+            return Some(value);
+        }
     }
     let mut candidate = m.clone();
     let mut reducer = r.clone();
