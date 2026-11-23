@@ -2418,21 +2418,40 @@ pub(crate) fn horner(e: &mut Emitter, t: &Value, coeffs: &[f64]) -> Value {
 // a per-observation formula built from arithmetic on `v` — see
 // [`categorical_logpdf`]'s doc comment.
 
+/// The smaller outcome probability q = invlogit(-|z|) is at most 1/2.
+/// The more likely outcome has log mass log1p(-q), and the less likely
+/// outcome's log mass is smaller by |z|, even after q underflows.
+fn binary_logit_terms(e: &mut Emitter, z: &Value) -> (Value, Value) {
+    let magnitude = e.abs(z);
+    let log_odds = e.neg(&magnitude);
+    let small = e.invlogit(&log_odds);
+    let minus_small = e.neg(&small);
+    (e.log1p(&minus_small), log_odds)
+}
+
 /// Select the observed probability before taking its log, including p=0 and p=1.
+/// When its logit is known, take the log probability before it rounds to an endpoint.
 fn bernoulli_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
     let one = e.scalar(1.0);
     let zero = e.scalar(0.0);
-    let one_minus_p = e.sub(&one, &prob);
     let success = e.compare("EQ", v, &one);
     let failure = e.compare("EQ", v, &zero);
     let supported = e.or(&success, &failure);
-    let selected = e.select(&success, &prob, &one_minus_p);
-    let safe = e.select(&supported, &selected, &one);
-    let score = e.log(&safe);
-    let inf = e.inf_like(&score);
-    let outside = e.neg(&inf);
-    Ok(e.select(&supported, &score, &outside))
+    let score = if let Some(logit) = e.invlogit_operand(&prob) {
+        let z = e.select(&supported, &logit, &zero);
+        let (common, log_odds) = binary_logit_terms(e, &z);
+        let nonnegative = e.compare("GE", &z, &zero);
+        let likely = e.compare("EQ", &success, &nonnegative);
+        let offset = e.select(&likely, &zero, &log_odds);
+        e.add(&offset, &common)
+    } else {
+        let one_minus_p = e.sub(&one, &prob);
+        let selected = e.select(&success, &prob, &one_minus_p);
+        let safe = e.select(&supported, &selected, &one);
+        e.log(&safe)
+    };
+    Ok(outside_count_support(e, &supported, &score))
 }
 
 /// §08 Poisson uses the same expression as §09 ContinuedPoisson on its
@@ -2493,6 +2512,26 @@ fn outside_count_support(e: &mut Emitter, supported: &Value, score: &Value) -> V
     e.select(supported, score, &outside)
 }
 
+/// A zero count of the less likely outcome can occur at an infinite logit.
+/// Replace its unused log odds before multiplication.
+pub(crate) fn binomial_logit_score(
+    e: &mut Emitter,
+    z: &Value,
+    successes: &Value,
+    failures: &Value,
+) -> Value {
+    let zero = e.scalar(0.0);
+    let nonnegative = e.compare("GE", z, &zero);
+    let (common, log_odds) = binary_logit_terms(e, z);
+    let trials = e.add(successes, failures);
+    let common = e.mul(&trials, &common);
+    let count = e.select(&nonnegative, failures, successes);
+    let empty = e.compare("EQ", &count, &zero);
+    let safe = e.select(&empty, &zero, &log_odds);
+    let linear = e.mul(&count, &safe);
+    e.add(&linear, &common)
+}
+
 /// §08 Binomial: `log f = logC(n, k) + k * log(p) + (n - k) * log(1 - p)`,
 /// with `logC(n, k) = -log1p(n) - log B(k + 1, n - k + 1)`, which equals
 /// `lgamma(n+1) - lgamma(k+1) - lgamma(n-k+1)`. `n - k` is computed once and its
@@ -2507,8 +2546,6 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let fixed_log_choose = e.fold_log_choose(&n, v);
     let zero = e.scalar(0.0);
     let (supported, v) = count_support(e, v, Some(&n));
-    let half = e.scalar(0.5);
-    let prob = e.select(&supported, &prob, &half);
     let one = e.scalar(1.0);
 
     let n_minus_k = e.sub(&n, &v);
@@ -2522,6 +2559,14 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
         e.sub(&neg_log1p_n, &log_beta)
     });
 
+    if let Some(logit) = e.invlogit_operand(&prob) {
+        let safe = e.select(&supported, &logit, &zero);
+        let term = binomial_logit_score(e, &safe, &v, &n_minus_k);
+        let score = e.add(&log_choose_nk, &term);
+        return Ok(outside_count_support(e, &supported, &score));
+    }
+    let half = e.scalar(0.5);
+    let prob = e.select(&supported, &prob, &half);
     // A zero exponent contributes log(1), even when its probability is zero.
     // Guard before log so its unused singular derivative cannot poison AD.
     let no_successes = e.compare("EQ", &v, &zero);

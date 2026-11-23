@@ -1974,28 +1974,7 @@ impl<'m> Emitter<'m> {
             .map(|v| self.reshape(v, stacked_elem_ty.clone()))
             .collect();
 
-        let operand_ssas = reshaped
-            .iter()
-            .map(|v| v.ssa.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let operand_tys = reshaped
-            .iter()
-            .map(|v| v.ty.render(self.dtype, v.elem))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let result_ty_text = result_ty.render(self.dtype, elem_kind);
-
-        let ssa = self.pure_axes(format!(
-            "stablehlo.concatenate {operand_ssas}, dim = 0 : ({operand_tys}) -> {result_ty_text}"
-        ), axes);
-        let value = Value {
-            ssa,
-            ty: result_ty,
-            elem: elem_kind,
-        };
-        self.remember_pointwise(&value.ssa, &value, Pointwise::Concat(reshaped, 0));
-        value
+        self.concatenate_parts(reshaped, 0, result_ty, axes)
     }
 
     /// Concatenate vector cells, preserving batch prefixes and nested cells.
@@ -2050,6 +2029,18 @@ impl<'m> Emitter<'m> {
         {
             return Ok(value);
         }
+        Ok(self.concatenate_parts(parts, axes.batch, ty, axes))
+    }
+
+    /// Join physically aligned parts along an axis of a known result shape.
+    fn concatenate_parts(
+        &mut self,
+        parts: Vec<Value>,
+        axis: usize,
+        ty: MlirTy,
+        axes: Axes,
+    ) -> Value {
+        let elem = parts[0].elem;
         let names = parts
             .iter()
             .map(|v| v.ssa.as_str())
@@ -2060,22 +2051,14 @@ impl<'m> Emitter<'m> {
             .map(|v| v.ty.render(self.dtype, v.elem))
             .collect::<Vec<_>>()
             .join(", ");
-        let result = ty.render(self.dtype, first.elem);
-        let axis = axes.batch;
+        let result = ty.render(self.dtype, elem);
         let ssa = self.pure_axes(
-            format!(
-                "stablehlo.concatenate {names}, dim = {} : ({types}) -> {result}",
-                axes.batch
-            ),
+            format!("stablehlo.concatenate {names}, dim = {axis} : ({types}) -> {result}"),
             axes,
         );
-        let value = Value {
-            ssa,
-            ty,
-            elem: first.elem,
-        };
+        let value = Value { ssa, ty, elem };
         self.remember_pointwise(&value.ssa, &value, Pointwise::Concat(parts, axis));
-        Ok(value)
+        value
     }
 
     /// `%N = stablehlo.transpose %a, dims = [perm...] : (operand_ty) ->

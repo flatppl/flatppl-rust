@@ -355,8 +355,8 @@ fn invlogit_lowers_to_stablehlo_logistic() {
     let src = "flatppl_compat = \"0.1\"\n\
 a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
 p = invlogit(a)\n\
-y = draw(Bernoulli(p))\n\
-L = likelihoodof(kernelof(record(y = y), a = a), record(y = 1))\n\
+y = draw(Normal(p, 1.0))\n\
+L = likelihoodof(kernelof(record(y = y), a = a), record(y = 1.0))\n\
 post = bayesupdate(L, lawof(record(a = a)))\n\
 score = logdensityof(post, record(a = 0.7))\n\
 outputs = (score)\n";
@@ -394,6 +394,81 @@ fn emit_log_density_with(src: &str, options: &flatppl_stablehlo::EmitOptions) ->
     )
     .unwrap();
     flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, options).unwrap()
+}
+
+#[test]
+fn binary_scores_keep_proven_logits_through_group_selection() {
+    let decl = "z=elementof(cartpow(reals,3))\ns=elementof(booleans)\ninputs=(z,s)\n";
+    for (setup, density) in [
+        ("p=invlogit(z[1])", "logdensityof(Bernoulli(p),true)"),
+        (
+            "p=invlogit(z[1])",
+            "logdensityof(iid(Binomial(5,p),4),[0,2,5,1])",
+        ),
+        (
+            "p=invlogit.(z)[[3,1,3,2]]",
+            "logdensityof(Binomial.([2,3,4,5],p),[2,0,1,4])",
+        ),
+        (
+            "p=[invlogit(z[1]),invlogit(z[3])]",
+            "logdensityof(Bernoulli.(p),[true,false])",
+        ),
+        (
+            "p=ifelse(s,0.5,invlogit(z[1]))",
+            "logdensityof(Bernoulli(p),false)",
+        ),
+    ] {
+        let source = format!("{decl}{setup}\noutputs={density}");
+        for sufficient_statistics in [true, false] {
+            let module = emit_log_density_with(
+                &source,
+                &flatppl_stablehlo::EmitOptions {
+                    sufficient_statistics,
+                    check_parameters: false,
+                    ..Default::default()
+                },
+            );
+            // A sigmoid used by the score always receives -abs(logit). A
+            // sigmoid on the original input would discard a tail again.
+            let operand = |op: &str, name: &str| {
+                module.lines().find_map(|line| {
+                    line.trim()
+                        .strip_prefix(&format!("{name} = {op} "))?
+                        .split_whitespace()
+                        .next()
+                })
+            };
+            let mut sigmoids = module
+                .lines()
+                .filter_map(|line| {
+                    line.split_once(" = stablehlo.logistic ")?
+                        .1
+                        .split_whitespace()
+                        .next()
+                })
+                .peekable();
+            assert!(sigmoids.peek().is_some(), "{source}\n{module}");
+            for z in sigmoids {
+                assert!(
+                    operand("stablehlo.negate", z)
+                        .and_then(|magnitude| operand("stablehlo.abs", magnitude))
+                        .is_some(),
+                    "{source}\n{module}"
+                );
+            }
+            assert!(!module.contains("stablehlo.log "), "{source}\n{module}");
+            assert!(
+                module.contains("stablehlo.log_plus_one "),
+                "{source}\n{module}"
+            );
+        }
+    }
+    for p in ["0.5*invlogit(z[1])", "ifelse(s,invlogit(z[1]),z[2])"] {
+        let source = format!("{decl}outputs=logdensityof(Bernoulli({p}),false)");
+        let module = emit_log_density(&source);
+        assert!(module.contains("stablehlo.logistic "), "{source}\n{module}");
+        assert!(module.contains("stablehlo.log "), "{source}\n{module}");
+    }
 }
 
 /// A `joint(K1, K2)` kernel as a `jointchain` step (spec §06 "Joint measures") emits the

@@ -122,6 +122,12 @@ impl Emitter<'_> {
             if !self.check_parameters {
                 continue;
             }
+            // A callback parameter may be a view of an invlogit whose source
+            // expression is outside this lexical scope. Its range is still
+            // [0, 1], including the limits at infinite logits.
+            if set == ParamSet::UnitInterval && self.invlogit_operand(&value).is_some() {
+                continue;
+            }
             // A check outside every region holds wherever the value is used.
             let key = (value.ssa.clone(), format!("{set:?}"));
             if self.checked_parameters.contains(&key) {
