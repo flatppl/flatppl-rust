@@ -1,0 +1,5 @@
+a = elementof(cartpow(reals, [2, 65]))
+b = elementof(cartpow(reals, 65))
+scale = elementof(reals)
+inputs = (a, b, scale)
+outputs = scale * sum(a * b)

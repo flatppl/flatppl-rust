@@ -650,3 +650,59 @@ fn a_scan_checks_unreturned_fields_on_every_step() {
     let body = ir.split_once("} do {").expect("scan body").1;
     assert!(body.contains("dense<9>"), "{body}");
 }
+
+#[test]
+fn f32_contractions_keep_their_abi_across_compensated_and_native_shapes() {
+    let emit = |target, dtype, elem, length, batched, wide| {
+        let rows = if wide { length } else { 2 };
+        let mut a = format!("cartpow({elem}, [{rows}, {length}])");
+        let mut b = if wide {
+            format!("cartpow({elem}, [{length}, {length}])")
+        } else {
+            format!("cartpow({elem}, {length})")
+        };
+        let product = if batched {
+            a = format!("cartpow({a}, 3)");
+            b = format!("cartpow({b}, 3)");
+            "product.(a, b)"
+        } else {
+            "product(a, b)"
+        };
+        let input = write_model(
+            "contraction-precision",
+            &format!(
+                "a = elementof({a})\nb = elementof({b})\nproduct(x,y) = x * y\ninputs = (a,b)\noutputs = {product}\n"
+            ),
+        );
+        let result = flatppl()
+            .args(["stablehlo", "--target", target, "--dtype", dtype])
+            .arg(input)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap()
+    };
+
+    for target in ["cpu", "gpu"] {
+        for (batched, abi) in [(false, "2"), (true, "3x2")] {
+            let ir = emit(target, "f32", "reals", 65, batched, false);
+            assert!(ir.contains("stablehlo.is_finite"));
+            assert!(ir.contains(&format!("-> tensor<{abi}xf32> {{")), "{ir}");
+            assert!(!ir.contains("xf64>") && !ir.contains("tensor<f64>"));
+        }
+        for (dtype, elem, length, wide) in [
+            ("f64", "reals", 65, false),
+            ("f32", "reals", 8, false),
+            ("f32", "integers", 65, false),
+            ("f32", "reals", 65, true),
+        ] {
+            let ir = emit(target, dtype, elem, length, false, wide);
+            assert!(ir.contains("stablehlo.dot_general"), "{ir}");
+            assert!(!ir.contains("stablehlo.is_finite"), "{ir}");
+        }
+    }
+}
