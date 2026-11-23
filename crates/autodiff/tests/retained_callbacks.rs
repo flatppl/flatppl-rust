@@ -67,6 +67,25 @@ outputs = sum(evaluate.(points, [a], [b]))
 }
 
 #[test]
+fn differentiates_retained_broadcast_over_scalar_operands() {
+    let mut module = flatppl_syntax::parse(
+        "
+alpha = elementof(reals)
+interpolate(lo, hi, x) = ifelse(x > 1.0, exp(x * log(hi)), 1.0 + x * (hi - lo))
+inputs = alpha
+outputs = broadcast(interpolate, 0.9, 1.15, alpha)
+",
+    )
+    .unwrap();
+    infer(&mut module);
+    for transform in [gradient, jvp, vjp] {
+        let derivative = transform(&module, &["alpha"]).unwrap();
+        let mut reparsed = flatppl_syntax::parse(&flatppl_syntax::print(&derivative)).unwrap();
+        infer(&mut reparsed);
+    }
+}
+
+#[test]
 fn differentiates_explicit_and_dotted_cumulative_maps() {
     check_transforms(
         "

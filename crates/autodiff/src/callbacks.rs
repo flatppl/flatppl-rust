@@ -217,8 +217,10 @@ pub(super) fn lift_broadcast(
     let entries = reified_inputs(module, head, boundary)?.to_vec();
     let keyword_only = matches!(boundary, Inputs::Auto);
     let expected = module.type_of(node)?.clone();
-    let Type::Array { shape, elem } = &expected else {
-        return None;
+    let (shape, elem) = match &expected {
+        Type::Array { shape, elem } => (shape.as_ref(), elem.as_ref()),
+        ty if scalar(ty) => (&[][..], ty),
+        _ => return None,
     };
     let nested = tensor::nested_vector_type(&expected);
     if (!scalar(elem) && nested.is_none()) || shape.iter().any(|dim| matches!(dim, Dim::Static(0)))
