@@ -1,6 +1,7 @@
-//! Local scalar differentiation inside a finite sum or mean aggregate.
+//! Local scalar differentiation inside finite indexed reductions.
 
 use flatppl_core::graph::{build_call, expect_builtin_call};
+use flatppl_core::{Call, CallHead, Dim, Inputs, Ref, RefNs};
 
 use crate::contract::{aggregate, axis_name, checked_axes, cotangent_product, indexed};
 use crate::{
@@ -41,6 +42,7 @@ pub(super) struct Scope<'a> {
     root: Key,
     reduction: NodeId,
     count: u64,
+    product: Option<Product>,
     output_axes: Vec<NodeId>,
     sites: Vec<Site>,
 }
@@ -49,6 +51,13 @@ struct Site {
     local: NodeId,
     primal: NodeId,
     axes: Vec<NodeId>,
+}
+
+struct Product {
+    axis: NodeId,
+    extent: u32,
+    retained_shape: Vec<u32>,
+    body: NodeId,
 }
 
 pub(super) fn visit<'a>(
@@ -63,6 +72,7 @@ pub(super) fn visit<'a>(
         body,
         sites,
         count,
+        product,
     }) = read(outer.module, args)
     else {
         return Ok(None);
@@ -95,6 +105,7 @@ pub(super) fn visit<'a>(
                 root,
                 reduction,
                 count,
+                product,
                 output_axes,
                 sites: captures,
             },
@@ -126,6 +137,7 @@ impl<'a> Scope<'a> {
         let Some(partial) = self.differentiate(emitter, rules, seed)? else {
             return emitter.zero_like(site.primal);
         };
+        let partial = self.weighted(emitter, partial);
         let m = &mut emitter.module;
         let bar = indexed(m, bar, &self.output_axes);
         let derivative = cotangent_product(m, bar, partial, masked);
@@ -160,13 +172,27 @@ impl<'a> Scope<'a> {
         let Some(tangent) = self.differentiate(emitter, rules, seed)? else {
             return emitter.zero_like(step.node);
         };
+        let tangent = self.weighted(emitter, tangent);
         let tangent = self.anchor_axes(emitter, tangent)?;
-        Ok(aggregate(
-            &mut emitter.module,
-            self.reduction,
-            &self.output_axes,
-            tangent,
-        ))
+        let m = &mut emitter.module;
+        let reduction = if self.product.is_some() {
+            let sum = m.intern("sum");
+            m.alloc(Node::Const(sum))
+        } else {
+            self.reduction
+        };
+        Ok(aggregate(m, reduction, &self.output_axes, tangent))
+    }
+
+    fn weighted(&self, emitter: &mut Emitter, local: NodeId) -> NodeId {
+        let Some(product) = &self.product else {
+            return local;
+        };
+        if product.extent == 1 {
+            return local;
+        }
+        let weight = product.exclusive_cell(emitter, &self.output_axes);
+        build_call(&mut emitter.module, "mul", &[local, weight])
     }
 
     fn differentiate(
@@ -212,6 +238,7 @@ struct Aggregate {
     body: NodeId,
     sites: Vec<Site>,
     count: u64,
+    product: Option<Product>,
 }
 
 fn read(module: &Module, args: &[NodeId]) -> Option<Aggregate> {
@@ -221,11 +248,10 @@ fn read(module: &Module, args: &[NodeId]) -> Option<Aggregate> {
     let Node::Const(reducer) = module.node(reduction) else {
         return None;
     };
-    let mean = match module.resolve(*reducer) {
-        "mean" => true,
-        "sum" => false,
-        _ => return None,
-    };
+    let reducer = module.resolve(*reducer);
+    if !matches!(reducer, "sum" | "mean" | "prod") {
+        return None;
+    }
     let axes = expect_builtin_call(module, axes, "vector")?.args.to_vec();
     checked_axes(module, &axes)?;
     let mut extents = HashMap::new();
@@ -285,7 +311,41 @@ fn read(module: &Module, args: &[NodeId]) -> Option<Aggregate> {
     {
         return None;
     }
-    let count = if mean {
+    let product = if reducer == "prod" {
+        if extents.len() != axes.len() + 1 {
+            return None;
+        }
+        let retained: HashSet<_> = axes
+            .iter()
+            .filter_map(|&axis| axis_name(module, axis))
+            .collect();
+        let axis = sites
+            .iter()
+            .flat_map(|site| site.axes.iter().copied())
+            .find(|&axis| axis_name(module, axis).is_some_and(|name| !retained.contains(&name)))?;
+        let Dim::Static(extent) = extents[&axis_name(module, axis)?] else {
+            return None;
+        };
+        if extent == 0 {
+            return None;
+        }
+        let retained_shape = axes
+            .iter()
+            .map(|&axis| match extents[&axis_name(module, axis)?] {
+                Dim::Static(size) => Some(size),
+                Dim::Dynamic => None,
+            })
+            .collect::<Option<_>>()?;
+        Some(Product {
+            axis,
+            extent,
+            retained_shape,
+            body,
+        })
+    } else {
+        None
+    };
+    let count = if reducer == "mean" {
         for &axis in &axes {
             extents.remove(&axis_name(module, axis)?);
         }
@@ -305,7 +365,96 @@ fn read(module: &Module, args: &[NodeId]) -> Option<Aggregate> {
         body,
         sites,
         count,
+        product,
     })
+}
+
+impl Product {
+    fn exclusive_cell(&self, emitter: &mut Emitter, output_axes: &[NodeId]) -> NodeId {
+        let axes: Vec<_> = std::iter::once(self.axis)
+            .chain(output_axes.iter().copied())
+            .collect();
+        // The two scans run over the omitted axis. Their carries contain
+        // whole retained slices, including a leading singleton block axis.
+        let m = &mut emitter.module;
+        let sum = m.intern("sum");
+        let sum = m.alloc(Node::Const(sum));
+        let cells = aggregate(m, sum, &axes, self.body);
+        let one = real(m, 1.0);
+        let extent = tensor::int(m, i64::from(self.extent));
+        let extent_cells = build_call(m, "fill", &[one, extent]);
+        let indices = build_call(m, "indicesof", &[extent_cells]);
+        let integer_one = tensor::int(m, 1);
+        let before = tensor::broadcast(m, "sub", &[indices, integer_one]);
+        let reverse = build_call(m, "reverse", &[indices]);
+        let after = tensor::broadcast(m, "add", &[reverse, integer_one]);
+        let init = if output_axes.is_empty() {
+            one
+        } else {
+            let dims: Vec<_> = std::iter::once(integer_one)
+                .chain(
+                    self.retained_shape
+                        .iter()
+                        .map(|&size| tensor::int(m, i64::from(size))),
+                )
+                .collect();
+            let dims = build_call(m, "vector", &dims);
+            build_call(m, "fill", &[one, dims])
+        };
+        let callback = product_step(m, extent, !output_axes.is_empty());
+        let prefix = build_call(m, "scan", &[callback, init, before, cells]);
+        let suffix = build_call(m, "scan", &[callback, init, after, cells]);
+        let suffix = build_call(m, "reverse", &[suffix]);
+        let (prefix, suffix) = if output_axes.is_empty() {
+            (prefix, suffix)
+        } else {
+            let zero = tensor::int(m, 0);
+            let rank = tensor::int(m, output_axes.len() as i64);
+            let prefix = build_call(m, "addaxes", &[prefix, zero, rank]);
+            let suffix = build_call(m, "addaxes", &[suffix, zero, rank]);
+            (
+                build_call(m, "joinblocks", &[prefix]),
+                build_call(m, "joinblocks", &[suffix]),
+            )
+        };
+        let weights = tensor::broadcast(m, "mul", &[prefix, suffix]);
+        indexed(m, weights, &axes)
+    }
+}
+
+fn product_step(module: &mut Module, extent: NodeId, block: bool) -> NodeId {
+    let inputs = ["carry", "ordinal", "cells"].map(|label| {
+        (
+            module.intern(label),
+            Ref {
+                ns: RefNs::Local,
+                name: module.intern(&format!("_ad_product_{label}_")),
+            },
+        )
+    });
+    let [carry, ordinal, cells] = inputs.map(|(_, reference)| module.alloc(Node::Ref(reference)));
+    let one = tensor::int(module, 1);
+    let below = build_call(module, "lt", &[ordinal, one]);
+    let above = build_call(module, "gt", &[ordinal, extent]);
+    let skip = build_call(module, "lor", &[below, above]);
+    let index = build_call(module, "ifelse", &[skip, one, ordinal]);
+    let value = build_call(module, "get", &[cells, index]);
+    let unit = real(module, 1.0);
+    let value = tensor::broadcast(module, "ifelse", &[skip, unit, value]);
+    let value = if block {
+        let zero = tensor::int(module, 0);
+        build_call(module, "addaxes", &[value, one, zero])
+    } else {
+        value
+    };
+    let body = tensor::broadcast(module, "mul", &[carry, value]);
+    let head = module.intern("functionof");
+    module.alloc(Node::Call(Call {
+        head: CallHead::Builtin(head),
+        args: Box::new([body]),
+        named: Box::new([]),
+        inputs: Some(Inputs::Spec(Box::new(inputs))),
+    }))
 }
 
 fn axis_names(module: &Module, body: NodeId) -> HashSet<Symbol> {

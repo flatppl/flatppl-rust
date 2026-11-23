@@ -134,3 +134,20 @@ outputs = ifelse.([true, false], product, 0.0)
     let text = flatppl_syntax::print(&derivative);
     assert!(text.contains(".adinner"), "{text}");
 }
+
+#[test]
+fn indexed_products_keep_nested_axes_in_both_modes() {
+    let module = lower(
+        "
+A = elementof(cartpow(reals, [2, 3, 2]))
+w = elementof(cartpow(reals, [2, 2]))
+lanes = aggregate(prod, [.i, .j], A[.i, .k, .j] / 1.0)
+inputs = (A, w)
+outputs = aggregate(sum, [], lanes[.i, .j] * w[.i, .j])
+",
+    );
+    for differentiate in [gradient, vjp, jvp] {
+        let result = differentiate(&module, &["A", "w"]).unwrap();
+        lower(&flatppl_syntax::print(&result));
+    }
+}
