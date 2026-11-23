@@ -988,6 +988,7 @@ impl Reducer {
                 } else {
                     safe
                 };
+                let y = multivariate::shared(m, y);
                 let log_values = y.clone();
                 let first = op("get", [y.clone(), Expr::Integer(1)]);
                 let mixed_sign = op(
@@ -997,7 +998,7 @@ impl Reducer {
                         op("gt", [op("maximum", [y.clone()]), num(0.0)]),
                     ],
                 );
-                let first = op("ifelse", [mixed_sign, num(0.0), first]);
+                let first = multivariate::shared(m, op("ifelse", [mixed_sign, num(0.0), first]));
                 let center_expr = op(
                     "add",
                     [
@@ -1018,7 +1019,7 @@ impl Reducer {
                     },
                     center_expr,
                 );
-                let residuals = map("sub", [y, center.clone()]);
+                let residuals = multivariate::shared(m, map("sub", [y, center.clone()]));
                 let residual_sum = self.summary(
                     m,
                     observed,
@@ -1043,7 +1044,7 @@ impl Reducer {
                     "ifelse",
                     [op("iszero", [scale.clone()]), num(1.0), scale.clone()],
                 );
-                let scaled = map("divide", [residuals, safe_scale]);
+                let scaled = multivariate::shared(m, map("divide", [residuals, safe_scale]));
                 let spread = self.summary(
                     m,
                     observed,
