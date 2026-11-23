@@ -17,6 +17,32 @@ fn main_arguments(source: &str) -> usize {
 }
 
 #[test]
+fn fixed_regression_uses_fewer_qr_levels_in_double_precision()
+-> Result<(), Box<dyn std::error::Error>> {
+    let values = (0..257)
+        .map(|i| format!("{}.0", i % 31))
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = format!(
+        "x=[{values}]\ndata=record(x=x,y=x)\nX=colstack([ones(257),data.x])\n\
+         beta=elementof(cartpow(reals,2))\nsigma=elementof(posreals)\n\
+         inputs=(beta,sigma)\noutputs=logdensityof(Normal.(X*beta,sigma),data.y)"
+    );
+    let query = Context::default().parse(&source, None, None)?;
+    let mut loops = Vec::new();
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let options = EmitOptions {
+            dtype,
+            ..Default::default()
+        };
+        let setup = query.compile_prepared(&options)?.preparation.unwrap();
+        loops.push(setup.stablehlo.matches("stablehlo.while").count());
+    }
+    assert!(loops[1] > 0 && loops[1] < loops[0]);
+    Ok(())
+}
+
+#[test]
 fn fixed_regression_runs_qr_and_checks_the_solve_in_preparation()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::temp_dir().join(format!("flatppl-fixed-regression-{}", std::process::id()));

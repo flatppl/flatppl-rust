@@ -19,14 +19,25 @@ pub use dependencies::{
 };
 
 pub use incremental::{IncrementalScorePlan, IncrementalTerm, prepare_incremental_score};
+/// Floating-point arithmetic used to emit a prepared query.
+#[derive(Clone, Copy, Debug)]
+pub enum RealPrecision {
+    F32,
+    F64,
+}
+
+/// Arithmetic used to validate a coordinate map and emit its companions.
+/// Coordinate checks describe a point in this precision.
+pub use RealPrecision as CoordinatePrecision;
 pub use normal_coordinates::{
-    CoordinatePrecision, NormalCoordinateQueries, NormalCoordinatesQueries,
-    prepare_normal_coordinate, prepare_normal_coordinate_at_path, prepare_normal_coordinates,
+    NormalCoordinateQueries, NormalCoordinatesQueries, prepare_normal_coordinate,
+    prepare_normal_coordinate_at_path, prepare_normal_coordinates,
 };
 
 pub use sufficient_statistics::{
     GroupPartition, IidNormalPlan, PreparationError, PreparationOptions, PreparedLikelihood,
     ReductionDecision, ReductionOutcome, ReductionReport, plan_iid_normal,
-    prepare_fixed_likelihood, prepare_likelihood, prepare_likelihood_with_options,
-    prepare_likelihood_with_report, sufficient_statistics, sufficient_statistics_with_report,
+    prepare_fixed_likelihood, prepare_fixed_likelihood_for_precision, prepare_likelihood,
+    prepare_likelihood_with_options, prepare_likelihood_with_report, sufficient_statistics,
+    sufficient_statistics_with_report,
 };

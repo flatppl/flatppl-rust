@@ -44,7 +44,7 @@ pub struct ReductionReport {
 impl ReductionReport {
     /// Inspect disabled candidates without changing the supplied module.
     pub fn record_disabled(&mut self, m: &Module) {
-        super::reduce(&mut m.clone(), HashSet::new(), false, Some(self), false);
+        super::reduce(&mut m.clone(), HashSet::new(), None, Some(self), false);
     }
 }
 

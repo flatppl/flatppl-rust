@@ -105,7 +105,7 @@ pub fn plan_iid_normal(
     if count < 2 || elem.as_ref() != &Type::Scalar(ScalarType::Real) {
         return None;
     }
-    let mut reducer = Reducer::new(boundary, allowed);
+    let mut reducer = Reducer::new(boundary, allowed, None);
     if !reducer.data_only(m, observed) || !reducer.fixed(m, size) {
         return None;
     }

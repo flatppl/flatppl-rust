@@ -11,13 +11,20 @@ use flatppl_core::{Binding, CallHead, Idx, Module, Node, NodeId, RefNs};
 use flatppl_fileaccess::{Cache, DenyAll, Location, OfflineFetcher, Resolver};
 use flatppl_hs3::PyhfOptions;
 use flatppl_infer::{Level, ModuleBundle, Severity};
-use flatppl_stablehlo::{BatchSpec, EmitOptions};
+use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions};
 use serde::Serialize;
 
 use crate::Constant;
 use crate::export::{Export, emit_prepared, emit_query};
 use crate::inspect::{self, BindingKind, Domain, InputInfo};
 use crate::posterior::{PosteriorTrace, PosteriorUpdate};
+
+fn real_precision(dtype: Dtype) -> flatppl_determinizer::RealPrecision {
+    match dtype {
+        Dtype::F32 => flatppl_determinizer::RealPrecision::F32,
+        Dtype::F64 => flatppl_determinizer::RealPrecision::F64,
+    }
+}
 
 /// A compiler error. `span` holds byte offsets into the text of `source`.
 #[derive(Debug, Serialize)]
@@ -317,8 +324,11 @@ impl LoadedModule {
         // Some fixed-data rules match before load_data is materialized.
         // Split the ordinarily lowered query to retain their summary bindings.
         let split = if prepare_fixed_data && options.sufficient_statistics {
-            flatppl_determinizer::prepare_fixed_likelihood(&lowered)
-                .map_err(|e| locate("prepare_likelihood", Some(e.node), e.reason))?
+            flatppl_determinizer::prepare_fixed_likelihood_for_precision(
+                &lowered,
+                real_precision(options.dtype),
+            )
+            .map_err(|e| locate("prepare_likelihood", Some(e.node), e.reason))?
         } else {
             None
         };
@@ -636,10 +646,7 @@ impl Context {
         let (mut lowered, _) = self.analyze_model(module, data_inputs)?;
         crate::load_fixed_data(&mut lowered, |source| module.read_data(source))
             .map_err(|error| fail(error.to_string()))?;
-        let precision = match dtype {
-            flatppl_stablehlo::Dtype::F32 => flatppl_determinizer::CoordinatePrecision::F32,
-            flatppl_stablehlo::Dtype::F64 => flatppl_determinizer::CoordinatePrecision::F64,
-        };
+        let precision = real_precision(dtype);
         let plan = flatppl_determinizer::prepare_normal_coordinate_at_path(
             &lowered,
             data_inputs,
@@ -672,10 +679,7 @@ impl Context {
         let (mut lowered, _) = self.analyze_model(module, data_inputs)?;
         crate::load_fixed_data(&mut lowered, |source| module.read_data(source))
             .map_err(|error| fail(error.to_string()))?;
-        let precision = match dtype {
-            flatppl_stablehlo::Dtype::F32 => flatppl_determinizer::CoordinatePrecision::F32,
-            flatppl_stablehlo::Dtype::F64 => flatppl_determinizer::CoordinatePrecision::F64,
-        };
+        let precision = real_precision(dtype);
         let plan = flatppl_determinizer::prepare_normal_coordinates(
             &lowered,
             data_inputs,
