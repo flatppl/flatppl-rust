@@ -1,7 +1,7 @@
 //! Graph construction for the shape-dependent terms in math.egg.
 
 use flatppl_core::graph::build_call;
-use flatppl_core::{Dim, Module, NodeId};
+use flatppl_core::{Call, CallHead, Dim, Inputs, Module, Node, NodeId, Ref, RefNs};
 
 use crate::{Emitter, real, tensor};
 
@@ -11,6 +11,13 @@ pub(super) fn structural(op: &str) -> bool {
         "indexed sum product"
             | "polynomial"
             | "l2norm"
+            | "l1norm"
+            | "linfnorm"
+            | "prod"
+            | "var"
+            | "std"
+            | "maximum"
+            | "minimum"
             | "trace"
             | "diagmat"
             | "diag"
@@ -220,7 +227,20 @@ pub(super) fn requires_unmasked(op: &str) -> bool {
 }
 
 pub(super) fn scalar_reduction(op: &str) -> bool {
-    matches!(op, "polynomial" | "l2norm" | "trace" | "det")
+    matches!(
+        op,
+        "polynomial"
+            | "l2norm"
+            | "l1norm"
+            | "linfnorm"
+            | "prod"
+            | "var"
+            | "std"
+            | "maximum"
+            | "minimum"
+            | "trace"
+            | "det"
+    )
 }
 
 fn coefficient_count(emitter: &Emitter, coefficients: NodeId, x: NodeId) -> Option<i64> {
@@ -264,4 +284,67 @@ pub(super) fn polynomial_basis(
     let m = &mut emitter.module;
     let degrees = index_vector(m, 0..n);
     Some(tensor::broadcast(m, "pow", &[x, degrees]))
+}
+
+pub(super) fn sample_degrees(module: &Module, primal: NodeId) -> Option<u64> {
+    let shape = tensor::real_shape(module, primal)?;
+    let count = shape.iter().try_fold(1u64, |acc, dim| match dim {
+        Dim::Static(n) => acc.checked_mul(u64::from(*n)),
+        Dim::Dynamic => None,
+    })?;
+    count.checked_sub(1).filter(|&degrees| degrees > 0)
+}
+
+pub(super) fn product_partials(emitter: &mut Emitter, primal: NodeId) -> Option<NodeId> {
+    let &[Dim::Static(length)] = tensor::real_shape(&emitter.module, primal)? else {
+        return None;
+    };
+    let one = real(&mut emitter.module, 1.0);
+    if length <= 1 {
+        return tensor::fill_like(emitter, one, primal);
+    }
+    // The partial at each cell is its exclusive prefix times its exclusive
+    // suffix. This remains valid with one or several zeros in the input.
+    let primal = emitter.primal(primal);
+    let accumulate = multiply_callback(&mut emitter.module);
+    let accumulate = emitter.define("_ad_product_step", accumulate);
+    let m = &mut emitter.module;
+    let prefix = build_call(m, "scan", &[accumulate, one, primal]);
+    let reversed = build_call(m, "reverse", &[primal]);
+    let suffix = build_call(m, "scan", &[accumulate, one, reversed]);
+    let suffix = build_call(m, "reverse", &[suffix]);
+    let size = tensor::int(m, i64::from(length - 1));
+    let extent = build_call(m, "fill", &[one, size]);
+    let head = build_call(m, "indicesof", &[extent]);
+    let offset = tensor::int(m, 1);
+    let tail = tensor::broadcast(m, "add", &[head, offset]);
+    let prefix = build_call(m, "get", &[prefix, head]);
+    let suffix = build_call(m, "get", &[suffix, tail]);
+    let unit = build_call(m, "vector", &[one]);
+    let prefix = build_call(m, "cat", &[unit, prefix]);
+    let suffix = build_call(m, "cat", &[suffix, unit]);
+    Some(tensor::broadcast(m, "mul", &[prefix, suffix]))
+}
+
+fn multiply_callback(module: &mut Module) -> NodeId {
+    let inputs = ["prefix", "cell"].map(|name| {
+        let label = module.intern(name);
+        let name = module.intern(&format!("_{name}_"));
+        (
+            label,
+            Ref {
+                ns: RefNs::Local,
+                name,
+            },
+        )
+    });
+    let args = inputs.map(|(_, reference)| module.alloc(Node::Ref(reference)));
+    let body = build_call(module, "mul", &args);
+    let function = module.intern("functionof");
+    module.alloc(Node::Call(Call {
+        head: CallHead::Builtin(function),
+        args: Box::new([body]),
+        named: Box::new([]),
+        inputs: Some(Inputs::Spec(Box::new(inputs))),
+    }))
 }

@@ -11,7 +11,7 @@ use flatppl_core::{
     NamedKind, Node, NodeId, Ref, RefNs, Scalar, ScalarType, Symbol, Type,
 };
 
-use crate::{Query, metric, recurrence, tensor};
+use crate::{Query, affine_scan, metric, recurrence, tensor};
 
 pub(super) fn legalize(module: &Module, query: &Query<'_>) -> Option<Module> {
     // Avoid cloning the arena when no supported expansion occurs.
@@ -97,9 +97,11 @@ impl Walker<'_> {
                     rebuilt
                 };
                 lift_broadcast(self.module, self.inputs, current)
+                    .or_else(|| lift_matrix_vector_map(self.module, self.inputs, current))
                     .or_else(|| expand_static_cells(self.module, self.inputs, current))
                     .or_else(|| metric::lower(self.module, current))
                     .or_else(|| recurrence::lower(self.module, self.inputs, current))
+                    .or_else(|| affine_scan::square_scan(self.module, self.inputs, current))
                     .unwrap_or(current)
             }
             _ => node,
@@ -109,11 +111,14 @@ impl Walker<'_> {
     }
 }
 
-fn lift_broadcast(
+pub(super) fn lift_broadcast(
     module: &mut Module,
     inputs: &HashSet<BindingId>,
     node: NodeId,
 ) -> Option<NodeId> {
+    if packed_vectors(module, node).is_some() || packed_rows(module, node).is_some() {
+        return None;
+    }
     let call = expect_builtin_call(module, node, "broadcast")?.clone();
     let (&head, positional) = call.args.split_first()?;
     let head = resolve_unpromoted(module, inputs, head)?;
@@ -126,7 +131,9 @@ fn lift_broadcast(
     let Type::Array { shape, elem } = &expected else {
         return None;
     };
-    if !scalar(elem) || shape.iter().any(|dim| matches!(dim, Dim::Static(0))) {
+    let nested = tensor::nested_vector_type(&expected);
+    if (!scalar(elem) && nested.is_none()) || shape.iter().any(|dim| matches!(dim, Dim::Static(0)))
+    {
         return None;
     }
     let names: Vec<_> = entries.iter().map(|&(label, _)| label).collect();
@@ -150,13 +157,29 @@ fn lift_broadcast(
         scope.bound.push((reference, mapped));
     }
     scope.depends(body, 0)?;
-    let result = scope.expression(body)?;
-    let result = expand(scope.module, result, shape, elem)?;
-    let result = annotate_equivalent(scope.module, result.value, &expected)?;
+    let result = if let Some((_, width)) = nested {
+        let event = scope.vector(body)?.into_vector()?;
+        if event.len() != width as usize {
+            return None;
+        }
+        let columns = event
+            .into_iter()
+            .map(|cell| Some(expand(scope.module, cell, shape, &crate::REAL)?.value))
+            .collect::<Option<Vec<_>>>()?;
+        pack_vectors(scope.module, &columns)
+    } else {
+        let result = scope.expression(body)?;
+        expand(scope.module, result, shape, elem)?.value
+    };
+    let result = annotate_equivalent(scope.module, result, &expected)?;
     Some(bind_shared_terms(scope.module, result, &scope.shared))
 }
 
-fn annotate_equivalent(module: &mut Module, result: NodeId, expected: &Type) -> Option<NodeId> {
+pub(super) fn annotate_equivalent(
+    module: &mut Module,
+    result: NodeId,
+    expected: &Type,
+) -> Option<NodeId> {
     let (types, diagnostics) = flatppl_infer::infer_expression(module, result, &[]);
     if types.get(&result) != Some(expected)
         || diagnostics
@@ -308,10 +331,8 @@ impl Scope<'_> {
         width: u32,
     ) -> Option<Vec<Cell>> {
         let m = &mut *self.module;
-        if shape == [Dim::Static(1)]
-            && let Some(root) = resolve_unpromoted(m, self.inputs, value)
-            && let Some(vector) = expect_builtin_call(m, root, "vector")
-            && let [whole] = *vector.args
+        if let Some(root) = resolve_unpromoted(m, self.inputs, value)
+            && let Some(whole) = repeated_value(m, root, shape)
         {
             return Some(event_components(m, whole, layout, width));
         }
@@ -517,6 +538,21 @@ impl Scope<'_> {
             "in" => return self.membership(&call.args),
             "logsumexp" => return self.logsumexp(&call.args),
             "sum" => return self.sum(&call.args),
+            "broadcast" => {
+                let (&op, args) = call.args.split_first()?;
+                let Node::Const(op) = self.module.node(self.resolve_structure(op)) else {
+                    return None;
+                };
+                let name = self.module.resolve(*op).to_owned();
+                if !pointwise(&name) {
+                    return None;
+                }
+                let args = args
+                    .iter()
+                    .map(|&arg| self.expression(arg))
+                    .collect::<Option<_>>()?;
+                return self.pointwise_call(&name, args);
+            }
             _ => {}
         }
         if !pointwise(&name) {
@@ -593,6 +629,9 @@ impl Scope<'_> {
                         }
                         "broadcast" => self.vector_broadcast(&call.args)?,
                         "softmax" => Event::vector(self.softmax(&call.args)?),
+                        "cumsum" => self.prefix_sum(&call.args)?,
+                        "add" | "sub" => self
+                            .map_builtin_vector(self.module.resolve(head).to_owned(), &call.args)?,
                         "get" | "get0" => {
                             let base = i64::from(self.module.resolve(head) == "get");
                             Event::vector(self.vector_get(&call.args, base)?)
@@ -615,6 +654,21 @@ impl Scope<'_> {
         };
         self.vectors.insert(node, terms.clone());
         Some(terms)
+    }
+
+    fn prefix_sum(&mut self, args: &[NodeId]) -> Option<Event> {
+        let [input] = *args else {
+            return None;
+        };
+        let mut terms = self.vector(input)?.into_vector()?.into_iter();
+        let mut prefix = terms.next()?;
+        let mut cells = vec![prefix.clone()];
+        for next in terms {
+            prefix = self.pointwise_call("add", vec![prefix, next])?;
+            self.shared.insert(prefix.value);
+            cells.push(prefix.clone());
+        }
+        Some(Event::vector(cells))
     }
 
     fn softmax(&mut self, args: &[NodeId]) -> Option<Vec<Cell>> {
@@ -701,6 +755,10 @@ impl Scope<'_> {
         if !pointwise(&name) {
             return None;
         }
+        self.map_builtin_vector(name, args)
+    }
+
+    fn map_builtin_vector(&mut self, name: String, args: &[NodeId]) -> Option<Event> {
         let operands = args
             .iter()
             .map(|&arg| self.operand(arg))
@@ -1201,6 +1259,26 @@ fn operand_shape(operands: &[Operand]) -> Option<(EventLayout, usize)> {
     shape
 }
 
+fn repeated_value(module: &Module, node: NodeId, shape: &[Dim]) -> Option<NodeId> {
+    if shape.iter().any(|dim| matches!(dim, Dim::Dynamic)) {
+        return None;
+    }
+    if let Some(fill) = expect_builtin_call(module, node, "fill")
+        && let [value, _] = *fill.args
+        && fill.named.is_empty()
+    {
+        return Some(value);
+    }
+    if shape == [Dim::Static(1)]
+        && let Some(vector) = expect_builtin_call(module, node, "vector")
+        && let [value] = *vector.args
+        && vector.named.is_empty()
+    {
+        return Some(value);
+    }
+    None
+}
+
 fn event_components(
     module: &mut Module,
     value: NodeId,
@@ -1284,6 +1362,206 @@ fn callback_input(module: &mut Module, label: &str, entries: &mut Vec<(Symbol, R
     };
     entries.push((module.intern(label), target));
     module.alloc(Node::Ref(target))
+}
+
+/// Map matrix-vector multiplication with a held matrix as one ordinary
+/// matrix product. Row packing below restores the original array layers.
+fn lift_matrix_vector_map(
+    module: &mut Module,
+    inputs: &HashSet<BindingId>,
+    node: NodeId,
+) -> Option<NodeId> {
+    let (rows, cols) = tensor::nested_vector(module, node)?;
+    let call = expect_builtin_call(module, node, "broadcast")?.clone();
+    let (&head, args) = call.args.split_first()?;
+    let head = resolve_unpromoted(module, inputs, head)?;
+    let function = expect_builtin_call(module, head, "functionof")?;
+    let [body] = *function.args else {
+        return None;
+    };
+    let Some(Inputs::Spec(entries)) = function.inputs.as_ref() else {
+        return None;
+    };
+    if entries.len() != 2 || entries[0].1 == entries[1].1 {
+        return None;
+    }
+    let product = expect_builtin_call(module, body, "mul")?;
+    let [matrix, vector] = *product.args else {
+        return None;
+    };
+    if !product.named.is_empty() {
+        return None;
+    }
+    let transposed = expect_builtin_call(module, matrix, "transpose");
+    let matrix = match transposed {
+        Some(transpose) if transpose.named.is_empty() => {
+            let [matrix] = *transpose.args else {
+                return None;
+            };
+            matrix
+        }
+        Some(_) => return None,
+        None => matrix,
+    };
+    let transposed = transposed.is_some();
+    let index = |id| {
+        let Node::Ref(reference) = module.node(id) else {
+            return None;
+        };
+        entries
+            .iter()
+            .position(|&(_, target)| target == *reference && target.ns == RefNs::Local)
+    };
+    let matrix_slot = index(matrix)?;
+    let vector_slot = index(vector)?;
+    let names: Vec<_> = entries.iter().map(|&(name, _)| name).collect();
+    let args = bind_call_args(module, &names, args, &call.named, false)?;
+    let vectors = args[vector_slot];
+    let (count, inner) = tensor::nested_vector(module, vectors)?;
+    if count != rows {
+        return None;
+    }
+    let repeated = args[matrix_slot];
+    let Type::Array { shape, .. } = module.type_of(repeated)? else {
+        return None;
+    };
+    if shape.as_ref() != [Dim::Static(1)] && shape.as_ref() != [Dim::Static(rows)] {
+        return None;
+    }
+    let repeated = resolve_unpromoted(module, inputs, repeated)?;
+    let matrix = repeated_value(module, repeated, shape)?;
+    let matrix_shape = tensor::real_shape(module, matrix)?;
+    let expected_matrix = if transposed {
+        [inner, cols]
+    } else {
+        [cols, inner]
+    };
+    if matrix_shape != expected_matrix.map(Dim::Static) {
+        return None;
+    }
+    let lhs = build_call(module, "rowstack", &[vectors]);
+    let rhs = if transposed {
+        matrix
+    } else {
+        build_call(module, "transpose", &[matrix])
+    };
+    let result = build_call(module, "mul", &[lhs, rhs]);
+    let result = pack_rows(module, result, rows);
+    let expected = module.type_of(node)?.clone();
+    annotate_equivalent(module, result, &expected)
+}
+
+pub(super) fn pack_rows(module: &mut Module, matrix: NodeId, rows: u32) -> NodeId {
+    let mut entries = Vec::new();
+    let index = callback_input(module, "row", &mut entries);
+    let body_matrix = callback_input(module, "matrix", &mut entries);
+    let all = module.intern("all");
+    let all = module.alloc(Node::Const(all));
+    let body = build_call(module, "get", &[body_matrix, index, all]);
+    let function = reify(module, body, entries);
+    let rows = tensor::int(module, i64::from(rows));
+    let range = build_call(module, "zeros", &[rows]);
+    let range = build_call(module, "indicesof", &[range]);
+    let singleton = build_call(module, "vector", &[matrix]);
+    build_call(module, "broadcast", &[function, range, singleton])
+}
+
+pub(super) fn packed_rows(module: &Module, node: NodeId) -> Option<NodeId> {
+    let (rows, cols) = tensor::nested_vector(module, node)?;
+    let call = expect_builtin_call(module, node, "broadcast")?;
+    let [head, indices, matrix] = *call.args else {
+        return None;
+    };
+    if !call.named.is_empty() || tensor::numeric_shape(module, indices)? != [Dim::Static(rows)] {
+        return None;
+    }
+    let range = expect_builtin_call(module, indices, "indicesof")?;
+    let [range_input] = *range.args else {
+        return None;
+    };
+    if !range.named.is_empty() || tensor::numeric_shape(module, range_input)? != [Dim::Static(rows)]
+    {
+        return None;
+    }
+    let function = expect_builtin_call(module, head, "functionof")?;
+    let Some(Inputs::Spec(entries)) = function.inputs.as_ref() else {
+        return None;
+    };
+    let ([(_, row), (_, matrix_ref)], [body]) = (entries.as_ref(), function.args.as_ref()) else {
+        return None;
+    };
+    if row.ns != RefNs::Local || matrix_ref.ns != RefNs::Local || row == matrix_ref {
+        return None;
+    }
+    let access = expect_builtin_call(module, *body, "get")?;
+    let [body_matrix, body_row, all] = *access.args else {
+        return None;
+    };
+    if !access.named.is_empty()
+        || !matches!(module.node(body_matrix), Node::Ref(r) if r == matrix_ref)
+        || !matches!(module.node(body_row), Node::Ref(r) if r == row)
+        || !matches!(module.node(all), Node::Const(s) if module.resolve(*s) == "all")
+    {
+        return None;
+    }
+    let singleton = expect_builtin_call(module, matrix, "vector")?;
+    let [matrix] = *singleton.args else {
+        return None;
+    };
+    (singleton.named.is_empty()
+        && tensor::real_shape(module, matrix)? == [Dim::Static(rows), Dim::Static(cols)])
+    .then_some(matrix)
+}
+
+/// Pack one flat column per inner vector component. The callable's body only
+/// changes the array layering, which keeps the map visible in FlatPDL.
+pub(super) fn pack_vectors(module: &mut Module, columns: &[NodeId]) -> NodeId {
+    let mut entries = Vec::with_capacity(columns.len());
+    let body: Vec<_> = (0..columns.len())
+        .map(|i| callback_input(module, &format!("component_{i}"), &mut entries))
+        .collect();
+    let body = build_call(module, "vector", &body);
+    let function = reify(module, body, entries);
+    let args: Vec<_> = std::iter::once(function)
+        .chain(columns.iter().copied())
+        .collect();
+    build_call(module, "broadcast", &args)
+}
+
+pub(super) fn packed_vectors(module: &Module, node: NodeId) -> Option<&[NodeId]> {
+    let (rows, cols) = tensor::nested_vector(module, node)?;
+    let call = expect_builtin_call(module, node, "broadcast")?;
+    if !call.named.is_empty() {
+        return None;
+    }
+    let (&head, args) = call.args.split_first()?;
+    if args.len() != cols as usize
+        || args
+            .iter()
+            .any(|&arg| tensor::real_shape(module, arg) != Some(&[Dim::Static(rows)]))
+    {
+        return None;
+    }
+    let function = expect_builtin_call(module, head, "functionof")?;
+    let Some(Inputs::Spec(entries)) = function.inputs.as_ref() else {
+        return None;
+    };
+    let [body] = *function.args else {
+        return None;
+    };
+    let vector = expect_builtin_call(module, body, "vector")?;
+    (entries.len() == args.len()
+        && vector.args.len() == args.len()
+        && vector.named.is_empty()
+        && vector
+            .args
+            .iter()
+            .zip(entries.iter())
+            .all(|(&arg, &(_, target))| {
+                target.ns == RefNs::Local
+                    && matches!(module.node(arg), Node::Ref(reference) if *reference == target)
+            }))
+    .then_some(args)
 }
 
 pub(super) struct DensityOperands {

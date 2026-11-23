@@ -3,6 +3,7 @@
 //! Use [`determinize_query`] to prepare the inferred model for [`gradient`].
 //! The returned module is ordinary FlatPDL.
 
+mod affine_scan;
 mod aggregate;
 mod callbacks;
 mod contract;
@@ -809,6 +810,14 @@ impl<'a> Plan<'a> {
             && let Some(contraction) = contract::SumProduct::read(self.module, &call.args)
         {
             ("indexed sum product", contraction.args().to_vec(), false)
+        } else if op == "scan"
+            && let Some(args) = affine_scan::args(self.module, &self.query.inputs, &call.args)
+        {
+            ("affine scan", args.to_vec(), false)
+        } else if let Some(matrix) = callbacks::packed_rows(self.module, node) {
+            ("pack matrix rows", vec![matrix], false)
+        } else if let Some(args) = callbacks::packed_vectors(self.module, node) {
+            ("pack vector cells", args.to_vec(), false)
         } else if let Some((head, args)) =
             positional_broadcast.filter(|(head, _)| !structural(head))
         {
@@ -1118,10 +1127,13 @@ fn structural(op: &str) -> bool {
             | "get0"
             | "stack rows"
             | "stack columns"
+            | "pack vector cells"
+            | "pack matrix rows"
             | "rowstack"
             | "colstack"
             | "matrix product"
             | "scoped aggregate"
+            | "affine scan"
             | "transpose"
             | "iid Categorical log density"
             | "iid Categorical0 log density"
@@ -1193,7 +1205,10 @@ impl<'a> Step<'a> {
             ));
         }
         let have_shapes = (tensor::real_shape(module, self.node).is_some()
-            || matches!(self.op, "vector" | "cat" | "get" | "get0") && nested_vector(self.node)
+            || matches!(
+                self.op,
+                "vector" | "cat" | "get" | "get0" | "pack vector cells" | "pack matrix rows"
+            ) && nested_vector(self.node)
             || record_access
                 && module
                     .type_of(self.node)
@@ -1258,6 +1273,19 @@ impl<'a> Step<'a> {
             return Err(Error::new(
                 Some(self.node),
                 "cumulative and reverse pullbacks require a fixed-length real vector",
+            ));
+        }
+        if self.op == "prod" && !matches!(tensor::real_shape(module, self.args[0]), Some([_])) {
+            return Err(Error::new(
+                Some(self.node),
+                "product pullback requires a real vector",
+            ));
+        }
+        if matches!(self.op, "var" | "std") && math::sample_degrees(module, self.args[0]).is_none()
+        {
+            return Err(Error::new(
+                Some(self.node),
+                "sample moment pullback requires at least two real cells",
             ));
         }
         if self.op == "diag" && math::square_size(module, self.args[0]).is_none() {

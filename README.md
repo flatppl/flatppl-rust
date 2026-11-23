@@ -90,7 +90,7 @@ and derivative outputs, ready for source printing or graph optimization.
 Compiler-only numerical integrals use the same transform through the
 `*_with_options` entry points. The transform integrates the derivative of
 the integrand and adds terms for moving bounds and supported scalar cutoffs.
-Reverse differentiation of integrands supports scalar captures. For StableHLO,
+Reverse differentiation of integrands supports scalar, fixed-vector, and fixed-matrix captures. For StableHLO,
 combine `--numerical-integrals` with one or more `--ad-wrt` arguments and
 optionally `--ad-mode jvp` or `--ad-mode vjp`.
 

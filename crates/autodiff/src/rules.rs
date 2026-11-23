@@ -5,7 +5,7 @@ use egglog::{CommandOutput, EGraph, Term, TermDag, TermId};
 use flatppl_core::graph::{build_call, expect_builtin_call, special_functions_alias};
 use flatppl_core::{Call, CallHead, Module, Node, NodeId, Ref, RefNs};
 
-use crate::{Emitter, Error, Step, contract, math, real, record, tensor};
+use crate::{Emitter, Error, Step, affine_scan, contract, math, real, record, tensor};
 
 pub(super) type RuleKey<'a> = (&'static str, &'a str, usize, usize);
 
@@ -222,6 +222,23 @@ impl Template {
                 };
                 tensor::drop_added_axes(emitter, bar, primal, leading, values.step.node)?
             }
+            ("PackRows", []) => {
+                let (rows, _) = tensor::nested_vector(&emitter.module, values.step.node)?;
+                crate::callbacks::pack_rows(&mut emitter.module, values.bar, rows)
+            }
+            ("PackColumn", [slot]) => {
+                let m = &mut emitter.module;
+                let matrix = build_call(m, "rowstack", &[values.bar]);
+                tensor::stack_pick(m, matrix, self.int(*slot)? + 1, true)
+            }
+            ("PackSeed", [slot]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                let primal = *values.step.args.get(slot)?;
+                let zero = emitter.zero_like(primal).ok()?;
+                let mut columns = vec![zero; values.step.args.len()];
+                columns[slot] = values.bar;
+                crate::callbacks::pack_vectors(&mut emitter.module, &columns)
+            }
             ("Scatter", [bar, base]) => {
                 let bar = self.emit(*bar, emitter, values)?;
                 let (&primal, selectors) = values.step.args.split_first()?;
@@ -287,6 +304,22 @@ impl Template {
                     value
                 }
             }
+            ("AffineScan", [initial, sequence, scale, guarded]) => {
+                let initial = self.emit(*initial, emitter, values)?;
+                let sequence = self.emit(*sequence, emitter, values)?;
+                let scale = self.emit(*scale, emitter, values)?;
+                let guarded = self.int(*guarded)? != 0;
+                affine_scan::scan(&mut emitter.module, initial, sequence, scale, guarded)
+            }
+            ("LaggedScan", [initial, states]) => {
+                let shape = tensor::real_shape(&emitter.module, values.step.node)?;
+                let &[flatppl_core::Dim::Static(length)] = shape else {
+                    return None;
+                };
+                let initial = self.emit(*initial, emitter, values)?;
+                let states = self.emit(*states, emitter, values)?;
+                affine_scan::lag(&mut emitter.module, initial, states, length)
+            }
             ("MathDot", [left, right]) => {
                 let left = self.emit(*left, emitter, values)?;
                 let right = self.emit(*right, emitter, values)?;
@@ -318,6 +351,19 @@ impl Template {
                     return None;
                 };
                 math::polynomial_basis(emitter, coefficients, x)?
+            }
+            ("SampleDegrees", []) => {
+                let [primal] = *values.step.args.as_slice() else {
+                    return None;
+                };
+                let degrees = math::sample_degrees(&emitter.module, primal)? as f64;
+                real(&mut emitter.module, degrees)
+            }
+            ("ProductPartials", []) => {
+                let [primal] = *values.step.args.as_slice() else {
+                    return None;
+                };
+                math::product_partials(emitter, primal)?
             }
             ("IdentityLike", [slot]) => {
                 let slot = usize::try_from(self.int(*slot)?).ok()?;

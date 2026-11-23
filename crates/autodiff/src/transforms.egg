@@ -183,3 +183,7 @@
 (rewrite (Pullback "beta" 2 1)
   (Unary "neg" (Binary "mul" (Binary "mul" (Bar) (Out)) (DigammaDifference (Arg 1) (Arg 0))))
   :ruleset pullbacks)
+
+(rewrite (Pullback "gamma" 1 0)
+  (Binary "mul" (Bar) (Binary "mul" (Out) (SpecialUnary "digamma" (Arg 0))))
+  :ruleset pullbacks)
