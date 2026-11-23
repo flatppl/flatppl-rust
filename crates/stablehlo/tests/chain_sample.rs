@@ -2,9 +2,13 @@
 //! holds the rng key. Only the key after the last step is kept (spec §07
 //! "Random number generation").
 
-use flatppl_stablehlo::{EmitOptions, Mode};
+use flatppl_stablehlo::{EmitOptions, Mode, Target};
 
 fn emit(source: &str) -> Result<String, String> {
+    emit_target(source, Target::Cpu)
+}
+
+fn emit_target(source: &str, target: Target) -> Result<String, String> {
     let mut model = flatppl_syntax::parse(source).unwrap();
     let diagnostics = flatppl_infer::infer(&mut model);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -20,6 +24,7 @@ fn emit(source: &str) -> Result<String, String> {
         &model,
         Mode::Sample,
         &EmitOptions {
+            target,
             restrict_enzyme_compatible: false,
             ..Default::default()
         },
@@ -53,6 +58,26 @@ fn kscan_sample_is_one_while_carrying_the_key() {
         signature.contains("-> (tensor<5xf32>, tensor<2xui64>"),
         "{hlo}"
     );
+}
+
+#[test]
+fn a_long_gpu_chain_keeps_one_keyed_step_per_iteration() {
+    let hlo = emit_target(
+        "rho = elementof(interval(-1.0, 1.0))\n\
+         mc = markovchain((x, rho) -> Normal(rho * x, 1.0), 0.5, 35, rho)\n\
+         s = rnginit(0)\nd, s2 = rand(mc, s)\ninputs = (s, rho)\noutputs = (d, s2)",
+        Target::Gpu,
+    )
+    .unwrap();
+    assert_one_keyed_while(&hlo);
+    let condition = hlo
+        .split("cond {")
+        .nth(1)
+        .unwrap()
+        .split("} do {")
+        .next()
+        .unwrap();
+    assert!(condition.contains("dense<35>"), "{condition}");
 }
 
 /// The draw after the chain reads the final carried key, not a key from

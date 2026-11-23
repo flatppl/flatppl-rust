@@ -790,95 +790,142 @@ impl Emitter<'_> {
                 .iter()
                 .map(|v| v.ty.render(self.dtype, v.elem))
                 .collect::<Vec<_>>();
-            let results = self.try_while_loop(
-                &inits,
-                &types,
-                |e, args| {
-                    let limit = e.int_value_const((n - first) as i64);
-                    e.compare("LT", &args[0], &limit)
-                },
-                |e, args| {
-                    let mut sequence_items = Vec::with_capacity(seqs.len());
-                    let mut at = 1;
-                    let item = if reduce {
-                        let one = e.int_value_const(1);
-                        e.add(&args[0], &one)
-                    } else {
-                        args[0].clone()
-                    };
-                    for (sequence, &len) in seqs.iter().zip(&lengths) {
-                        let Some(len) = len else {
-                            sequence_items.push(sequence.clone());
-                            continue;
-                        };
-                        let index = if len == 1 {
-                            e.int_value_const(0)
-                        } else {
-                            item.clone()
-                        };
-                        let mut items = Vec::with_capacity(sequence.values.len());
-                        for (value, original) in args[at..].iter().zip(&sequence.values) {
-                            let value = e.axes_view(value, e.axes_of(original));
-                            items.push(e.scan_slice(&value, &index));
-                        }
-                        at += sequence.values.len();
-                        sequence_items.push(sequence.with_values(&items));
-                    }
-                    let mut carries = Vec::with_capacity(state.values.len());
-                    for (value, original) in args[start..out_start].iter().zip(&state.values) {
-                        carries.push(if original.ty == MlirTy::Key {
-                            value.clone()
-                        } else {
-                            e.axes_view(value, e.axes_of(original))
-                        });
-                    }
-                    let mut arguments = vec![state.with_values(&carries)];
-                    arguments.extend(sequence_items);
-                    let mut types = vec![state_type.clone()];
-                    types.extend(item_types.iter().cloned());
-                    if let Some((value, ty)) = &parameter {
-                        arguments.push(value.clone());
-                        types.push(ty.clone());
-                    }
-                    let output = e
-                        .call_components(body, &entries, &arguments, &types)?
-                        .align(&state, id)?;
-                    let mut next = Vec::with_capacity(args.len());
+            let width = if !reduce && self.block_scan(body, &state, xs, n) {
+                4
+            } else {
+                1
+            };
+            let advance = |e: &mut Self,
+                           args: &[Value],
+                           index: &Value|
+             -> Result<Vec<Value>, EmitError> {
+                let mut sequence_items = Vec::with_capacity(seqs.len());
+                let mut at = 1;
+                let item = if reduce {
                     let one = e.int_value_const(1);
-                    next.push(e.add(&args[0], &one));
-                    next.extend_from_slice(&args[1..start]);
-                    for (value, expected) in output.values.iter().zip(&state.values) {
-                        if expected.ty == MlirTy::Key || value.ty == MlirTy::Key {
-                            if value.ty != expected.ty {
-                                return Err(EmitError::at(id, "scan: step changes the state type"));
-                            }
-                            next.push(value.clone());
-                            continue;
-                        }
-                        let frame = e.call_frame.clone();
-                        let value = e.finish_broadcast(value, &frame, frame.len());
-                        if value.ty != expected.ty
-                            || elem_rank(value.elem) > elem_rank(expected.elem)
-                        {
+                    e.add(index, &one)
+                } else {
+                    index.clone()
+                };
+                for (sequence, &len) in seqs.iter().zip(&lengths) {
+                    let Some(len) = len else {
+                        sequence_items.push(sequence.clone());
+                        continue;
+                    };
+                    let index = if len == 1 {
+                        e.int_value_const(0)
+                    } else {
+                        item.clone()
+                    };
+                    let mut items = Vec::with_capacity(sequence.values.len());
+                    for (value, original) in args[at..].iter().zip(&sequence.values) {
+                        let value = e.axes_view(value, e.axes_of(original));
+                        items.push(e.scan_slice(&value, &index));
+                    }
+                    at += sequence.values.len();
+                    sequence_items.push(sequence.with_values(&items));
+                }
+                let mut carries = Vec::with_capacity(state.values.len());
+                for (value, original) in args[start..out_start].iter().zip(&state.values) {
+                    carries.push(if original.ty == MlirTy::Key {
+                        value.clone()
+                    } else {
+                        e.axes_view(value, e.axes_of(original))
+                    });
+                }
+                let mut arguments = vec![state.with_values(&carries)];
+                arguments.extend(sequence_items);
+                let mut types = vec![state_type.clone()];
+                types.extend(item_types.iter().cloned());
+                if let Some((value, ty)) = &parameter {
+                    arguments.push(value.clone());
+                    types.push(ty.clone());
+                }
+                let output = e
+                    .call_components(body, &entries, &arguments, &types)?
+                    .align(&state, id)?;
+                let mut next = Vec::with_capacity(args.len());
+                let one = e.int_value_const(1);
+                next.push(e.add(&args[0], &one));
+                next.extend_from_slice(&args[1..start]);
+                for (value, expected) in output.values.iter().zip(&state.values) {
+                    if expected.ty == MlirTy::Key || value.ty == MlirTy::Key {
+                        if value.ty != expected.ty {
                             return Err(EmitError::at(id, "scan: step changes the state type"));
                         }
-                        next.push(e.convert(&value, expected.elem));
+                        next.push(value.clone());
+                        continue;
                     }
+                    let frame = e.call_frame.clone();
+                    let value = e.finish_broadcast(value, &frame, frame.len());
+                    if value.ty != expected.ty || elem_rank(value.elem) > elem_rank(expected.elem) {
+                        return Err(EmitError::at(id, "scan: step changes the state type"));
+                    }
+                    next.push(e.convert(&value, expected.elem));
+                }
+                Ok(next)
+            };
+            let block = |e: &mut Self,
+                         args: &[Value],
+                         index: &Value,
+                         count: u64|
+             -> Result<Vec<Value>, EmitError> {
+                let mut next = args[..out_start].to_vec();
+                let mut rows = vec![Vec::new(); args.len() - out_start];
+                for offset in 0..count {
+                    let item = if offset == 0 {
+                        index.clone()
+                    } else {
+                        let offset = e.int_value_const(offset as i64);
+                        e.add(index, &offset)
+                    };
+                    next = advance(e, &next, &item)?;
                     let buffered = next[start..out_start]
                         .iter()
                         .zip(&keys)
-                        .filter(|(_, key)| !**key)
-                        .map(|(value, _)| value.clone())
-                        .collect::<Vec<_>>();
-                    let updates = args[out_start..]
-                        .iter()
-                        .zip(&buffered)
-                        .map(|(buffer, value)| e.scan_update(buffer, value, &args[0]))
-                        .collect::<Vec<_>>();
-                    next.extend(updates);
-                    Ok(next)
+                        .filter(|(_, key)| !**key);
+                    for (rows, (value, _)) in rows.iter_mut().zip(buffered) {
+                        rows.push(value.clone());
+                    }
+                }
+                for (buffer, rows) in args[out_start..].iter().zip(rows) {
+                    let update = if let [row] = rows.as_slice() {
+                        e.scan_update(buffer, row, index)
+                    } else {
+                        let block = e.vector(&rows);
+                        e.update_scan_rows(buffer, &block, index, e.batch_rank(&block))
+                    };
+                    next.push(update);
+                }
+                Ok(next)
+            };
+            // The loop counts blocks from zero for Enzyme's reverse-pass tapes.
+            // A short tail executes only the remaining callbacks, in order.
+            let steps = n - first;
+            let mut results = self.try_while_loop(
+                &inits,
+                &types,
+                |e, args| {
+                    let limit = e.int_value_const((steps / width) as i64);
+                    e.compare("LT", &args[0], &limit)
+                },
+                |e, args| {
+                    let index = if width == 1 {
+                        args[0].clone()
+                    } else {
+                        let width = e.int_value_const(width as i64);
+                        e.mul(&args[0], &width)
+                    };
+                    let mut result = block(e, args, &index, width)?;
+                    let one = e.int_value_const(1);
+                    result[0] = e.add(&args[0], &one);
+                    Ok(result)
                 },
             )?;
+            if !steps.is_multiple_of(width) {
+                let tail = self.int_value_const((steps - steps % width) as i64);
+                results = block(self, &results, &tail, steps % width)?;
+            }
             buffers = if reduce {
                 results[start..out_start].to_vec()
             } else {
@@ -924,6 +971,61 @@ impl Emitter<'_> {
             self.bind(id, buffers[0].clone());
         }
         Ok(result)
+    }
+
+    /// Small real carries have little device parallelism. Compile four ordered
+    /// steps per GPU loop to amortize launch overhead without reassociating them.
+    fn block_scan(&self, body: NodeId, state: &Components, xs: &Components, length: u64) -> bool {
+        let compact_state = |v: &Value| {
+            v.elem == ElemKind::Real
+                && (v.ty == MlirTy::Scalar
+                    || matches!(&v.ty, MlirTy::Ranked(dims) if matches!(dims.as_slice(), [Some(1..=8)])))
+        };
+        let compact_items = |v: &Value| matches!(&v.ty, MlirTy::Ranked(dims) if matches!(dims.as_slice(), [_] | [_, Some(1..=8)]));
+        if self.target.serial_scans()
+            || length < 32
+            || !self.call_frame.is_empty()
+            || self.region_depth != 0
+            || state.values.len() > 4
+            || xs.values.len() > 4
+            || !state.values.iter().all(compact_state)
+            || !xs.values.iter().all(compact_items)
+        {
+            return false;
+        }
+        // Bound repeated code and skip nested loops. Already-bound operands
+        // are captured once in the enclosing function.
+        const MAX_NODES: usize = 48;
+        let mut pending = vec![body];
+        let mut seen = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if self.memo.contains_key(&id) || !seen.insert(id) {
+                continue;
+            }
+            if seen.len() > MAX_NODES {
+                return false;
+            }
+            let node = self.m.node(id);
+            if let Node::Call(call) = node {
+                if call.args.len() + call.named.len() > MAX_NODES {
+                    return false;
+                }
+                if let CallHead::Builtin(head) = call.head
+                    && matches!(
+                        self.m.resolve(head),
+                        "scan" | "reduce" | "builtin_sample" | "integral"
+                    )
+                {
+                    return false;
+                }
+            }
+            node.for_each_child(|child| pending.push(child));
+            let target = self.resolve_ref_one(id);
+            if target != id {
+                pending.push(target);
+            }
+        }
+        true
     }
 
     /// A left scan of scalar integers with the literal callback `(a, x) -> a + x`.
@@ -1027,6 +1129,16 @@ impl Emitter<'_> {
         let mut dims = shape(&value.ty).to_vec();
         dims.insert(axis, Some(1));
         let update = self.reshape(value, tensor(dims));
+        self.update_scan_rows(buffer, &update, index, axis)
+    }
+
+    fn update_scan_rows(
+        &mut self,
+        buffer: &Value,
+        update: &Value,
+        index: &Value,
+        axis: usize,
+    ) -> Value {
         let zero = self.int_value_const(0);
         let rank = shape(&buffer.ty).len();
         let mut starts = vec![zero.ssa.as_str(); rank];
