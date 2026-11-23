@@ -56,7 +56,7 @@
 use flatppl_core::{CallHead, Dim, Node, NodeId, Scalar, Symbol, Type};
 
 use crate::emitter::{Axes, Emitter, IntegralKind, elem_rank};
-use crate::mlir::{ElemKind, MlirTy, Value};
+use crate::mlir::{ElemKind, Lowered, MlirTy, Value};
 use crate::refuse::EmitError;
 
 /// Lower one FlatPDL builtin call to a [`Value`]. `id` is the call (or
@@ -3260,12 +3260,24 @@ enum ElemSet {
 /// `in(v, S)` (spec §06 membership predicate `_ in R`) over a §03 element set,
 /// or over `cartpow(S, n)` of one for a vector variate.
 ///
-/// A supported `S` is [`ElemSet`]: `interval(lo, hi)`, `posreals`,
-/// `nonnegreals`. Positional `cartprod` checks each scalar coordinate against
-/// its own element set. Other set expressions refuse.
+/// Positional `cartprod` checks each scalar coordinate against its own
+/// element set. Named `cartprod` checks the corresponding record fields.
 fn lower_in(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [v_id, set_id] = args_exact(id, args)?;
-    lower_membership(e, id, v_id, set_id)
+    // The ABI represents a table by its columns. Treating those columns as
+    // a record point requires the explicit record(table) conversion.
+    fn contains_table(ty: &Type) -> bool {
+        match ty {
+            Type::Table { .. } => true,
+            Type::Record(fields) => fields.iter().any(|(_, ty)| contains_table(ty)),
+            _ => false,
+        }
+    }
+    if e.type_of(v_id).is_some_and(contains_table) {
+        return Err(EmitError::at(id, "'in' over a table point is unsupported"));
+    }
+    let point = e.lower_value(v_id)?;
+    lower_membership(e, id, &point, set_id)
 }
 
 /// The fields of a record set `cartprod(name = S, …)`, by name.
@@ -3279,19 +3291,10 @@ fn record_set_fields(e: &Emitter, set_id: NodeId) -> Option<Vec<(Symbol, NodeId)
     .then(|| c.named.iter().map(|n| (n.name, n.value)).collect())
 }
 
-/// The field values of a written `record(name = v, …)`, by name.
-fn record_fields(e: &Emitter, v_id: NodeId) -> Option<Vec<(Symbol, NodeId)>> {
-    let Node::Call(c) = e.node(e.resolve_ref_one(v_id)) else {
-        return None;
-    };
-    (matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "record") && c.args.is_empty())
-        .then(|| c.named.iter().map(|n| (n.name, n.value)).collect())
-}
-
 fn lower_membership(
     e: &mut Emitter,
     id: NodeId,
-    v_id: NodeId,
+    point: &Lowered,
     set_id: NodeId,
 ) -> Result<Value, EmitError> {
     let set_id = e.resolve_ref_one(set_id);
@@ -3299,9 +3302,12 @@ fn lower_membership(
     // §03: a record lies in `cartprod(name = S, …)` when each field lies in the set
     // of the same name, so the record needs no tensor form.
     if let Some(sets) = record_set_fields(e, set_id) {
-        let fields = record_fields(e, v_id).ok_or_else(|| {
-            EmitError::at(id, "'in' over a record set needs a written record point")
-        })?;
+        let Lowered::Record(fields) = point else {
+            return Err(EmitError::at(
+                id,
+                "'in' over a record set needs a record point",
+            ));
+        };
         if fields.len() != sets.len() {
             return Err(EmitError::at(
                 id,
@@ -3310,7 +3316,7 @@ fn lower_membership(
         }
         let mut members = Vec::with_capacity(sets.len());
         for (name, set) in sets {
-            let Some(&(_, field)) = fields.iter().find(|(n, _)| *n == name) else {
+            let Some((_, field)) = fields.iter().find(|(n, _)| n == e.resolve(name)) else {
                 return Err(EmitError::at(
                     id,
                     format!(
@@ -3327,14 +3333,19 @@ fn lower_membership(
             .ok_or_else(|| EmitError::at(id, "'in' over an empty record set is unsupported"));
     }
 
-    let v = e.lower_node(v_id)?;
+    let Lowered::Tensor(v) = point else {
+        return Err(EmitError::at(
+            id,
+            "'in' with a record point needs a record set",
+        ));
+    };
 
     if let Node::Call(c) = e.node(set_id)
         && matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "cartprod")
         && c.named.is_empty()
     {
         let sets = c.args.clone();
-        if e.cell_ty(&v) != MlirTy::Ranked(vec![Some(sets.len() as u64)]) {
+        if e.cell_ty(v) != MlirTy::Ranked(vec![Some(sets.len() as u64)]) {
             return Err(EmitError::at(
                 id,
                 "'in' over cartprod needs a vector with one scalar per set",
@@ -3344,7 +3355,7 @@ fn lower_membership(
         for (i, set) in sets.into_iter().enumerate() {
             let set = classify_elem_set(e, id, set)?;
             let index = e.int_value_const(i as i64);
-            let cell = e.gather_cells(&v, &index, 0);
+            let cell = e.gather_cells(v, &index, 0);
             members.push(elem_membership(e, id, &cell, set)?);
         }
         return members
@@ -3379,16 +3390,16 @@ fn lower_membership(
             ));
         }
         let set = classify_elem_set(e, id, elem_id)?;
-        let per_cell = elem_membership(e, id, &v, set)?;
+        let per_cell = elem_membership(e, id, v, set)?;
         return Ok(e.reduce_boolean("stablehlo.and", "true", &per_cell));
     }
 
     if let Some((set, n_id)) = vector_set_parts(e, set_id) {
-        return vector_set_membership(e, id, &v, set, n_id);
+        return vector_set_membership(e, id, v, set, n_id);
     }
 
     let set = classify_elem_set(e, id, set_id)?;
-    elem_membership(e, id, &v, set)
+    elem_membership(e, id, v, set)
 }
 
 /// The §03 sets of real n-vectors that `in` tests as a whole.

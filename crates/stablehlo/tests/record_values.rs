@@ -493,6 +493,50 @@ fn record_set_membership_is_the_conjunction_of_field_memberships() {
     );
 }
 
+#[test]
+fn record_input_membership_uses_named_fields_at_each_level() {
+    let model = "p = elementof(cartprod(a = reals, inner = cartprod(b = cartpow(reals, 2))))\n\
+                 S = cartprod(inner = cartprod(b = cartpow(posreals, 2)), a = unitinterval)\n\
+                 inputs = p\n";
+    assert_eq!(
+        emit(&format!("{model}outputs = p in S\n")),
+        emit(&format!(
+            "{model}outputs = land(p.inner.b in cartpow(posreals, 2), p.a in unitinterval)\n"
+        )),
+    );
+    let promoted = "p = record(x = [-1.0, -2.0])\ninputs = p\n";
+    assert_eq!(
+        emit(&format!(
+            "{promoted}outputs = p in cartprod(x = cartpow(posreals, 2))\n"
+        )),
+        emit(&format!(
+            "{promoted}outputs = p.x in cartpow(posreals, 2)\n"
+        )),
+    );
+}
+
+#[test]
+fn a_table_row_and_its_column_record_have_their_own_sets() {
+    let model = "t = elementof(cartpow(cartprod(x = reals), 2))\ninputs = t\n";
+    assert_eq!(
+        emit(&format!(
+            "{model}outputs = t[1] in cartprod(x = posreals)\n"
+        )),
+        emit(&format!("{model}outputs = t.x[1] in posreals\n")),
+    );
+    assert_eq!(
+        emit(&format!(
+            "{model}outputs = record(t) in cartprod(x = cartpow(posreals, 2))\n"
+        )),
+        emit(&format!("{model}outputs = t.x in cartpow(posreals, 2)\n")),
+    );
+    let result = emit_mode(
+        &format!("{model}outputs = t in cartprod(x = cartpow(posreals, 2))\n"),
+        Mode::LogDensity,
+    );
+    assert!(result.unwrap_err().contains("table point"));
+}
+
 // The posteriorDB state_space port truncates a record-valued Lebesgue by a record
 // set. At s = [0.5, 1.5] the closed form is -sum(s) = -2.0, executed in the PR.
 #[test]
