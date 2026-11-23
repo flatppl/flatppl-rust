@@ -11,7 +11,7 @@ use flatppl_core::{
     NamedKind, Node, NodeId, Ref, RefNs, Scalar, ScalarType, Symbol, Type,
 };
 
-use crate::{Query, affine_scan, metric, recurrence, tensor};
+use crate::{Query, affine_scan, metric, probability_scan, recurrence, tensor};
 
 pub(super) fn legalize(module: &Module, query: &Query<'_>) -> Option<Module> {
     // Avoid cloning the arena when no supported expansion occurs.
@@ -21,6 +21,9 @@ pub(super) fn legalize(module: &Module, query: &Query<'_>) -> Option<Module> {
             .iter()
             .any(|name| expect_builtin_call(module, id, name).is_some())
         {
+            return true;
+        }
+        if normal_row_operands(module, id).is_some() {
             return true;
         }
         expect_builtin_call(module, id, "broadcast")
@@ -102,6 +105,7 @@ impl Walker<'_> {
                     .or_else(|| metric::lower(self.module, current))
                     .or_else(|| recurrence::lower(self.module, self.inputs, current))
                     .or_else(|| affine_scan::square_scan(self.module, self.inputs, current))
+                    .or_else(|| probability_scan::projection(self.module, self.inputs, current))
                     .or_else(|| affine_scan::residual_projection(self.module, self.inputs, current))
                     .unwrap_or(current)
             }
@@ -112,11 +116,95 @@ impl Walker<'_> {
     }
 }
 
+fn normal_row_operands(module: &Module, node: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
+    let call = expect_builtin_call(module, node, "broadcast")?;
+    let [head, tag, parameters, observation] = *call.args else {
+        return None;
+    };
+    let named = |id, name| matches!(module.node(id), Node::Const(s) if module.resolve(*s) == name);
+    if !call.named.is_empty()
+        || !named(head, "builtin_logdensityof")
+        || !named(tag, "Normal")
+        || tensor::nested_vector(module, observation).is_none()
+    {
+        return None;
+    }
+    Some((tag, parameters, observation))
+}
+
+// This FlatPDL primitive scores the iid coordinates of each outer row.
+// Keep that reduction separate from the ordinary pointwise density rule.
+fn lift_normal_rows(
+    module: &mut Module,
+    inputs: &HashSet<BindingId>,
+    node: NodeId,
+) -> Option<NodeId> {
+    let (tag, parameters, observation) = normal_row_operands(module, node)?;
+    let expected = module.type_of(node)?.clone();
+    let Type::Array { shape, elem } = &expected else {
+        return None;
+    };
+    if **elem != crate::REAL {
+        return None;
+    }
+    let parameters = resolve_unpromoted(module, inputs, parameters)?;
+    let record = expect_builtin_call(module, parameters, "broadcast")?;
+    let [head] = *record.args else {
+        return None;
+    };
+    if !matches!(module.node(head), Node::Const(s) if module.resolve(*s) == "record") {
+        return None;
+    }
+    let fields: Vec<_> = record
+        .named
+        .iter()
+        .map(|field| (field.name, field.value))
+        .collect();
+    if fields.len() != 2
+        || !fields.iter().any(|&(name, _)| module.resolve(name) == "mu")
+        || !fields
+            .iter()
+            .any(|&(name, _)| module.resolve(name) == "sigma")
+    {
+        return None;
+    }
+    let mut scope = Scope::new(module, inputs);
+    let observed = scope.framed_operand(observation)?;
+    let mut operands: Vec<_> = fields
+        .iter()
+        .map(|&(_, value)| scope.framed_operand(value))
+        .collect::<Option<_>>()?;
+    operands.push(observed);
+    let (layout, width) = operand_shape(&operands)?;
+    if layout != EventLayout::Vector {
+        return None;
+    }
+    let scores: Vec<_> = (0..width)
+        .map(|index| {
+            let parameters = fields
+                .iter()
+                .zip(&operands)
+                .map(|(&(name, _), operand)| Some((name, operand.item(index)?)))
+                .collect::<Option<_>>()?;
+            let observation = operands.last()?.item(index)?;
+            scope.score(tag, parameters, observation)
+        })
+        .collect::<Option<_>>()?;
+    let mut scores = scores.into_iter();
+    let first = scores.next()?;
+    let row = scores.try_fold(first, |a, b| scope.pointwise_call("add", vec![a, b]))?;
+    let row = expand(scope.module, row, shape, elem)?;
+    annotate_equivalent(scope.module, row.value, &expected)
+}
+
 pub(super) fn lift_broadcast(
     module: &mut Module,
     inputs: &HashSet<BindingId>,
     node: NodeId,
 ) -> Option<NodeId> {
+    if let Some(result) = lift_normal_rows(module, inputs, node) {
+        return Some(result);
+    }
     if packed_vectors(module, node).is_some() || packed_rows(module, node).is_some() {
         return None;
     }
@@ -141,16 +229,7 @@ pub(super) fn lift_broadcast(
     let operands = bind_call_args(module, &names, positional, &call.named, keyword_only)?;
     let mut scope = Scope::new(module, inputs);
     for ((_, reference), value) in entries.into_iter().zip(operands) {
-        let ty = scope.module.type_of(value)?.clone();
-        let mapped = match &ty {
-            Type::Array { shape, elem } if scalar(elem) => Operand::Scalar(Cell {
-                value,
-                shape: shape.to_vec(),
-            }),
-            Type::Array { shape, elem } => scope.array_operand(value, shape, elem)?,
-            ty if scalar(ty) => Operand::Scalar(Cell::scalar(value)),
-            _ => return None,
-        };
+        let mapped = scope.framed_operand(value)?;
         scope.bound.push((reference, mapped));
     }
     scope.depends(body, 0)?;
@@ -325,6 +404,18 @@ impl Scope<'_> {
         self.bound
             .iter()
             .find_map(|(target, value)| (*target == reference).then_some(value))
+    }
+
+    fn framed_operand(&mut self, value: NodeId) -> Option<Operand> {
+        match self.module.type_of(value)?.clone() {
+            Type::Array { shape, elem } if scalar(&elem) => Some(Operand::Scalar(Cell {
+                value,
+                shape: shape.to_vec(),
+            })),
+            Type::Array { shape, elem } => self.array_operand(value, &shape, &elem),
+            ty if scalar(&ty) => Some(Operand::Scalar(Cell::scalar(value))),
+            _ => None,
+        }
     }
 
     fn array_operand(&mut self, value: NodeId, shape: &[Dim], elem: &Type) -> Option<Operand> {

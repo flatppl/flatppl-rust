@@ -7,14 +7,17 @@ mod affine_scan;
 mod aggregate;
 mod callbacks;
 mod contract;
+mod fixed_scan;
 mod integral;
 mod math;
 mod metric;
+mod probability_scan;
 mod record;
 mod recurrence;
 mod rules;
 mod tensor;
 mod transforms;
+mod vector_scan;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -321,9 +324,24 @@ fn reverse_values(
     seeds: &[NodeId],
     mode: Mode,
 ) -> Result<Contributions, Error> {
+    reverse_values_with_mask(emitter, plan, rules, roots, seeds, mode, false)
+}
+
+fn reverse_values_with_mask(
+    emitter: &mut Emitter,
+    plan: &Plan<'_>,
+    rules: &rules::Rules<'_>,
+    roots: &[Key],
+    seeds: &[NodeId],
+    mode: Mode,
+    seed_masked: bool,
+) -> Result<Contributions, Error> {
     let mut contributions = Contributions::new();
     for (&root, &seed) in roots.iter().zip(seeds) {
-        contributions.entry(root).or_default().push((seed, false));
+        contributions
+            .entry(root)
+            .or_default()
+            .push((seed, seed_masked));
     }
     for step in plan.steps.iter().rev() {
         let terms = contributions.remove(&Key::Node(step.node)).ok_or_else(|| {
@@ -335,6 +353,21 @@ fn reverse_values(
         let masked = terms.iter().any(|&(_, masked)| masked);
         let terms: Vec<_> = terms.into_iter().map(|(value, _)| value).collect();
         let bar = emitter.named_adjoint("_ad_bar", step.node, &terms);
+        if step.op == fixed_scan::OP {
+            let projection =
+                fixed_scan::Projection::read(plan.module, &plan.query.inputs, step.node)
+                    .ok_or_else(|| Error::new(Some(step.node), "missing projected scan"))?;
+            let terms = projection.pullback(emitter, bar, masked)?;
+            for (slot, term) in [0].into_iter().chain(2..step.targets.len()).zip(terms) {
+                if let Some(target) = step.targets[slot].filter(|key| plan.activity[key]) {
+                    contributions
+                        .entry(target)
+                        .or_default()
+                        .push((term, masked));
+                }
+            }
+            continue;
+        }
         let scope = plan.integrals.get(&step.node);
         let aggregate = plan.aggregates.get(&step.node);
         if scope.is_none() && aggregate.is_none() {
@@ -452,6 +485,14 @@ fn forward_values(
         }
         if let Some(scope) = plan.integrals.get(&step.node) {
             let tangent = scope.pushforward(emitter, rules, step, &tangents)?;
+            tangents.insert(Key::Node(step.node), tangent);
+            continue;
+        }
+        if step.op == fixed_scan::OP {
+            let projection =
+                fixed_scan::Projection::read(plan.module, &plan.query.inputs, step.node)
+                    .ok_or_else(|| Error::new(Some(step.node), "missing projected scan"))?;
+            let tangent = projection.pushforward(emitter, step, &tangents)?;
             tangents.insert(Key::Node(step.node), tangent);
             continue;
         }
@@ -752,6 +793,9 @@ impl<'a> Plan<'a> {
 
     fn collect_rules(&self, mode: Mode, requests: &mut BTreeSet<rules::RuleKey<'a>>) {
         for step in &self.steps {
+            if step.op == fixed_scan::OP {
+                continue;
+            }
             if let Some(scope) = self.integrals.get(&step.node) {
                 scope.plan.collect_rules(mode, requests);
                 continue;
@@ -770,41 +814,96 @@ impl<'a> Plan<'a> {
         }
     }
 
-    fn visit(&mut self, key: Key, depth: usize) -> Result<bool, Error> {
-        if let Some(&active) = self.activity.get(&key) {
-            return Ok(active);
-        }
+    fn visit(&mut self, root: Key, depth: usize) -> Result<bool, Error> {
         if depth > DEFAULT_MAX_DEPTH {
             return Err(Error::new(
                 None,
-                "derivative DAG exceeds the expression depth limit",
+                "derivative scopes exceed the expression depth limit",
             ));
         }
-        let active = match key {
-            Key::Input(binding) => self.query.wrt.iter().any(|input| input.binding == binding),
-            Key::Node(node) => self.visit_node(node, depth)?,
-        };
-        self.activity.insert(key, active);
-        Ok(active)
+        // Named states can form long dependency chains even though every
+        // authored expression and callable body has a bounded depth.
+        let mut pending = HashSet::new();
+        let mut work = vec![Dependency::Enter(root)];
+        while let Some(item) = work.pop() {
+            match item {
+                Dependency::Enter(key) => {
+                    if self.activity.contains_key(&key) {
+                        continue;
+                    }
+                    let prepared = match key {
+                        Key::Input(binding) => Prepared::Known(
+                            self.query.wrt.iter().any(|input| input.binding == binding),
+                        ),
+                        Key::Node(node) => {
+                            if pending.contains(&key) {
+                                return Err(Error::new(Some(node), "cyclic derivative dependency"));
+                            }
+                            self.prepare_node(node, depth)?
+                        }
+                    };
+                    match prepared {
+                        Prepared::Known(active) => {
+                            self.activity.insert(key, active);
+                        }
+                        Prepared::Step(step) => {
+                            pending.insert(key);
+                            let continuation = work.len();
+                            work.extend(
+                                step.targets
+                                    .iter()
+                                    .rev()
+                                    .flatten()
+                                    .map(|&target| Dependency::Enter(target)),
+                            );
+                            // The postorder entry must run after all incoming operands.
+                            work.insert(continuation, Dependency::Finish(step));
+                        }
+                    }
+                }
+                Dependency::Finish(step) => {
+                    if step.op == fixed_scan::OP
+                        && step.targets[1].is_some_and(|grid| self.activity[&grid])
+                    {
+                        return Err(Error::new(
+                            Some(step.node),
+                            "a fixed scan grid cannot be an active input",
+                        ));
+                    }
+                    let key = Key::Node(step.node);
+                    let active = step
+                        .targets
+                        .iter()
+                        .flatten()
+                        .any(|target| self.activity[target]);
+                    if active {
+                        self.steps.push(step);
+                    }
+                    pending.remove(&key);
+                    self.activity.insert(key, active);
+                }
+            }
+        }
+        Ok(self.activity[&root])
     }
 
-    fn visit_node(&mut self, node: NodeId, depth: usize) -> Result<bool, Error> {
+    fn prepare_node(&mut self, node: NodeId, depth: usize) -> Result<Prepared<'a>, Error> {
         let Node::Call(call) = self.module.node(node) else {
-            return Ok(false);
+            return Ok(Prepared::Known(false));
         };
         let op = match call.head {
             CallHead::Builtin(symbol) => self.module.resolve(symbol),
             CallHead::User(callee) => special_op(self.module, callee).unwrap_or("user call"),
         };
         if matches!(op, flatppl_core::LOG_INTEGRAL | flatppl_core::MASS_INTEGRAL) {
-            return integral::visit(self, node, op, &call.args, depth);
+            return integral::visit(self, node, op, &call.args, depth).map(Prepared::Known);
         }
         if op == "aggregate"
             && call.named.is_empty()
             && contract::SumProduct::read(self.module, &call.args).is_none()
             && let Some(active) = aggregate::visit(self, node, &call.args, depth)?
         {
-            return Ok(active);
+            return Ok(Prepared::Known(active));
         }
         if matches!(op, "elementof" | "external" | "load_data") {
             return Err(Error::new(
@@ -818,7 +917,7 @@ impl<'a> Plan<'a> {
             && (tensor::numeric_shape(self.module, *input).is_some()
                 || tensor::nested_vector(self.module, *input).is_some())
         {
-            return Ok(false);
+            return Ok(Prepared::Known(false));
         }
         let positional_broadcast = if op == "broadcast" && call.named.is_empty() {
             call.args.split_first().and_then(|(&head, args)| {
@@ -836,11 +935,29 @@ impl<'a> Plan<'a> {
                 .or_else(|| transforms::args(self.module, self.query, call, op))
         {
             (rule, args, op == "broadcast")
+        } else if op == "get"
+            && let Some(projection) =
+                fixed_scan::Projection::read(self.module, &self.query.inputs, node)
+        {
+            (fixed_scan::OP, projection.args(), false)
+        } else if op == "aggregate"
+            && call.named.is_empty()
+            && let Some(matrix) = aggregate::row_maximum(self.module, &call.args)
+        {
+            ("row maximum", vec![matrix], false)
         } else if op == "aggregate"
             && call.named.is_empty()
             && let Some(contraction) = contract::SumProduct::read(self.module, &call.args)
         {
             ("indexed sum product", contraction.args().to_vec(), false)
+        } else if op == "get"
+            && let Some(args) = vector_scan::operands(self.module, &self.query.inputs, node)
+        {
+            (vector_scan::OP, args.to_vec(), false)
+        } else if op == "scan"
+            && let Some(args) = probability_scan::args(self.module, &self.query.inputs, &call.args)
+        {
+            ("probability scan", args.to_vec(), false)
         } else if op == "scan"
             && let Some(args) = affine_scan::args(self.module, &self.query.inputs, &call.args)
         {
@@ -874,27 +991,32 @@ impl<'a> Plan<'a> {
         };
         let op = math::complex_rule(self.module, node, &args, op).unwrap_or(op);
         let mut targets = Vec::with_capacity(args.len());
-        let mut active = false;
         for (slot, &arg) in args.iter().enumerate() {
             if op == "ifelse" && slot == 0 {
                 targets.push(None);
                 continue;
             }
             let target = self.query.key(self.module, arg)?;
-            active |= self.visit(target, depth + 1)?;
             targets.push(Some(target));
         }
-        if active {
-            self.steps.push(Step {
-                node,
-                op,
-                args,
-                targets,
-                broadcast,
-            });
-        }
-        Ok(active)
+        Ok(Prepared::Step(Step {
+            node,
+            op,
+            args,
+            targets,
+            broadcast,
+        }))
     }
+}
+
+enum Dependency<'a> {
+    Enter(Key),
+    Finish(Step<'a>),
+}
+
+enum Prepared<'a> {
+    Known(bool),
+    Step(Step<'a>),
 }
 
 fn special_op(module: &Module, callee: NodeId) -> Option<&'static str> {
@@ -1200,6 +1322,9 @@ fn structural(op: &str) -> bool {
             | "matrix product"
             | "scoped aggregate"
             | "affine scan"
+            | "probability scan"
+            | "row maximum"
+            | vector_scan::OP
             | "transpose"
             | "iid Dirichlet log density"
             | "iid Categorical log density"
@@ -1405,6 +1530,8 @@ struct Emitter {
     names: HashMap<NodeId, Symbol>,
     suffix: usize,
     inline: bool,
+    vector_scans: HashMap<NodeId, vector_scan::Prepared>,
+    vector_scan_bars: HashMap<NodeId, NodeId>,
 }
 
 impl Emitter {
@@ -1420,6 +1547,8 @@ impl Emitter {
             names,
             suffix: 0,
             inline: false,
+            vector_scans: HashMap::new(),
+            vector_scan_bars: HashMap::new(),
         }
     }
 

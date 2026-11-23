@@ -119,3 +119,54 @@ fn autodiff_accepts_an_explicit_empty_selection() {
     let output = String::from_utf8(explicit.stdout).unwrap();
     assert!(output.contains("outputs = primal"), "{output}");
 }
+
+#[cfg(feature = "stablehlo")]
+#[test]
+fn probability_scan_vjp_emits_a_guarded_reverse_loop_with_the_seed_abi() {
+    let model = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/probability_scan/masked.flatppl"
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .args([
+            "stablehlo",
+            model,
+            "--dtype",
+            "f64",
+            "--ad-mode",
+            "vjp",
+            "--ad-wrt",
+            "q",
+            "--ad-wrt",
+            "obs",
+            "--ad-wrt",
+            "high",
+            "--ad-wrt",
+            "low",
+            "--ad-wrt",
+            "unused",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hlo = String::from_utf8(output.stdout).unwrap();
+    let signature = hlo.lines().find(|line| line.contains("func.func")).unwrap();
+    assert!(
+        signature.ends_with(
+            "%arg6: tensor<f64>) -> (tensor<f64>, tensor<f64>, tensor<65xf64>, tensor<f64>, tensor<f64>, tensor<f64>) {"
+        ),
+        "{signature}"
+    );
+    assert!(
+        hlo.split("stablehlo.while").skip(1).any(|region| {
+            let body = region.split_once("} do {").unwrap().1;
+            let body = body.split_once("stablehlo.return").unwrap().0;
+            body.contains("stablehlo.compare EQ") && body.contains("stablehlo.select")
+        }),
+        "{hlo}"
+    );
+}

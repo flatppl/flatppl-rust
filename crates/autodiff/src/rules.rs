@@ -30,7 +30,9 @@ impl<'a> Rules<'a> {
             "\n",
             include_str!("complex.egg"),
             "\n",
-            include_str!("glm.egg")
+            include_str!("glm.egg"),
+            "\n",
+            include_str!("vector_scan.egg")
         )
         .to_owned();
         for (catalog, op, arity, slot) in &keys {
@@ -297,6 +299,35 @@ impl Template {
                     }
                 } else {
                     value
+                }
+            }
+            ("ProbabilityPropagation", [slot, forward, state, argument]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                let forward = self.int(*forward)? != 0;
+                let state = self.emit(*state, emitter, values)?;
+                let argument = self.emit(*argument, emitter, values)?;
+                crate::probability_scan::propagate(
+                    emitter,
+                    values.step,
+                    values.bar,
+                    state,
+                    argument,
+                    slot,
+                    forward,
+                )?
+            }
+            ("MarkovScan", [slot, forward]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                if self.int(*forward)? == 0 {
+                    crate::vector_scan::pullback(
+                        emitter,
+                        values.step,
+                        values.bar,
+                        slot,
+                        values.masked,
+                    )?
+                } else {
+                    crate::vector_scan::pushforward(emitter, values.step, values.bar, slot)?
                 }
             }
             ("AffineScan", [initial, sequence, scale, guarded]) => {

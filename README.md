@@ -82,6 +82,8 @@ AD runs after determinization and before optimization. Egglog rules cover
 pointwise arithmetic and conditionals, scalar broadcast callbacks, reductions,
 indexing and stacking, matrix operations, selected distribution transports,
 and log densities including Beta, Gamma, StudentT, Dirichlet, and MvNormal.
+The transform also handles fixed record and array scans, log-space Markov
+updates, and fixed-grid solver steps with active initial states and parameters.
 Active operations without a rule produce an error. Derivatives apply on the
 smooth, finite domain of the query.
 

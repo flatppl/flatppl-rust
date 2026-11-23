@@ -1,0 +1,12 @@
+q = elementof(unitinterval)
+obs = elementof(cartpow(reals, 65))
+high = elementof(unitinterval)
+low = elementof(unitinterval)
+unused = elementof(reals)
+enabled = elementof(reals)
+parameter = record(high = high, low = low, unused = unused)
+step(p, r, a) = a.low + (a.high - a.low) * invlogit(logit(p) + r)
+scan_values = scan(step, q, obs, parameter)
+score = ifelse(enabled > 0, sum(scan_values), unused)
+inputs = (q, obs, high, low, unused, enabled)
+outputs = score

@@ -8,6 +8,34 @@ use crate::{
     forward_values, real, rules::Rules, tensor,
 };
 
+// Recognize one row reduction over a rectangular real matrix. Treating
+// the indexed expression as a scalar would lose its free column axis.
+pub(super) fn row_maximum(module: &Module, args: &[NodeId]) -> Option<NodeId> {
+    let [reducer, output, body] = *args else {
+        return None;
+    };
+    let Node::Const(reducer) = module.node(reducer) else {
+        return None;
+    };
+    if module.resolve(*reducer) != "maximum" {
+        return None;
+    }
+    let [output] = *expect_builtin_call(module, output, "vector")?.args else {
+        return None;
+    };
+    let element = expect_builtin_call(module, body, "get")?;
+    let [matrix, row, column] = *element.args else {
+        return None;
+    };
+    let row = axis_name(module, row)?;
+    let column = axis_name(module, column)?;
+    let [_, _] = tensor::real_shape(module, matrix)? else {
+        return None;
+    };
+    (element.named.is_empty() && row != column && Some(row) == axis_name(module, output))
+        .then_some(matrix)
+}
+
 pub(super) struct Scope<'a> {
     pub(super) plan: Plan<'a>,
     root: Key,

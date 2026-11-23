@@ -655,10 +655,14 @@ pub(super) fn logsumexp(
         return None;
     };
     let input = emitter.primal(input);
-    let output = emitter.primal(output);
     let m = &mut emitter.module;
-    let shifted = broadcast(m, "sub", &[input, output]);
+    // Subtracting the rounded logsumexp loses relative precision when the
+    // logarithmic coordinates share a large common offset.
+    let maximum = build_call(m, "maximum", &[input]);
+    let shifted = broadcast(m, "sub", &[input, maximum]);
     let weights = broadcast(m, "exp", &[shifted]);
+    let total = build_call(m, "sum", &[weights]);
+    let weights = broadcast(m, "divide", &[weights, total]);
     let term = broadcast(m, "mul", &[weights, bar]);
     let term = zero_when_masked(m, bar, term, true);
     Some(if forward {

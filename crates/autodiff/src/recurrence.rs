@@ -7,20 +7,25 @@ use flatppl_core::graph::{
     build_call, build_record, expect_builtin_call, rebuild_with_children, resolve_ref_one,
 };
 use flatppl_core::{
-    Binding, BindingId, DEFAULT_MAX_DEPTH, Dim, Module, Node, NodeId, Ref, RefNs, Scalar, Type,
+    Binding, BindingId, DEFAULT_MAX_DEPTH, Dim, Module, Node, NodeId, Phase, Ref, RefNs, Scalar,
+    Symbol, Type,
 };
 
 use crate::{REAL, tensor};
 
 pub(super) const MAX_STEPS: u32 = 64;
+const MAX_ARRAY_SCAN_STEPS: u32 = 128;
 
 pub(super) fn lower(
     module: &mut Module,
     inputs: &HashSet<BindingId>,
     node: NodeId,
 ) -> Option<NodeId> {
-    if let Some(projection) = projected_scan(module, inputs, node) {
-        return Some(projection);
+    if let Some(expansion) = projected_scan(module, inputs, node)
+        .or_else(|| indexed_record_scan(module, inputs, node))
+        .or_else(|| array_scan(module, inputs, node))
+    {
+        return Some(expansion);
     }
     let (function, initial, sequence, params) =
         if let Some(call) = expect_builtin_call(module, node, "reduce") {
@@ -100,25 +105,20 @@ fn projected_scan(
         return None;
     }
     let scan = resolve_unpromoted(module, inputs, scan)?;
-    let scan_call = expect_builtin_call(module, scan, "scan")?;
-    if !scan_call.named.is_empty() {
-        return None;
-    }
-    let [step, initial, sequence, params @ ..] = scan_call.args.as_ref() else {
-        return None;
-    };
-    let [Dim::Static(length)] = *tensor::numeric_shape(module, *sequence)? else {
+    let Type::Table {
+        columns,
+        nrows: Dim::Static(length),
+    } = module.type_of(scan)?
+    else {
         return None;
     };
+    let length = *length;
     if length == 0
         || length > MAX_STEPS
         || tensor::real_shape(module, node)? != [Dim::Static(length)]
     {
         return None;
     }
-    let Type::Table { columns, .. } = module.type_of(scan)? else {
-        return None;
-    };
     if columns.iter().any(|(_, ty)| *ty != REAL) {
         return None;
     }
@@ -141,47 +141,235 @@ fn projected_scan(
     let column = columns
         .iter()
         .position(|(name, _)| module.resolve(*name) == field.as_ref())?;
-    let (body, formals) = callback(module, inputs, *step)?;
-    if formals.len() != 2 + params.len() {
-        return None;
-    }
-    expect_builtin_call(module, body, "record")?;
-
     let expected = Type::Record(columns.clone());
-    let result_type = module.type_of(node)?.clone();
-    let params = params.to_vec();
-    // Leave no generated bindings behind if a specialization cannot type-check.
+    let output = module.type_of(node)?.clone();
+    let name = columns[column].0;
+    let scan = FixedScan::read(module, inputs, scan, length, expected)?;
     let mut staged = module.clone();
-    let mut state = *initial;
-    let mut output = Vec::with_capacity(length as usize);
-    let mut seeds = Vec::new();
-    for index in 1..=length {
-        let cell = element(&mut staged, *sequence, index);
-        let actual = [state, cell].into_iter().chain(params.iter().copied());
-        let bindings: Vec<_> = formals.iter().copied().zip(actual).collect();
-        let next = substitute(&mut staged, inputs, body, &bindings, &mut HashMap::new(), 0)?;
-        infer_result(&mut staged, next, &expected, &seeds)?;
-
-        let record = expect_builtin_call(&staged, next, "record")?;
-        let fields = columns
-            .iter()
-            .map(|(name, _)| {
-                let value = record.named.iter().find(|field| field.name == *name)?.value;
-                Some((*name, value))
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let fields = fields
-            .into_iter()
-            .map(|(name, value)| Some((name, bind_value(&mut staged, value, "_ad_state")?)))
-            .collect::<Option<Vec<_>>>()?;
-        seeds = fields.iter().map(|&(_, field)| (field, REAL)).collect();
-        state = build_record(&mut staged, &fields);
-        output.push(fields[column].1);
-    }
-    let result = build_call(&mut staged, "vector", &output);
-    staged.set_type(result, result_type);
+    let fields = scan.project(&mut staged, inputs, name)?;
+    let result = build_call(&mut staged, "vector", &fields);
+    staged.set_type(result, output);
     *module = staged;
     Some(result)
+}
+
+fn indexed_record_scan(
+    module: &mut Module,
+    inputs: &HashSet<BindingId>,
+    node: NodeId,
+) -> Option<NodeId> {
+    let [row, selector] = *expect_builtin_call(module, node, "get")?.args.as_ref() else {
+        return None;
+    };
+    let Node::Lit(Scalar::Str(field)) = module.node(selector) else {
+        return None;
+    };
+    let field = field.clone();
+    let row = resolve_unpromoted(module, inputs, row)?;
+    let (table, index, get, base) = if let Some(call) = expect_builtin_call(module, row, "get") {
+        let [table, index] = *call.args.as_ref() else {
+            return None;
+        };
+        (table, index, "get", 1)
+    } else {
+        let [table, index] = *expect_builtin_call(module, row, "get0")?.args.as_ref() else {
+            return None;
+        };
+        (table, index, "get0", 0)
+    };
+    let table = resolve_unpromoted(module, inputs, table)?;
+    let table_type = module.type_of(table)?.clone();
+    let Type::Table {
+        columns,
+        nrows: Dim::Static(length),
+    } = table_type
+    else {
+        return None;
+    };
+    if length == 0 || length > MAX_ARRAY_SCAN_STEPS {
+        return None;
+    }
+    if columns
+        .iter()
+        .any(|(_, ty)| tensor::real_shape_of(ty).is_none())
+    {
+        return None;
+    }
+    let (name, field_type) = columns
+        .iter()
+        .find(|(name, _)| module.resolve(*name) == field.as_ref())?
+        .clone();
+    let terminal = module.phase_of(index) == Some(Phase::Fixed)
+        && !depends_on_input(module, inputs, index)
+        && flatppl_infer::fixed_int_value(module, index) == Some(i64::from(length) - (1 - base));
+    if !terminal && tensor::index_axes(module, index) != Some(0) {
+        return None;
+    }
+    let scan = FixedScan::read(module, inputs, table, length, Type::Record(columns))?;
+    let mut staged = module.clone();
+    let fields = scan.project(&mut staged, inputs, name)?;
+    let result = if terminal {
+        *fields.last()?
+    } else {
+        let select = |module: &mut Module, values: &[NodeId]| {
+            let sequence = build_call(module, "vector", values);
+            build_call(module, get, &[sequence, index])
+        };
+        let result = match tensor::real_shape_of(&field_type)? {
+            [] => select(&mut staged, &fields),
+            [Dim::Static(width)] if *width > 0 => select(&mut staged, &fields),
+            [Dim::Static(rows), Dim::Static(cols)] if *rows > 0 && *cols > 0 => {
+                // Gather each row with the existing nested-vector index rule.
+                let rows: Vec<_> = (1..=i64::from(*rows))
+                    .map(|row| {
+                        let values: Vec<_> = fields
+                            .iter()
+                            .map(|&field| tensor::stack_pick(&mut staged, field, row, false))
+                            .collect();
+                        select(&mut staged, &values)
+                    })
+                    .collect();
+                let rows = build_call(&mut staged, "vector", &rows);
+                build_call(&mut staged, "rowstack", &[rows])
+            }
+            _ => return None,
+        };
+        infer_result(&mut staged, result, &field_type, &[])?;
+        result
+    };
+    *module = staged;
+    Some(result)
+}
+
+fn array_scan(module: &mut Module, inputs: &HashSet<BindingId>, node: NodeId) -> Option<NodeId> {
+    let Type::Array { shape, elem } = module.type_of(node)? else {
+        return None;
+    };
+    let [Dim::Static(length)] = *shape.as_ref() else {
+        return None;
+    };
+    let &[Dim::Static(_)] = tensor::real_shape_of(elem)? else {
+        return None;
+    };
+    if length == 0 || length > MAX_ARRAY_SCAN_STEPS {
+        return None;
+    }
+    let scan = FixedScan::read(module, inputs, node, length, elem.as_ref().clone())?;
+    let output = module.type_of(node)?.clone();
+    let mut staged = module.clone();
+    let mut state = scan.initial;
+    let mut seeds = Vec::new();
+    let mut states = Vec::with_capacity(length as usize);
+    for index in 1..=length {
+        let next = scan.step(&mut staged, inputs, state, index, &seeds)?;
+        state = bind_value(&mut staged, next, "_ad_state")?;
+        seeds = vec![(state, scan.state_type.clone())];
+        states.push(state);
+    }
+    let result = build_call(&mut staged, "vector", &states);
+    staged.set_type(result, output);
+    *module = staged;
+    Some(result)
+}
+
+struct FixedScan {
+    body: NodeId,
+    formals: Vec<Ref>,
+    initial: NodeId,
+    sequence: NodeId,
+    params: Vec<NodeId>,
+    length: u32,
+    state_type: Type,
+}
+
+impl FixedScan {
+    fn read(
+        module: &Module,
+        inputs: &HashSet<BindingId>,
+        node: NodeId,
+        length: u32,
+        state_type: Type,
+    ) -> Option<Self> {
+        let call = expect_builtin_call(module, node, "scan")?;
+        let [step, initial, sequence, params @ ..] = call.args.as_ref() else {
+            return None;
+        };
+        if !call.named.is_empty()
+            || tensor::numeric_shape(module, *sequence)? != [Dim::Static(length)]
+        {
+            return None;
+        }
+        let (body, formals) = callback(module, inputs, *step)?;
+        if formals.len() != 2 + params.len() {
+            return None;
+        }
+        if matches!(state_type, Type::Record(_)) {
+            expect_builtin_call(module, body, "record")?;
+        }
+        Some(Self {
+            body,
+            formals,
+            initial: *initial,
+            sequence: *sequence,
+            params: params.to_vec(),
+            length,
+            state_type,
+        })
+    }
+
+    fn step(
+        &self,
+        module: &mut Module,
+        inputs: &HashSet<BindingId>,
+        state: NodeId,
+        index: u32,
+        seeds: &[(NodeId, Type)],
+    ) -> Option<NodeId> {
+        let cell = element(module, self.sequence, index);
+        let actual = [state, cell].into_iter().chain(self.params.iter().copied());
+        let bindings: Vec<_> = self.formals.iter().copied().zip(actual).collect();
+        let next = substitute(module, inputs, self.body, &bindings, &mut HashMap::new(), 0)?;
+        infer_result(module, next, &self.state_type, seeds)?;
+        Some(next)
+    }
+
+    fn project(
+        &self,
+        module: &mut Module,
+        inputs: &HashSet<BindingId>,
+        column: Symbol,
+    ) -> Option<Vec<NodeId>> {
+        let Type::Record(columns) = &self.state_type else {
+            return None;
+        };
+        let mut state = self.initial;
+        let mut seeds = Vec::new();
+        let selected = columns.iter().position(|(name, _)| *name == column)?;
+        let mut output = Vec::with_capacity(self.length as usize);
+        for index in 1..=self.length {
+            let next = self.step(module, inputs, state, index, &seeds)?;
+            let record = expect_builtin_call(module, next, "record")?;
+            let fields = columns
+                .iter()
+                .map(|(name, _)| {
+                    let value = record.named.iter().find(|field| field.name == *name)?.value;
+                    Some((*name, value))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let fields = fields
+                .into_iter()
+                .map(|(name, value)| Some((name, bind_value(module, value, "_ad_state")?)))
+                .collect::<Option<Vec<_>>>()?;
+            output.push(fields[selected].1);
+            seeds = fields
+                .iter()
+                .zip(columns.iter())
+                .map(|(&(_, field), (_, ty))| (field, ty.clone()))
+                .collect();
+            state = build_record(module, &fields);
+        }
+        Some(output)
+    }
 }
 
 fn infer_result(
@@ -221,6 +409,26 @@ fn resolve_unpromoted(
         value = rhs;
     }
     None
+}
+
+fn depends_on_input(module: &Module, inputs: &HashSet<BindingId>, root: NodeId) -> bool {
+    // A promoted input keeps its original phase and RHS in the typed module.
+    let mut pending = vec![root];
+    let mut visited = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+        if let (rhs, Some(binding)) = resolve_ref_one(module, node) {
+            if inputs.contains(&binding) {
+                return true;
+            }
+            pending.push(rhs);
+        } else {
+            module.for_each_child(node, |child| pending.push(child));
+        }
+    }
+    false
 }
 
 pub(super) fn callback(

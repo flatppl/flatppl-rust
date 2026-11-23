@@ -34,3 +34,32 @@ outputs = sum(project.(trajectory))
         flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
     }
 }
+
+#[test]
+fn vector_record_scan_products_serialize_with_a_native_scan() {
+    let source = "
+state = elementof(cartpow(reals, 2))
+scale = elementof(reals)
+step(s, time, p) = record(y = s.y .* p, t = time)
+times = [0.0, 1.0, 2.0]
+trajectory = scan(step, record(y = state, t = 0.0), times, scale).y
+inputs = (state, scale)
+outputs = sum(rowstack(trajectory))
+";
+    let mut module = flatppl_syntax::parse(source).unwrap();
+    let diagnostics = flatppl_infer::infer(&mut module);
+    assert!(diagnostics.iter().all(|d| d.severity != Severity::Error));
+    let deterministic = determinize_query(&module, &ModuleBundle::new()).unwrap();
+    for differentiate in [gradient, jvp, vjp] {
+        let derivative = differentiate(&deterministic, &["state", "scale"]).unwrap();
+        let source = flatppl_syntax::print(&derivative);
+        assert!(source.matches("scan(").count() >= 2);
+        let mut reparsed = flatppl_syntax::parse(&source).unwrap();
+        let diagnostics = flatppl_infer::infer(&mut reparsed);
+        assert!(
+            diagnostics.iter().all(|d| d.severity != Severity::Error),
+            "{diagnostics:?}"
+        );
+        flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
+    }
+}

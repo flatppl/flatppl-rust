@@ -1,0 +1,4 @@
+; For a normalized log transition, apply the local Jacobian or its transpose
+; along the fixed scan itinerary. Slots are initial state, matrix and emissions.
+(rewrite (Pullback "terminal log Markov scan" 3 slot) (MarkovScan slot 0) :ruleset pullbacks)
+(rewrite (Pushforward "terminal log Markov scan" 3 slot) (MarkovScan slot 1) :ruleset pullbacks)

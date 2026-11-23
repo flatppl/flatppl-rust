@@ -265,8 +265,21 @@ fn determinize_inner(
                 // Call inlining is still required to reach FlatPDL when the
                 // caller requests the graph before optimization.
                 if options.disable_optimizations {
-                    if crate::canon::inline_user_calls(&mut work) {
-                        let _ = flatppl_infer::infer(&mut work);
+                    // Specializing a sequence callback can expose another
+                    // applied callable, and inlining can expose a sequence.
+                    for _ in 0..12 {
+                        let inlined = crate::canon::inline_user_calls(&mut work);
+                        if inlined {
+                            let _ = flatppl_infer::infer(&mut work);
+                        }
+                        let specialized =
+                            crate::density::broadcast::specialize_callable_sequences(&mut work);
+                        if !inlined && !specialized {
+                            break;
+                        }
+                        if specialized {
+                            let _ = flatppl_infer::infer(&mut work);
+                        }
                     }
                     if let Some(roots) = roots {
                         crate::canon::retain_reachable(&mut work, roots);

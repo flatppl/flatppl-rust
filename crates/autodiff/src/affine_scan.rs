@@ -137,7 +137,7 @@ fn offsets(
     Some(build_call(module, "broadcast", &args))
 }
 
-fn placeholder(module: &mut Module, name: &str) -> (flatppl_core::Symbol, Ref) {
+pub(super) fn placeholder(module: &mut Module, name: &str) -> (flatppl_core::Symbol, Ref) {
     let label = module.intern(name);
     let name = module.intern(&format!("_{name}_"));
     (
@@ -230,7 +230,7 @@ pub(super) fn scan(
     build_call(module, "scan", &[step, initial, sequence, scale])
 }
 
-fn function_of(
+pub(super) fn function_of(
     module: &mut Module,
     body: NodeId,
     formals: &[(flatppl_core::Symbol, Ref)],

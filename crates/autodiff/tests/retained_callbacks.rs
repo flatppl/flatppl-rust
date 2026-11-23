@@ -10,10 +10,14 @@ fn infer(module: &mut Module) {
     );
 }
 
-fn check_transforms(source: &str, inputs: &[&str]) {
+fn lower(source: &str) -> Module {
     let mut model = flatppl_syntax::parse(source).unwrap();
     infer(&mut model);
-    let module = determinize_query(&model, &ModuleBundle::new()).unwrap();
+    determinize_query(&model, &ModuleBundle::new()).unwrap()
+}
+
+fn check_transforms(source: &str, inputs: &[&str]) {
+    let module = lower(source);
     for transform in [gradient, jvp, vjp] {
         let transformed = transform(&module, inputs).unwrap();
         let mut reparsed = flatppl_syntax::parse(&flatppl_syntax::print(&transformed)).unwrap();
@@ -51,5 +55,57 @@ inputs = (points, means)
 outputs = sum(mixture.(points, [means]))
 ",
         &["points", "means"],
+    );
+}
+
+const PROBABILITY_SCAN: &str = "
+q = elementof(unitinterval)
+high = elementof(unitinterval)
+low = elementof(unitinterval)
+items = elementof(cartpow(reals, 65))
+step(state, r, p) = record(previous = state.next, next = p.low + (p.high - p.low) * invlogit(logit(state.next) + r))
+project(state) = state.previous
+weights = project.(scan(step, record(previous = q, next = q), items, record(high = high, low = low)))
+inputs = (q, high, low, items)
+outputs = sum(weights)
+";
+const SCAN_INPUTS: &[&str] = &["q", "high", "low", "items"];
+
+#[test]
+fn differentiates_a_long_projected_probability_scan() {
+    check_transforms(PROBABILITY_SCAN, SCAN_INPUTS);
+}
+
+#[test]
+fn a_two_lag_scan_does_not_match_the_one_carry_rule() {
+    let source = PROBABILITY_SCAN.replace("logit(state.next)", "logit(state.previous)");
+    let module = lower(&source);
+    assert!(gradient(&module, SCAN_INPUTS).is_err());
+}
+
+#[test]
+fn differentiates_rectangular_row_maximum() {
+    check_transforms(
+        "
+x = elementof(cartpow(reals, [2, 3]))
+rowmax = aggregate(maximum, [.r], x[.r, .c])
+inputs = x
+outputs = sum(rowmax)
+",
+        &["x"],
+    );
+}
+
+#[test]
+fn differentiates_independent_normal_rows() {
+    check_transforms(
+        "
+x = elementof(cartpow(cartpow(reals, 4), 3))
+scale = elementof(posreals)
+parameters = broadcast(record, mu = [[0.0]], sigma = [[scale]])
+inputs = (x, scale)
+outputs = sum(builtin_logdensityof.(Normal, parameters, x))
+",
+        &["x", "scale"],
     );
 }
