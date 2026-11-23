@@ -4776,29 +4776,26 @@ fn kernel_and_input(m: &mut Module, ctor: NodeId) -> Result<(NodeId, NodeId), Re
     Ok((kernel, input))
 }
 
+// The standard Student-t CDF is exact at its centre and at infinite endpoints
+// for every valid degree of freedom.
+fn student_t_endpoint_cdf(m: &Module, kernel: NodeId, input: NodeId, x: NodeId) -> Option<f64> {
+    if !matches!(m.node(kernel), Node::Const(sym) if m.resolve(*sym) == "StudentT")
+        || static_real(m, find_field(m, input, "nu")?).is_some_and(|nu| nu <= 0.0 || nu.is_nan())
+    {
+        return None;
+    }
+    match static_real(m, x)? {
+        0.0 => Some(0.5),
+        f64::NEG_INFINITY => Some(0.0),
+        f64::INFINITY => Some(1.0),
+        _ => None,
+    }
+}
+
 /// `builtin_touniform(kernel, kernel_input, x)` — the CDF transport (§07).
 fn build_touniform(m: &mut Module, kernel: NodeId, input: NodeId, x: NodeId) -> NodeId {
-    // Student-t symmetry gives exact normalizers for half-line restrictions
-    // without requiring a general CDF implementation from the target. F(0) = 1/2
-    // holds for every nu > 0, so a run-time nu needs no static value.
-    if matches!(m.node(kernel), Node::Const(sym) if m.resolve(*sym) == "StudentT")
-        && let Some(parameters) = expect_builtin_call(m, input, "record")
-        && let Some(nu) = parameters.named.iter().find(|p| m.resolve(p.name) == "nu")
-        && static_real(m, nu.value).is_none_or(|nu| nu > 0.0)
-        && let Some(x) = static_real(m, x)
-    {
-        let cdf = if x == 0.0 {
-            Some(0.5)
-        } else if x == f64::NEG_INFINITY {
-            Some(0.0)
-        } else if x == f64::INFINITY {
-            Some(1.0)
-        } else {
-            None
-        };
-        if let Some(cdf) = cdf {
-            return m.alloc(Node::Lit(Scalar::Real(cdf)));
-        }
+    if let Some(cdf) = student_t_endpoint_cdf(m, kernel, input, x) {
+        return m.alloc(Node::Lit(Scalar::Real(cdf)));
     }
     let sym = m.intern("builtin_touniform");
     m.alloc(Node::Call(Call {

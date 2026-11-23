@@ -642,6 +642,8 @@ pub(crate) fn lower_interval_mass(
         && options
             .supports_cdf
             .is_some_and(|supports| !supports(m.resolve(ctor)))
+        && !(student_t_endpoint_cdf(m, kernel, input, lo).is_some()
+            && student_t_endpoint_cdf(m, kernel, input, hi).is_some())
     {
         let (base_lo, base_hi) = bounds(m, base).ok_or_else(|| {
             refuse(
