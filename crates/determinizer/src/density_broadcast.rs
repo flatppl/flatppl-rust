@@ -657,28 +657,71 @@ struct BoundCall {
     args: Vec<NodeId>,
 }
 
+/// The scalar accepted by a distribution parameter, when the catalogue declares
+/// one. Aggregate parameters and set-valued supports keep their own semantics.
+fn scalar_parameter(m: &Module, ctor: Symbol, index: usize) -> Option<Type> {
+    use flatppl_infer::ParamSet::*;
+    let name = m.resolve(ctor);
+    if *flatppl_infer::distribution_param_ranks(name)?.get(index)? != 0 {
+        return None;
+    }
+    let kind = match flatppl_infer::distribution_param_sets(name)?.get(index)? {
+        Reals | PosReals | NonNegReals | UnitInterval | Interval(..) => ScalarType::Real,
+        Integers | PosIntegers | NonNegIntegers => ScalarType::Integer,
+        Booleans => ScalarType::Boolean,
+        Unconstrained | StdSimplex | PosDefinite => return None,
+    };
+    Some(Type::Scalar(kind))
+}
+
 fn bind_call(
     m: &mut Module,
     head: CallHead,
     positional: &[NodeId],
     named: &[(Symbol, NodeId)],
 ) -> Result<BoundCall, RefuseError> {
+    let ctor = match head {
+        CallHead::Builtin(op) => Some(op),
+        CallHead::User(node) => std_module_ctor_sym(m, node),
+    };
+    let names: Option<Vec<Symbol>> = match (ctor, head) {
+        (Some(op), _) => flatppl_infer::constructor_param_names(m.resolve(op))
+            .map(|names| names.iter().map(|n| m.intern(n)).collect()),
+        (None, CallHead::User(node)) => crate::kernel::resolve_reified(m, node)
+            .map(|k| k.inputs.iter().map(|(n, _)| *n).collect()),
+        _ => None,
+    };
     let mut inputs = Vec::new();
     let mut args = Vec::new();
-    let mut bind = |m: &mut Module, value| {
+    let mut bind = |m: &mut Module, value, index: Option<usize>| {
         let (resolved, _) = resolve_ref_chain(m, value);
         match known_type(m, value).or_else(|| known_type(m, resolved)) {
             Some(Type::Array { .. } | Type::Table { .. }) => {
                 cell_input(m, value, &mut inputs, &mut args)
             }
+            None | Some(Type::Any | Type::Deferred | Type::Var(_))
+                if !matches!(m.node(resolved), Node::Const(_))
+                    && !matches!(m.type_of(resolved), Some(Type::Measure { .. })) =>
+            {
+                // Callable specialization can reveal the operand's frame later.
+                // Ordinary broadcast repeats a scalar and zips a collection.
+                let cell = ctor
+                    .zip(index)
+                    .and_then(|(ctor, i)| scalar_parameter(m, ctor, i))
+                    .ok_or_else(|| {
+                        refuse(
+                            value,
+                            m,
+                            "density broadcast cannot determine whether an operand is a collection",
+                        )
+                    })?;
+                let (label, reference, point) = placeholder(m, cell);
+                inputs.push((label, reference));
+                args.push(value);
+                Ok(point)
+            }
             _ => Ok(value),
         }
-    };
-    let names: Option<Vec<Symbol>> = match head {
-        CallHead::User(node) => crate::kernel::resolve_reified(m, node)
-            .map(|k| k.inputs.iter().map(|(n, _)| *n).collect()),
-        CallHead::Builtin(sym) => flatppl_infer::constructor_param_names(m.resolve(sym))
-            .map(|names| names.iter().map(|n| m.intern(n)).collect()),
     };
     let mixed: Vec<_> = if !positional.is_empty() && !named.is_empty() {
         names
@@ -703,7 +746,8 @@ fn bind_call(
     };
     let positional = positional
         .iter()
-        .map(|&value| bind(m, value))
+        .enumerate()
+        .map(|(i, &value)| bind(m, value, Some(i)))
         .collect::<Result<Vec<_>, RefuseError>>()?;
     let named = named
         .iter()
@@ -711,7 +755,13 @@ fn bind_call(
             Ok(NamedArg {
                 kind: NamedKind::Kwarg,
                 name,
-                value: bind(m, value)?,
+                value: bind(
+                    m,
+                    value,
+                    names
+                        .as_ref()
+                        .and_then(|ns| ns.iter().position(|n| *n == name)),
+                )?,
             })
         })
         .collect::<Result<Vec<_>, RefuseError>>()?;

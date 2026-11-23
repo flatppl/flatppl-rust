@@ -45,6 +45,31 @@ fn matrix_distribution_broadcast_matches_a_scalar_kernel() {
 }
 
 #[test]
+fn callback_result_broadcasts_like_an_explicit_density_operand() {
+    let source = "s = external(cartpow(posreals, 2))\n\
+                  step(y,t,n) = y .+ [t,n*t]\n\
+                  apply(u,t,p) = record(y=p[1](u.y,t,p[2]))\n\
+                  series(f,y,p) = scan(apply,record(y=y),[1.0,2.0],(f,p)).y\n\
+                  mat = rowstack(series(step,s,2.0))\n\
+                  sc = tile(addaxes(s,1,0),[2,1])\n\
+                  obs = rowstack([[1.0,2.0],[3.0,4.0]])\n\
+                  inputs = s\n";
+    for mean in ["mat", "mat[1,1]"] {
+        let expected = emit(&format!(
+            "{source}outputs = sum(((m,s,x) -> logdensityof(Normal(m,s),x)).({mean},sc,obs))"
+        ));
+        for parameters in [format!("{mean}, sc"), format!("mu={mean}, sigma=sc")] {
+            assert_eq!(
+                emit(&format!(
+                    "{source}outputs = logdensityof(Normal.({parameters}), obs)"
+                )),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
 fn density_broadcast_keeps_mixed_scalar_and_collection_operands() {
     let source = "x = external(cartpow(reals, 3))\n\
                   shift = external(reals)\n\
