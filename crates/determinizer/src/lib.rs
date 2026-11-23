@@ -21,6 +21,7 @@ mod query_analysis;
 mod refuse;
 mod sample;
 mod stdfn;
+mod surface_integrals;
 pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};
 pub use conformance::{is_flatpdl, is_flatpdl_with_options};
 pub use crossmodule::{Grafted, Import, graft_imports};
@@ -51,6 +52,7 @@ pub use query_analysis::{
 };
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::{expand_spline, standard_function};
+pub use surface_integrals::reify_numerical_integrals;
 
 /// Deterministic standard functions a backend lowers without portable expansion.
 /// The default keeps the backend-independent FlatPDL form.

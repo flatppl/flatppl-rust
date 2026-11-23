@@ -103,6 +103,37 @@ pub fn prepare_source(module: &mut Module) {
     source::factor_callables(module);
 }
 
+/// Lower a source AD query with portable numerical integration enabled.
+pub const NUMERICAL_SOURCE_OPTIONS: LoweringOptions<'static> = LoweringOptions {
+    disable_optimizations: false,
+    disable_sufficient_statistics: false,
+    share_normal_scale: false,
+    retain_standard_functions: &[("special-functions", "log_ndtr")],
+    compact_log_cdf_difference: false,
+    preserve_rand_tuple: false,
+    numerical_integrals: true,
+    vector_sort: false,
+    restricted_sampling: false,
+    supports_cdf: Some(|_| false),
+};
+
+/// Prepare a derivative module for compact, reparsable FlatPPL source output.
+///
+/// Pass the options used to differentiate the module. Numerical integration
+/// is printed as a weighted Lebesgue mass, which requires the same numerical
+/// opt-in when determinizing the printed source.
+pub fn prepare_source_with_options(
+    module: &mut Module,
+    options: &LoweringOptions<'_>,
+) -> Result<(), flatppl_determinizer::RefuseError> {
+    flatppl_determinizer::prepare_serialization(module, None);
+    if options.numerical_integrals {
+        flatppl_determinizer::reify_numerical_integrals(module)?;
+    }
+    source::factor_callables(module);
+    Ok(())
+}
+
 /// Append one derivative result per requested input, in request order.
 ///
 /// The module must declare a single real scalar `outputs` value. A query with

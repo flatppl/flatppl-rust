@@ -69,6 +69,15 @@ outputs = logdensityof(measure, 0.45)
     };
     let disabled = run(&["--ad-wrt", "a"]);
     assert_eq!(disabled.status.code(), Some(3));
+    let source = |options: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_flatppl"))
+            .arg("autodiff")
+            .arg(&model)
+            .args(options)
+            .output()
+            .unwrap()
+    };
+    assert_eq!(source(&["--wrt", "a"]).status.code(), Some(3));
     for mode in ["gradient", "jvp", "vjp"] {
         let result = run(&[
             "--numerical-integrals",
@@ -91,6 +100,39 @@ outputs = logdensityof(measure, 0.45)
             String::from_utf8_lossy(&result.stderr)
         );
         let hlo = String::from_utf8(result.stdout).unwrap();
+        assert!(hlo.contains("stablehlo.while"));
+        let printed = source(&[
+            "--numerical-integrals",
+            "--mode",
+            mode,
+            "--wrt",
+            "a",
+            "--wrt",
+            "lo",
+            "--wrt",
+            "hi",
+            "--wrt",
+            "cut",
+        ]);
+        assert!(
+            printed.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&printed.stderr)
+        );
+        let path = dir.path(&format!("{mode}.flatppl"));
+        std::fs::write(&path, printed.stdout).unwrap();
+        let compiled = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+            .arg("stablehlo")
+            .arg(path)
+            .args(["--numerical-integrals", "--dtype", "f64"])
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let hlo = String::from_utf8(compiled.stdout).unwrap();
         assert!(hlo.contains("stablehlo.while"));
     }
 }

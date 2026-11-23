@@ -92,12 +92,22 @@ Rust callers can use `flatppl_autodiff::determinize_query` followed by
 and derivative outputs. To print standalone FlatPPL, call
 `flatppl_autodiff::prepare_source` before `flatppl_syntax::print`.
 
-Compiler-only numerical integrals use the same transform through the
-`*_with_options` entry points. The transform integrates the derivative of
-the integrand and adds terms for moving bounds and supported scalar cutoffs.
-Reverse differentiation of integrands supports scalar, fixed-vector, and fixed-matrix captures. For StableHLO,
-combine `--numerical-integrals` with one or more `--ad-wrt` arguments and
-optionally `--ad-mode jvp` or `--ad-mode vjp`.
+Use `--numerical-integrals` to differentiate an integral and print the
+result as FlatPPL. The generated query uses weighted integrals and requires
+the same opt-in when compiled.
+
+```sh
+flatppl autodiff query.flatppl --numerical-integrals --wrt theta -o gradient.flatppl
+flatppl stablehlo gradient.flatppl --numerical-integrals
+```
+
+Numerical AD integrates the derivative of the integrand and adds terms for
+moving bounds and supported scalar cutoffs. Reverse differentiation supports
+scalar, fixed-vector, and fixed-matrix captures. The Rust
+`*_with_options` entry points accept `NUMERICAL_SOURCE_OPTIONS`.
+Call `prepare_source_with_options` before printing. To compile the
+derivative directly to StableHLO, add `--ad-wrt` to the `stablehlo` command
+and optionally select `--ad-mode jvp` or `--ad-mode vjp`.
 
 ### Lowering and emission
 

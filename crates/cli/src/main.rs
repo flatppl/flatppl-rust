@@ -262,6 +262,9 @@ enum Command {
         /// Derivative transform to emit.
         #[arg(long, value_enum, default_value_t = AdMode::Gradient)]
         mode: AdMode,
+        /// Permit numerical integrals in the generated source.
+        #[arg(long)]
+        numerical_integrals: bool,
         /// Output file. Write to stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -582,11 +585,13 @@ fn main() -> ExitCode {
             wrt,
             empty_wrt,
             mode,
+            numerical_integrals,
             output,
         } => autodiff_cmd(
             &input,
             if empty_wrt { &[] } else { &wrt },
             mode,
+            numerical_integrals,
             output.as_deref(),
         ),
         #[cfg(feature = "stablehlo")]
@@ -1501,15 +1506,22 @@ fn autodiff_cmd(
     input: &Path,
     wrt: &[String],
     mode: AdMode,
+    numerical_integrals: bool,
     output: Option<&Path>,
 ) -> Result<(), Failure> {
     let resolver = CliResolver::cache_only();
     let (surface, bundle, source) = load_and_infer(input, &resolver)?;
-    let mut lowered = flatppl_autodiff::determinize_query(&surface, &bundle)
+    let options = if numerical_integrals {
+        flatppl_autodiff::NUMERICAL_SOURCE_OPTIONS
+    } else {
+        Default::default()
+    };
+    let mut lowered = flatppl_autodiff::determinize_query_with_options(&surface, &bundle, &options)
         .map_err(|e| Failure::Refuse(refuse_message(input, &source, &surface, &e)))?;
     load_fixed_data(&mut lowered, &resolver, input, &source, &surface)?;
-    let mut derivative = differentiate(&lowered, wrt, mode, &Default::default())?;
-    flatppl_autodiff::prepare_source(&mut derivative);
+    let mut derivative = differentiate(&lowered, wrt, mode, &options)?;
+    flatppl_autodiff::prepare_source_with_options(&mut derivative, &options)
+        .map_err(|error| Failure::Refuse(error.reason))?;
     let rendered = flatppl_syntax::print(&derivative);
     match output {
         Some(path) => fs::write(path, rendered).map_err(|e| {

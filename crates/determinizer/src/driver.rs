@@ -775,7 +775,13 @@ fn apply_rule(
             })?;
         let root = crate::density::closed_form_totalmass(m, measure)
             .map(Ok)
-            .or_else(|| crate::density::integral::rectangular_totalmass(m, measure))
+            .or_else(|| {
+                crate::density::integral::lebesgue_totalmass(
+                    m,
+                    measure,
+                    options.numerical_integrals,
+                )
+            })
             .ok_or_else(|| {
                 crate::density::refuse(target_node, m, "totalmass needs a closed-form mass")
             })??;

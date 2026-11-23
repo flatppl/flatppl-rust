@@ -264,7 +264,7 @@ fn expectation(
 }
 
 pub(super) fn mass(m: &mut Module, measure: NodeId) -> Option<Result<NodeId, RefuseError>> {
-    if let Some(integral) = rectangular_mass(m, measure) {
+    if let Some(integral) = lebesgue_mass(m, measure, false) {
         return Some(integral.map(|(mass, logarithmic)| {
             if logarithmic {
                 mass
@@ -278,24 +278,28 @@ pub(super) fn mass(m: &mut Module, measure: NodeId) -> Option<Result<NodeId, Ref
     })
 }
 
-pub(crate) fn rectangular_totalmass(
+pub(crate) fn lebesgue_totalmass(
     m: &mut Module,
     measure: NodeId,
+    allow_scalar: bool,
 ) -> Option<Result<NodeId, RefuseError>> {
-    Some(rectangular_mass(m, measure)?.map(|(mass, logarithmic)| {
-        if logarithmic {
-            build_call(m, "exp", &[mass])
-        } else {
-            mass
-        }
-    }))
+    Some(
+        lebesgue_mass(m, measure, allow_scalar)?.map(|(mass, logarithmic)| {
+            if logarithmic {
+                build_call(m, "exp", &[mass])
+            } else {
+                mass
+            }
+        }),
+    )
 }
 
-// Direct Lebesgue reweighting gives unit reference density throughout the
-// rectangle. Integrate the callback alone, preserving raw derivatives at zero.
-fn rectangular_mass(
+// Direct Lebesgue reweighting gives unit reference density on the support.
+// Integrate the callback alone, preserving raw derivatives at zero.
+fn lebesgue_mass(
     m: &mut Module,
     measure: NodeId,
+    allow_scalar: bool,
 ) -> Option<Result<(NodeId, bool), RefuseError>> {
     let (node, _) = resolve_ref_chain(m, measure);
     let logarithmic = match builtin_name(m, node)? {
@@ -309,16 +313,37 @@ fn rectangular_mass(
     let [weight, base, ..] = *call.args else {
         return None;
     };
-    let [xlo, xhi, ylo, yhi] = rectangular_bounds(m, base)?;
-    if measure_reaches_draw(m, measure, &[]) {
+    let rectangle = rectangular_bounds(m, base);
+    let interval = if rectangle.is_none() && allow_scalar {
+        let (base, _) = resolve_ref_chain(m, base);
+        let lebesgue = expect_builtin_call(m, base, "Lebesgue")?;
+        let support = named_or_positional(m, lebesgue, "support")?;
+        let (support, _) = resolve_ref_chain(m, support);
+        let call = expect_builtin_call(m, support, "interval")?;
+        let [lo, hi] = *call.args else {
+            return None;
+        };
+        Some([lo, hi])
+    } else {
+        None
+    };
+    if (rectangle.is_none() && interval.is_none()) || measure_reaches_draw(m, measure, &[]) {
         return None;
     }
     Some((|| {
         let parameters = crate::extras::bind_extras(m, node, weight, 2, 1)?;
         let x = point(m);
-        let y = point(m);
+        let mut axes = Vec::with_capacity(6);
+        let coordinates = if let Some([lo, hi]) = interval {
+            axes.extend([x, lo, hi]);
+            x
+        } else {
+            let [xlo, xhi, ylo, yhi] = rectangle.expect("a rectangle or interval was verified");
+            let y = point(m);
+            axes.extend([x, xlo, xhi, y, ylo, yhi]);
+            build_call(m, "vector", &[x, y])
+        };
         let body = if !parameters.is_empty() || weight_is_variate_dependent(m, weight) {
-            let coordinates = build_call(m, "vector", &[x, y]);
             let body = build_callback_call(m, weight, coordinates, &parameters)?;
             crate::canon::inline_expression(m, body)
         } else {
@@ -329,7 +354,8 @@ fn rectangular_mass(
         } else {
             flatppl_core::MASS_INTEGRAL
         };
-        let mass = build_call(m, op, &[body, x, xlo, xhi, y, ylo, yhi]);
+        let args: Vec<_> = std::iter::once(body).chain(axes).collect();
+        let mass = build_call(m, op, &args);
         m.set_type(mass, Type::Scalar(ScalarType::Real));
         Ok((mass, logarithmic))
     })())
