@@ -1,6 +1,10 @@
 use flatppl_stablehlo::{Dtype, EmitOptions, Mode, Target};
 
 fn emit(source: &str, target: Target) -> String {
+    emit_with_dtype(source, target, Dtype::F64)
+}
+
+fn emit_with_dtype(source: &str, target: Target, dtype: Dtype) -> String {
     let mut module = flatppl_syntax::parse(source).expect("parse");
     let diagnostics = flatppl_infer::infer(&mut module);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -15,7 +19,7 @@ fn emit(source: &str, target: Target) -> String {
         &lowered,
         Mode::LogDensity,
         &EmitOptions {
-            dtype: Dtype::F64,
+            dtype,
             target,
             ..Default::default()
         },
@@ -138,5 +142,59 @@ fn gpu_non_affine_integer_steps_keep_the_loop() {
     for step in ["t * t + s", "max(t, s)"] {
         let ir = emit(&integer_count(step), Target::Gpu);
         assert_eq!(ir.matches("stablehlo.while").count(), 1, "{step}: {ir}");
+    }
+}
+
+#[test]
+fn small_nonlinear_gpu_scans_write_ordered_blocks_and_an_exact_tail() {
+    for dtype in [Dtype::F32, Dtype::F64] {
+        for n in [1, 31, 32, 33, 34, 35] {
+            let prefix = format!(
+                "y = elementof(cartpow(reals,{n}))\n\
+                 seed = elementof(reals)\n\
+                 states = scan((s,x) -> tanh(s+x), seed, y)\n\
+                 inputs = (seed,y)\n"
+            );
+            for result in ["sum(states)".to_owned(), format!("states[{n}]")] {
+                let source = format!("{prefix}outputs = {result}");
+                for target in [Target::Cpu, Target::Gpu] {
+                    let ir = emit_with_dtype(&source, target, dtype);
+                    let stepped = target == Target::Gpu && n >= 32;
+                    let expected = if stepped { 4 + n % 4 } else { 1 };
+                    assert_eq!(ir.matches("stablehlo.tanh").count(), expected, "{ir}");
+                    let trips = if stepped { n / 4 } else { n };
+                    let condition = ir
+                        .split("cond {")
+                        .nth(1)
+                        .unwrap()
+                        .split("} do {")
+                        .next()
+                        .unwrap();
+                    assert!(
+                        condition.contains(&format!("dense<{trips}>")),
+                        "{condition}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_and_large_state_scans_keep_their_existing_lowering() {
+    let empty = "seed = elementof(reals)\n\
+                 xs = filter(x -> x > 10.0, [1.0,2.0])\n\
+                 states = scan((s,x) -> tanh(s+x), seed, xs)\n\
+                 inputs = seed\noutputs = sum(states)";
+    let large = "seed = elementof(cartpow(reals,9))\n\
+                 xs = elementof(cartpow(reals,35))\n\
+                 states = scan((s,x) -> tanh.(s .+ x), seed, xs)\n\
+                 inputs = (seed,xs)\noutputs = sum(states[35])";
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let ir = emit_with_dtype(empty, Target::Gpu, dtype);
+        assert!(!ir.contains("stablehlo.while"), "{ir}");
+        assert!(!ir.contains("stablehlo.tanh"), "{ir}");
+        let ir = emit_with_dtype(large, Target::Gpu, dtype);
+        assert_eq!(ir.matches("stablehlo.tanh").count(), 1, "{ir}");
     }
 }

@@ -36,7 +36,7 @@ pub use flatppl_model_analysis::{
     NormalCoordinate, NormalCoordinateQueries, NormalCoordinatesQueries, OutputTerm,
     PreparationOptions, PreparedLikelihood, RealPrecision, ReductionDecision, ReductionOutcome,
     ReductionReport, prepare_fixed_likelihood, prepare_fixed_likelihood_for_precision,
-    sufficient_statistics, sufficient_statistics_with_report,
+    sufficient_statistics, sufficient_statistics_for_target, sufficient_statistics_with_report,
 };
 
 pub use flatppl_model_analysis::posterior::gaussian_block::update as gaussian_posterior_block;
@@ -58,6 +58,8 @@ pub use stdfn::{expand_spline, standard_function};
 pub struct LoweringOptions<'a> {
     /// Leave independent likelihood factors unreduced.
     pub disable_sufficient_statistics: bool,
+    /// Share regular grouped Normal scale reciprocals across residual terms.
+    pub share_normal_scale: bool,
     pub retain_standard_functions: &'a [(&'a str, &'a str)],
     /// Keep log-CDF subtraction opaque for fixed one-sided interval lanes.
     pub compact_log_cdf_difference: bool,
