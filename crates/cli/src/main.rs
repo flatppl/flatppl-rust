@@ -254,8 +254,11 @@ enum Command {
         /// FlatPPL model with declared inputs and outputs.
         input: PathBuf,
         /// Real scalar, fixed-shape real array, or record of these to differentiate (repeatable).
-        #[arg(long, required = true)]
+        #[arg(long, required_unless_present = "empty_wrt")]
         wrt: Vec<String>,
+        /// Differentiate with an explicitly empty selection of inputs.
+        #[arg(long, conflicts_with = "wrt")]
+        empty_wrt: bool,
         /// Derivative transform to emit.
         #[arg(long, value_enum, default_value_t = AdMode::Gradient)]
         mode: AdMode,
@@ -577,9 +580,15 @@ fn main() -> ExitCode {
         Command::Autodiff {
             input,
             wrt,
+            empty_wrt,
             mode,
             output,
-        } => autodiff_cmd(&input, &wrt, mode, output.as_deref()),
+        } => autodiff_cmd(
+            &input,
+            if empty_wrt { &[] } else { &wrt },
+            mode,
+            output.as_deref(),
+        ),
         #[cfg(feature = "stablehlo")]
         Command::Stablehlo {
             prepare_data,

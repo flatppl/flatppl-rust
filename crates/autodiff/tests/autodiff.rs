@@ -311,3 +311,42 @@ outputs = score
         flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
     }
 }
+
+#[test]
+fn empty_selections_follow_the_primal_and_tangent_abis() {
+    let input = lower("primal = 2.0\noutputs = primal\n");
+    let gradient = flatppl_syntax::print(&gradient(&input, &[]).unwrap());
+    assert!(gradient.contains("outputs = primal"), "{gradient}");
+    assert!(!gradient.contains("inputs"), "{gradient}");
+
+    let tangent = flatppl_syntax::print(&flatppl_autodiff::jvp(&input, &[]).unwrap());
+    assert!(
+        tangent.contains("outputs = (primal, d_output_1)"),
+        "{tangent}"
+    );
+    assert!(tangent.contains("d_output_1 = 0.0"), "{tangent}");
+    assert!(!tangent.contains("inputs"), "{tangent}");
+
+    let cotangent = flatppl_syntax::print(&flatppl_autodiff::vjp(&input, &[]).unwrap());
+    assert!(cotangent.contains("inputs = cotangent_1"), "{cotangent}");
+    assert!(cotangent.contains("outputs = primal"), "{cotangent}");
+}
+
+#[test]
+fn poisson_observation_is_discrete_even_with_a_real_abi() {
+    let module = lower(
+        "
+rate = elementof(posreals)
+observed = elementof(reals)
+score = logdensityof(Poisson(rate), observed)
+inputs = (rate, observed)
+outputs = score
+",
+    );
+    let error = gradient(&module, &["observed"]).unwrap_err();
+    assert!(
+        error.to_string().contains("discrete observation"),
+        "{error}"
+    );
+    assert!(gradient(&module, &["rate"]).is_ok());
+}

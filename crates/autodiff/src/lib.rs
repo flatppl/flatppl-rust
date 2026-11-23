@@ -92,7 +92,8 @@ pub fn determinize_query_with_options(
 
 /// Append one derivative result per requested input, in request order.
 ///
-/// The module must declare `inputs` and a single real scalar `outputs` value.
+/// The module must declare a single real scalar `outputs` value. A query with
+/// no arguments may omit `inputs`. An empty selection returns just the primal.
 /// Each requested name must occur in `inputs` and denote a real scalar or a
 /// fixed-shape real array, including a fixed nonempty vector of real vectors,
 /// or a nonempty record of such values. Each derivative has the input's shape. All
@@ -125,6 +126,7 @@ pub fn gradient_with_options(
 /// outputs followed by the input cotangents in request order. Selected inputs
 /// can be real scalars, fixed-shape arrays, or nonempty records of these values.
 /// Outputs can use the same real-valued scalars, arrays and records as inputs.
+/// An empty selection appends the output cotangents and returns just the primals.
 pub fn vjp(module: &Module, wrt: &[&str]) -> Result<Module, Error> {
     vjp_with_options(module, wrt, &LoweringOptions::default())
 }
@@ -147,6 +149,7 @@ pub fn vjp_with_options(
 /// outputs followed by their tangents. Selected inputs can be real scalars,
 /// fixed-shape arrays, or nonempty records of these values.
 /// Outputs can use the same real-valued scalars, arrays and records as inputs.
+/// An empty selection takes no tangents and returns one zero tangent per primal.
 pub fn jvp(module: &Module, wrt: &[&str]) -> Result<Module, Error> {
     jvp_with_options(module, wrt, &LoweringOptions::default())
 }
@@ -178,7 +181,11 @@ fn transform(
 ) -> Result<Module, Error> {
     check_flatpdl(module, options)?;
     let query = Query::read(module, wrt, mode)?;
-    let legalized = callbacks::legalize(module, &query);
+    let legalized = if wrt.is_empty() {
+        None
+    } else {
+        callbacks::legalize(module, &query)
+    };
     let (module, query) = match legalized.as_ref() {
         Some(legalized) => (legalized, Query::read(legalized, wrt, mode)?),
         None => (module, query),
@@ -186,18 +193,25 @@ fn transform(
     let roots: Vec<_> = query
         .results
         .iter()
-        .map(|&node| query.key(module, node))
+        .map(|&node| {
+            if wrt.is_empty() {
+                Ok(Key::Node(node))
+            } else {
+                query.key(module, node)
+            }
+        })
         .collect::<Result<_, _>>()?;
     let mut plan = Plan::new(module, &query);
-    for &root in &roots {
-        plan.visit(root, 0)?;
+    if !wrt.is_empty() {
+        for &root in &roots {
+            plan.visit(root, 0)?;
+        }
     }
     let mut requests = BTreeSet::new();
     plan.collect_rules(mode, &mut requests);
     let rules = rules::Rules::load(requests)?;
 
     let mut emitter = Emitter::new(module, &query);
-    let mut inputs = abi_terms(module, query.input).to_vec();
     let seeds = match mode {
         Mode::Gradient => vec![real(&mut emitter.module, 1.0)],
         Mode::Vjp => query
@@ -218,10 +232,18 @@ fn transform(
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
-    if mode != Mode::Gradient {
+    if mode != Mode::Gradient && !seeds.is_empty() {
+        let mut inputs = query
+            .input
+            .map(|binding| abi_terms(module, binding).to_vec())
+            .unwrap_or_default();
         inputs.extend_from_slice(&seeds);
-        let signature = build_call(&mut emitter.module, "tuple", &inputs);
-        emitter.module.set_binding_rhs(query.input, signature);
+        let signature = build_abi(&mut emitter.module, &inputs);
+        if let Some(binding) = query.input {
+            emitter.module.set_binding_rhs(binding, signature);
+        } else {
+            emitter.define("inputs", signature);
+        }
     }
     let derived = if mode == Mode::Jvp {
         forward(&mut emitter, &plan, &rules, &roots, &seeds)?
@@ -242,7 +264,7 @@ fn transform(
         values.push(emitter.define(&name, value));
         expected.push(module.type_of(reference).unwrap().clone());
     }
-    let result = build_call(&mut emitter.module, "tuple", &values);
+    let result = build_abi(&mut emitter.module, &values);
     emitter.module.set_binding_rhs(query.output, result);
     if let Some(diagnostic) = flatppl_infer::infer(&mut emitter.module)
         .into_iter()
@@ -250,7 +272,11 @@ fn transform(
     {
         return Err(Error::new(None, diagnostic.message));
     }
-    let expected = Type::Tuple(expected.into());
+    let expected = if expected.len() == 1 {
+        expected.pop().unwrap()
+    } else {
+        Type::Tuple(expected.into())
+    };
     if emitter.module.type_of(result) != Some(&expected) {
         let actual = emitter.module.type_of(result);
         return Err(Error::new(
@@ -475,7 +501,7 @@ enum Key {
 
 struct Query<'a> {
     inputs: HashSet<BindingId>,
-    input: BindingId,
+    input: Option<BindingId>,
     output: BindingId,
     results: Vec<NodeId>,
     wrt: Vec<Input<'a>>,
@@ -489,22 +515,20 @@ struct Input<'a> {
 
 impl<'a> Query<'a> {
     fn read(module: &Module, wrt: &[&'a str], mode: Mode) -> Result<Self, Error> {
-        if wrt.is_empty() {
-            return Err(Error::new(
-                None,
-                "select at least one input to differentiate",
-            ));
-        }
         let abi = |name| {
             module
                 .bindings()
                 .find(|(_, b)| module.resolve(b.name) == name)
-                .ok_or_else(|| {
-                    Error::new(None, format!("declare `{name}` for the derivative query"))
-                })
         };
-        let (input, _) = abi("inputs")?;
-        let (output, result) = abi("outputs")?;
+        let input = abi("inputs").map(|(binding, _)| binding);
+        if input.is_none() && !wrt.is_empty() {
+            return Err(Error::new(
+                None,
+                "declare `inputs` for the derivative query",
+            ));
+        }
+        let (output, result) = abi("outputs")
+            .ok_or_else(|| Error::new(None, "declare `outputs` for the derivative query"))?;
         let results = abi_terms(module, output).to_vec();
         if mode == Mode::Gradient
             && (results.len() != 1 || module.type_of(results[0]) != Some(&REAL))
@@ -524,7 +548,7 @@ impl<'a> Query<'a> {
                 "`outputs` must contain real scalars, fixed-shape real arrays, or nonempty records of those",
             ));
         }
-        let items = abi_terms(module, input);
+        let items = input.map_or(&[][..], |binding| abi_terms(module, binding));
         let mut names = HashMap::new();
         let mut targets = HashSet::new();
         for &item in items {
@@ -671,6 +695,13 @@ impl<'a> Query<'a> {
             .type_of(node)
             .filter(|&ty| Some(ty) == module.type_of(child))
             .map(|_| child))
+    }
+}
+
+fn build_abi(module: &mut Module, values: &[NodeId]) -> NodeId {
+    match values {
+        [value] => *value,
+        _ => build_call(module, "tuple", values),
     }
 }
 
@@ -1197,6 +1228,12 @@ impl<'a> Step<'a> {
         slot: usize,
     ) -> Result<&'r rules::Template, Error> {
         rules.get(self.rule_key(mode, slot)).ok_or_else(|| {
+            if self.op == "Poisson log density" && slot == 1 {
+                return Error::new(
+                    Some(self.node),
+                    "Poisson log density has no real derivative with respect to its discrete observation",
+                );
+            }
             let name = if mode == Mode::Jvp {
                 "JVP rule"
             } else {

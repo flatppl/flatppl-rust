@@ -94,3 +94,28 @@ outputs = logdensityof(measure, 0.45)
         assert!(hlo.contains("stablehlo.while"));
     }
 }
+
+#[test]
+fn autodiff_accepts_an_explicit_empty_selection() {
+    let dir = common::Scratch::new("autodiff-empty");
+    let model = dir.path("model.flatppl");
+    std::fs::write(&model, "primal = 2.0\noutputs = primal\n").unwrap();
+    let run = |options: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_flatppl"))
+            .arg("autodiff")
+            .arg(&model)
+            .args(options)
+            .output()
+            .unwrap()
+    };
+    assert_eq!(run(&[]).status.code(), Some(2));
+    assert_eq!(run(&["--empty-wrt", "--wrt", "x"]).status.code(), Some(2));
+    let explicit = run(&["--empty-wrt"]);
+    assert!(
+        explicit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    let output = String::from_utf8(explicit.stdout).unwrap();
+    assert!(output.contains("outputs = primal"), "{output}");
+}

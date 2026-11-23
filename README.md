@@ -70,6 +70,8 @@ The query declares `inputs` and one real scalar output. Repeat `--wrt` for each
 real scalar, fixed-shape array, or nonempty record with real leaves. The result
 lists the original value followed by gradients in the requested order. Each
 gradient has the shape of its input.
+Use `--empty-wrt` for an empty selection, including queries with only discrete
+inputs. The gradient query then returns the primal alone.
 
 Use `--mode jvp` or `--mode vjp` for real scalar and fixed-shape array outputs.
 JVP adds one tangent argument per selected input and returns one tangent per
