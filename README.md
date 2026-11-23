@@ -89,7 +89,8 @@ smooth, finite domain of the query.
 
 Rust callers can use `flatppl_autodiff::determinize_query` followed by
 `gradient`, `jvp`, or `vjp`. The result is one FlatPDL module with the primal
-and derivative outputs, ready for source printing or graph optimization.
+and derivative outputs. To print standalone FlatPPL, call
+`flatppl_autodiff::prepare_source` before `flatppl_syntax::print`.
 
 Compiler-only numerical integrals use the same transform through the
 `*_with_options` entry points. The transform integrates the derivative of
