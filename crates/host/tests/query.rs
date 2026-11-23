@@ -346,6 +346,45 @@ fn batched_scan_keeps_one_time_loop() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[test]
+fn a_batched_terminal_scan_keeps_the_mapped_history() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "seed = external(reals)\nxs = external(cartpow(reals, 5))\n\
+         history = scan((s,x) -> tanh(s+x), seed, xs)\n\
+         inputs = (seed,xs)\noutputs = history[5]",
+        None,
+        None,
+    )?;
+    let options = EmitOptions::default();
+    let unbatched = query.compile(&options)?.stablehlo;
+    let batched = query
+        .compile_batched(
+            &options,
+            &BatchSpec {
+                shape: vec![3],
+                input_axes: vec![vec![Some(0)], vec![None]],
+            },
+        )?
+        .stablehlo;
+    assert_eq!(unbatched.matches("stablehlo.while").count(), 1);
+    let scan = unbatched
+        .lines()
+        .find(|line| line.contains("stablehlo.while"))
+        .unwrap();
+    assert!(scan.contains("tensor<1xf32>"), "{scan}");
+    assert_eq!(
+        unbatched.matches("stablehlo.dynamic_update_slice").count(),
+        1
+    );
+    assert_eq!(batched.matches("stablehlo.while").count(), 1);
+    assert!(
+        batched.contains("stablehlo.dynamic_update_slice"),
+        "{batched}"
+    );
+    assert!(batched.contains("tensor<3x5xf32>"), "{batched}");
+    Ok(())
+}
+
+#[test]
 fn scan_in_a_broadcast_callable_keeps_its_state_frame() -> Result<(), Box<dyn std::error::Error>> {
     let query = Context::default().parse(
         "q=external(reals)\na=elementof(reals)\nstep(s,x,a)=a*s+x\n\

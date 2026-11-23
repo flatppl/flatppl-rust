@@ -12,6 +12,7 @@ mod project;
 mod selectors;
 mod types;
 
+pub use demand::{ScanOutputDemand, scan_output_demand};
 use flatppl_core::{Module, Symbol};
 pub use matrix_projection::{MatrixProjection, MatrixProjectionFact, plan_matrix_projection};
 pub use ordered_scan::ordered_scan_width;

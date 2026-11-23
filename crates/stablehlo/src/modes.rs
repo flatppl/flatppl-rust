@@ -294,7 +294,7 @@ pub(crate) fn emit_logdensity_abi(
     } else {
         (m, abi.outputs.as_slice())
     };
-    let mut e = Emitter::with_options(m, opts);
+    let mut e = Emitter::for_query(m, opts);
     let mut args: Vec<(String, MlirTy, ElemKind)> = Vec::with_capacity(abi.inputs.len());
     let mut next_arg = 0usize;
     for &sym in &abi.inputs {
@@ -373,8 +373,6 @@ pub(crate) fn emit_sample_abi(
     abi: &Abi,
     opts: &EmitOptions,
 ) -> Result<String, EmitError> {
-    let mut e = Emitter::with_options(m, opts);
-
     if abi.outputs.is_empty() {
         return Err(EmitError::whole(
             "`outputs` ABI binding is missing or empty; a sample query needs at least one \
@@ -393,6 +391,7 @@ pub(crate) fn emit_sample_abi(
         )
     })?;
     let key_name = "%key".to_string();
+    let mut e = Emitter::for_query(m, opts);
     let resolved_src = resolve_self_ref(m, src);
     let source_input = match m.node(src) {
         Node::Ref(Ref {

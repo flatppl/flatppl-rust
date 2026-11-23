@@ -1,0 +1,19 @@
+(ruleset scan-demand)
+
+; One summary per reachable scan. The host proves each terminal or field read
+; and marks unknown users and scoped captures as escapes.
+(relation scan-use-summary (i64 i64 i64 i64 i64))
+(relation scan-output-plan (i64 i64))
+
+; Terminal consumers can reuse the final carry without any history.
+(rule ((scan-use-summary scan 0 1 0 total))
+      ((scan-output-plan scan 0))
+  :ruleset scan-demand)
+
+; A proper subset of field histories saves buffers. Keep the full value when
+; a whole scan escapes or terminal and history readers share the same scan.
+(rule ((scan-use-summary scan 0 0 fields total)
+       (> fields 0)
+       (< fields total))
+      ((scan-output-plan scan 1))
+  :ruleset scan-demand)

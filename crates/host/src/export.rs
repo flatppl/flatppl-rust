@@ -201,10 +201,13 @@ pub fn emit_query(
         args.push((value.ssa.clone(), value.ty.clone(), value.elem));
         values.insert(path, value);
     }
-    let mut emitter = Emitter::with_options(&module, options);
-    if batch.is_some_and(|batch| !batch.shape.is_empty()) {
+    let mut emitter = if batch.is_some_and(|batch| !batch.shape.is_empty()) {
+        let mut emitter = Emitter::with_options(&module, options);
         emitter.lower_for_host_batch();
-    }
+        emitter
+    } else {
+        Emitter::for_query(&module, options)
+    };
     bind_inputs(
         &mut emitter,
         &module,
