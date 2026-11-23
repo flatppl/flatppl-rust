@@ -30,7 +30,8 @@ fn overlapping_intervals_stage_one_exact_density_and_mass_query() {
     let restrictions = "first = truncate(law, interval(0.25, 3.0))\n\
                         second = truncate(first, interval(1.0, 5.0))\n\
                         window = truncate(second, interval(0.5, 2.5))\n";
-    let observations = "score = logdensityof(normalize(window), point)\n\
+    let observations = "conditioned = normalize(window)\n\
+                        score = logdensityof(conditioned, point)\n\
                         mass = totalmass(window)\n\
                         raw = densityof(window, point)\n\
                         outputs = (score, mass, raw)\n";
@@ -44,6 +45,8 @@ fn overlapping_intervals_stage_one_exact_density_and_mass_query() {
     let rendered = execute(&source, &["optimise"]);
     assert!(rendered.contains(restrictions), "{rendered}");
     assert!(rendered.contains("inputs = (rate, point)"), "{rendered}");
+    assert!(rendered.contains("conditioned = normalize(window)"));
+    assert!(!rendered.contains("score = logdensityof(conditioned, point)"));
     assert!(!rendered.contains("mass = totalmass(window)"), "{rendered}");
     let source_ir = scratch.path("nested.flatpir");
     let module = flatppl_syntax::parse(&fs::read_to_string(&source).unwrap()).unwrap();
@@ -59,7 +62,7 @@ fn overlapping_intervals_stage_one_exact_density_and_mass_query() {
     assert_eq!(execute(&source, &options), execute(&reference, &options));
 
     let shared = scratch.path("shared-sample.flatppl");
-    let draw = "rng = rnginit(42)\nvalue, next = rand(normalize(window), rng)\n";
+    let draw = "rng = rnginit(42)\nvalue, next = rand(conditioned, rng)\n";
     fs::write(
         &shared,
         format!("{prefix}{restrictions}{observations}{draw}"),
