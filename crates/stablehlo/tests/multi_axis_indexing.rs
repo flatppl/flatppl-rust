@@ -272,3 +272,34 @@ fn aggregate_of_position_matched_update_rows_lowers_to_scatter() {
     assert!(!nonzero.contains(r#""stablehlo.scatter""#), "{nonzero}");
     assert!(nonzero.contains("stablehlo.reduce"), "{nonzero}");
 }
+
+#[test]
+fn masked_row_quotient_scatters_one_update_per_pair() {
+    let source = "
+matrix = external(cartpow(reals, [4, 3]))
+docs = external(cartpow(integers, 6))
+words = external(cartpow(integers, 6))
+seed = external(cartpow(reals, 6))
+row(i, m) = m[i, :]
+source = row.(indicesof(zeros(4)), [matrix])
+denominator = rowstack(source[docs])
+word_match = addaxes(words, 0, 1) .== addaxes(indicesof(denominator[1]), 1, 0)
+numerator = addaxes(seed, 0, 1)
+weighted = ifelse.(word_match, ifelse.(iszero.(numerator), 0.0, numerator ./ denominator), 0.0)
+updates = row.(indicesof(zeros(6)), [weighted])
+out = aggregate(sum, [.doc, .word], ifelse(indicesof(matrix)[1][.doc] == docs[.item], rowstack(updates)[.item, .word], 0.0))
+inputs = (matrix, docs, words, seed)
+outputs = out
+";
+    let ir = emit(source).unwrap();
+    assert!(ir.contains(r#""stablehlo.scatter""#), "{ir}");
+    assert!(ir.contains("tensor<12xf32>"), "{ir}");
+    assert!(!ir.contains("tensor<6x3x"), "{ir}");
+
+    let unmasked = emit(&source.replace(
+        "numerator ./ denominator), 0.0)",
+        "numerator ./ denominator), 1.0)",
+    ))
+    .unwrap();
+    assert!(unmasked.contains("tensor<6x3x"), "{unmasked}");
+}

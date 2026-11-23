@@ -51,6 +51,8 @@
 //! rather than lowering something else. `metricsum` applies inverse-metric
 //! contractions before indexing and raises output axes after reduction.
 
+mod paired_scatter;
+
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{Axis, CallHead, Dim, Node, NodeId, Scalar, ScalarType, Symbol, Type, Variance};
@@ -305,6 +307,11 @@ impl RowScatter {
     }
 
     fn lower(self, e: &mut Emitter) -> Result<Option<Value>, EmitError> {
+        if let Some(paired) = paired_scatter::PairedScatter::read(e, &self)
+            && let Some(result) = paired.lower(e)?
+        {
+            return Ok(Some(result));
+        }
         let indices = e.lower_node(self.indices)?;
         let updates = e.lower_node(self.updates)?;
         let (MlirTy::Ranked(index_dims), MlirTy::Ranked(update_dims)) = (&indices.ty, &updates.ty)
