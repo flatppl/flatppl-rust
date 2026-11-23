@@ -4,12 +4,14 @@ mod conjugacy;
 mod demand;
 mod engine;
 mod gaussian;
+mod ordered_scan;
 mod outputs;
 mod project;
 mod selectors;
 mod types;
 
 use flatppl_core::{Module, Symbol};
+pub use ordered_scan::ordered_scan_width;
 
 /// The shared language and each emitter have separate rule schedules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

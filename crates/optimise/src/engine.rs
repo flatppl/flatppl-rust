@@ -159,6 +159,74 @@ pub(super) fn optimise(
     optimise_query(terms, roots, facts, profile).ok().flatten()
 }
 
+/// Run an emitter catalogue over bounded integer facts supplied by the
+/// lowering. The caller owns the interpretation of the result relation.
+pub(super) fn integer_plan_rows(
+    filename: &str,
+    program: &str,
+    ruleset: &str,
+    facts: &[(&str, &[i64])],
+    result: &str,
+) -> Option<Vec<Vec<i64>>> {
+    if facts.len() > MAX_INPUT_ROWS {
+        return None;
+    }
+    let mut graph = EGraph::default().with_num_threads(1);
+    graph
+        .parse_and_run_program(Some(filename.to_owned()), program)
+        .unwrap_or_else(|error| panic!("invalid embedded emitter catalogue {filename}: {error}"));
+    graph
+        .update(|mut state| {
+            for &(relation, values) in facts {
+                let key = values
+                    .iter()
+                    .map(|&value| state.base_to_value(value))
+                    .collect();
+                state.add(relation, RawValues(key))?;
+            }
+            Ok(())
+        })
+        .ok()?;
+    let mut matches = 0;
+    if !saturate(&mut graph, ruleset, &mut matches).ok()? {
+        return None;
+    }
+    graph
+        .read(|state| {
+            let mut rows = vec![];
+            state.constructor_enodes(result, |row| {
+                rows.push(
+                    row.children
+                        .iter()
+                        .map(|&value| state.value_to_base::<i64>(value))
+                        .collect(),
+                );
+            })?;
+            Ok::<_, Error>(rows)
+        })
+        .ok()
+}
+
+fn saturate(graph: &mut EGraph, rules: &str, matches: &mut usize) -> Result<bool, Error> {
+    let initial_rows = graph.num_tuples();
+    if initial_rows > MAX_INPUT_ROWS {
+        return Ok(false);
+    }
+    for _ in 0..MAX_ROUNDS {
+        let report = graph.step_rules(rules)?;
+        for &count in report.num_matches_per_rule.values() {
+            *matches = matches.saturating_add(count);
+        }
+        if graph.num_tuples() > initial_rows + MAX_NEW_ROWS || *matches > MAX_MATCHES {
+            return Ok(false);
+        }
+        if report.can_stop {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn optimise_query(
     terms: &mut Vec<Term>,
     roots: &[usize],
@@ -194,26 +262,8 @@ fn optimise_query(
             ..
         } => "query-gpu",
     };
-    let initial_rows = graph.num_tuples();
-    if initial_rows > MAX_INPUT_ROWS {
-        return Ok(None);
-    }
     let mut matches = 0usize;
-    let saturated = (|| {
-        for _ in 0..MAX_ROUNDS {
-            let report = graph.step_rules(rules)?;
-            for &count in report.num_matches_per_rule.values() {
-                matches = matches.saturating_add(count);
-            }
-            if graph.num_tuples() > initial_rows + MAX_NEW_ROWS || matches > MAX_MATCHES {
-                return Ok(false);
-            }
-            if report.can_stop {
-                return Ok(true);
-            }
-        }
-        Ok::<_, Error>(false)
-    })();
+    let saturated = saturate(&mut graph, rules, &mut matches);
     CATALOGUES.with_borrow_mut(|catalogues| {
         if let Some((_, used)) = &mut catalogues[config.index()] {
             *used = used.saturating_add(matches.min(MAX_MATCHES));
