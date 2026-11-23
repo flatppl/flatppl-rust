@@ -87,3 +87,27 @@ fn optimises_an_expression_typed_from_a_relative_import() {
         String::from_utf8_lossy(&inference.stderr)
     );
 }
+
+#[test]
+fn mixed_integer_bounds_keep_the_original_input_and_stronger_comparison() {
+    let scratch = common::Scratch::new("optimise-integer-bounds");
+    let path = scratch.path("bounds.flatppl");
+    let prefix = "k = external(integers)\ninputs = k\n";
+    fs::write(&path, format!("{prefix}outputs = land(7 < k, k >= 12)\n")).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .arg("optimise")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = flatppl_syntax::parse(&String::from_utf8(result.stdout).unwrap()).unwrap();
+    let expected = flatppl_syntax::parse(&format!("{prefix}outputs = k >= 12\n")).unwrap();
+    assert_eq!(
+        flatppl_syntax::print(&output),
+        flatppl_syntax::print(&expected)
+    );
+}

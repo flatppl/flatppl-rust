@@ -117,6 +117,32 @@
 
 ; Bounds on the same integer imply one another. Dropping the looser or
 ; tighter comparison still evaluates the shared input and its ancestors.
+(relation portable-flipped-order (String String))
+(portable-flipped-order "lt" "gt")
+(portable-flipped-order "le" "ge")
+(portable-flipped-order "gt" "lt")
+(portable-flipped-order "ge" "le")
+
+(relation portable-cutoff (Expr String Expr i64))
+(rule ((= p (B op x (Integer n))) (portable-flipped-order op flipped)
+       (bool-value p) (int-value x) (>= n -2147483648) (<= n 2147483647))
+      ((portable-cutoff p op x n)) :ruleset portable)
+(rule ((= p (B op (Integer n) x)) (portable-flipped-order op flipped)
+       (bool-value p) (int-value x) (>= n -2147483648) (<= n 2147483647))
+      ((portable-cutoff p flipped x n)) :ruleset portable)
+
+; Strict and weak tests describe the same half-line after moving an integer
+; endpoint by one. Only combine spellings where adjacent input thresholds
+; remain distinct even on a backend that widens an integer operand to f32.
+(relation portable-inclusive-cut (String String i64))
+(portable-inclusive-cut "lt" "upper" -1)
+(portable-inclusive-cut "le" "upper" 0)
+(portable-inclusive-cut "gt" "lower" 1)
+(portable-inclusive-cut "ge" "lower" 0)
+(rule ((portable-cutoff p op x n) (portable-inclusive-cut op side offset)
+       (>= n -16777216) (<= n 16777216))
+      ((portable-cutoff p side x (+ n offset))) :ruleset portable)
+
 (relation portable-bound-choice (String String bool))
 (portable-bound-choice "land" "lt" true)
 (portable-bound-choice "land" "le" true)
@@ -126,19 +152,19 @@
 (portable-bound-choice "lor" "le" false)
 (portable-bound-choice "lor" "gt" true)
 (portable-bound-choice "lor" "ge" true)
+(portable-bound-choice "land" "upper" true)
+(portable-bound-choice "land" "lower" false)
+(portable-bound-choice "lor" "upper" false)
+(portable-bound-choice "lor" "lower" true)
 (relation portable-compared-bounds (Expr String Expr Expr))
 (rule ((= e (B op p q)) (portable-bool-absorber op c))
       ((portable-compared-bounds e op p q) (portable-compared-bounds e op q p))
       :ruleset portable)
 (rule ((portable-compared-bounds e op p q) (portable-bound-choice op cmp true)
-       (= p (B cmp x (Integer a))) (= q (B cmp x (Integer b)))
-       (int-value x) (bool-value p) (bool-value q)
-       (>= a -2147483648) (<= a b) (<= b 2147483647))
+       (portable-cutoff p cmp x a) (portable-cutoff q cmp x b) (<= a b))
       ((union e p)) :ruleset portable)
 (rule ((portable-compared-bounds e op p q) (portable-bound-choice op cmp false)
-       (= p (B cmp x (Integer a))) (= q (B cmp x (Integer b)))
-       (int-value x) (bool-value p) (bool-value q)
-       (>= a -2147483648) (<= a b) (<= b 2147483647))
+       (portable-cutoff p cmp x a) (portable-cutoff q cmp x b) (<= a b))
       ((union e q)) :ruleset portable)
 
 (rewrite (T "ifelse" p (Boolean true) (Boolean false)) p
