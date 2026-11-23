@@ -15,6 +15,7 @@ mod probability_scan;
 mod record;
 mod recurrence;
 mod rules;
+mod source;
 mod tensor;
 mod transforms;
 mod vector_scan;
@@ -91,6 +92,15 @@ pub fn determinize_query_with_options(
         ..*options
     };
     flatppl_determinizer::determinize_with_options(module, bundle, Some(&roots), &lowering)
+}
+
+/// Prepare a derivative module for compact, reparsable FlatPPL source output.
+///
+/// This preserves shared expressions inside large callbacks as explicitly
+/// bound helper calls. Re-determinize the printed source before execution.
+pub fn prepare_source(module: &mut Module) {
+    flatppl_determinizer::prepare_serialization(module, None);
+    source::factor_callables(module);
 }
 
 /// Append one derivative result per requested input, in request order.

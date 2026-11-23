@@ -1509,7 +1509,7 @@ fn autodiff_cmd(
         .map_err(|e| Failure::Refuse(refuse_message(input, &source, &surface, &e)))?;
     load_fixed_data(&mut lowered, &resolver, input, &source, &surface)?;
     let mut derivative = differentiate(&lowered, wrt, mode, &Default::default())?;
-    flatppl_determinizer::prepare_serialization(&mut derivative, None);
+    flatppl_autodiff::prepare_source(&mut derivative);
     let rendered = flatppl_syntax::print(&derivative);
     match output {
         Some(path) => fs::write(path, rendered).map_err(|e| {
