@@ -7,7 +7,8 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use egglog::sort::S;
 use egglog::{Core, EGraph, Error, FullState, RawValues, Read, Value, Write};
 
-use crate::{Dtype, Profile, Target};
+use crate::policy::load_program;
+use crate::{Dtype, Profile, RulePolicy, Target};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum Term {
@@ -93,14 +94,17 @@ thread_local! {
     };
 }
 
-fn catalogue(config: Catalogue, rows: usize) -> EGraph {
+fn catalogue(config: Catalogue, rows: usize, rules: &RulePolicy) -> EGraph {
+    if !rules.is_default() {
+        return build_catalogue(config, rules);
+    }
     CATALOGUES.with_borrow_mut(|catalogues| {
         let cached = &mut catalogues[config.index()];
         if cached
             .as_ref()
             .is_none_or(|(_, used)| used + rows > 4 * MAX_INPUT_ROWS)
         {
-            *cached = Some((build_catalogue(config), 0));
+            *cached = Some((build_catalogue(config, rules), 0));
         }
         let (template, used) = cached.as_mut().expect("initialized rule catalogue");
         *used += rows;
@@ -108,11 +112,10 @@ fn catalogue(config: Catalogue, rows: usize) -> EGraph {
     })
 }
 
-fn build_catalogue(config: Catalogue) -> EGraph {
+fn build_catalogue(config: Catalogue, rules: &RulePolicy) -> EGraph {
     let mut graph = EGraph::default().with_num_threads(1);
     let mut load = |name: &str, program: &str| {
-        graph
-            .parse_and_run_program(Some(format!("{name}.egg")), program)
+        load_program(&mut graph, format!("{name}.egg"), program, rules)
             .unwrap_or_else(|error| panic!("invalid embedded egglog catalogue {name}: {error}"));
     };
     load("schema", include_str!("rules/schema.egg"));
@@ -166,14 +169,18 @@ pub(super) fn optimise(
     roots: &[usize],
     facts: &[Fact],
     profile: Profile,
+    rules: &RulePolicy,
 ) -> Option<Vec<usize>> {
-    if roots.is_empty()
+    if rules.is_all_disabled()
+        || roots.is_empty()
         || terms.len() + facts.len() > MAX_INPUT_ROWS
         || !has_candidates(terms, facts, profile)
     {
         return None;
     }
-    optimise_query(terms, roots, facts, profile).ok().flatten()
+    optimise_query(terms, roots, facts, profile, rules)
+        .ok()
+        .flatten()
 }
 
 /// Run an emitter catalogue over bounded integer facts supplied by the
@@ -184,13 +191,13 @@ pub(super) fn integer_plan_rows(
     ruleset: &str,
     facts: &[(&str, &[i64])],
     result: &str,
+    rules: &RulePolicy,
 ) -> Option<Vec<Vec<i64>>> {
-    if facts.len() > MAX_INPUT_ROWS {
+    if !rules.enables_ruleset(ruleset) || facts.len() > MAX_INPUT_ROWS {
         return None;
     }
     let mut graph = EGraph::default().with_num_threads(1);
-    graph
-        .parse_and_run_program(Some(filename.to_owned()), program)
+    load_program(&mut graph, filename.to_owned(), program, rules)
         .unwrap_or_else(|error| panic!("invalid embedded emitter catalogue {filename}: {error}"));
     graph
         .update(|mut state| {
@@ -249,9 +256,10 @@ fn optimise_query(
     roots: &[usize],
     facts: &[Fact],
     profile: Profile,
+    policy: &RulePolicy,
 ) -> Result<Option<Vec<usize>>, Error> {
     let config = Catalogue::for_query(profile, terms, facts);
-    let mut graph = catalogue(config, terms.len() + facts.len());
+    let mut graph = catalogue(config, terms.len() + facts.len(), policy);
     graph.update(|mut state| {
         let mut values = Vec::with_capacity(terms.len());
         for term in terms.iter() {
@@ -281,11 +289,13 @@ fn optimise_query(
     };
     let mut matches = 0usize;
     let saturated = saturate(&mut graph, rules, &mut matches);
-    CATALOGUES.with_borrow_mut(|catalogues| {
-        if let Some((_, used)) = &mut catalogues[config.index()] {
-            *used = used.saturating_add(matches.min(MAX_MATCHES));
-        }
-    });
+    if policy.is_default() {
+        CATALOGUES.with_borrow_mut(|catalogues| {
+            if let Some((_, used)) = &mut catalogues[config.index()] {
+                *used = used.saturating_add(matches.min(MAX_MATCHES));
+            }
+        });
+    }
     if !saturated? {
         return Ok(None);
     }
@@ -936,7 +946,8 @@ mod tests {
             name: "type-id",
             args: vec![FactArg::Expr(0)],
         };
-        assert!(optimise(&mut terms, &[1], &[invalid], Profile::Portable).is_none());
+        let rules = RulePolicy::default();
+        assert!(optimise(&mut terms, &[1], &[invalid], Profile::Portable, &rules).is_none());
         assert_eq!(terms, original);
     }
 

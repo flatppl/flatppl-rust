@@ -15,7 +15,7 @@
 //! their declared sets are not enforced at the ABI.
 
 use flatppl_infer::ParamSet;
-use flatppl_optimise::{SimplexRowCheck, plan_simplex_rows};
+use flatppl_optimise::{SimplexRowCheck, plan_simplex_rows_with_rules};
 
 use super::constants::element_count;
 use super::*;
@@ -505,12 +505,15 @@ impl Emitter<'_> {
             && let [Some(rows), Some(_)] = shape(&p.ty)
             && let [Some(occurrences)] = shape(&gathered.index.ty)
         {
-            match plan_simplex_rows(*rows, *occurrences, |at| {
-                match self.fixed_scalar_at(&gathered.index, at)? {
+            match plan_simplex_rows_with_rules(
+                *rows,
+                *occurrences,
+                |at| match self.fixed_scalar_at(&gathered.index, at)? {
                     Scalar::Int(row) => Some(row),
                     _ => None,
-                }
-            }) {
+                },
+                &self.rules,
+            ) {
                 Some(SimplexRowCheck::All) => None,
                 Some(SimplexRowCheck::Select(rows)) => {
                     let ty = MlirTy::Ranked(vec![Some(rows.len() as u64)]);

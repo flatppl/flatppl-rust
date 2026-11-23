@@ -75,11 +75,11 @@ use flatppl_core::{
     CallHead, Inputs, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
 };
 
-use crate::EmitOptions;
 use crate::emitter::Emitter;
 use crate::mlir::{ElemKind, Lowered, MlirTy, Value};
 use crate::refuse::EmitError;
 use crate::types::{mlir_type_of, mlir_type_of_ty};
+use crate::{EmitOptions, RulePolicy};
 
 /// The compilation ABI declared by the reserved `inputs = …` / `outputs = …`
 /// top-level bindings (design doc
@@ -277,6 +277,7 @@ pub(crate) fn emit_logdensity_abi(
     m: &Module,
     abi: &Abi,
     opts: &EmitOptions,
+    rules: &RulePolicy,
 ) -> Result<String, EmitError> {
     check_query_inputs(m, &abi.outputs, &abi.inputs.iter().copied().collect(), &[])?;
 
@@ -286,7 +287,7 @@ pub(crate) fn emit_logdensity_abi(
         ));
     }
 
-    let optimised = crate::optimise_query(m, opts);
+    let optimised = crate::optimise_query_with_rules(m, opts, rules);
     let optimised_outputs;
     let (m, outputs) = if let Some((m, root)) = &optimised {
         optimised_outputs = tuple_elems(m, *root);
@@ -294,7 +295,7 @@ pub(crate) fn emit_logdensity_abi(
     } else {
         (m, abi.outputs.as_slice())
     };
-    let mut e = Emitter::for_query(m, opts);
+    let mut e = Emitter::for_query_with_rules(m, opts, rules);
     let mut args: Vec<(String, MlirTy, ElemKind)> = Vec::with_capacity(abi.inputs.len());
     let mut next_arg = 0usize;
     for &sym in &abi.inputs {
@@ -372,6 +373,7 @@ pub(crate) fn emit_sample_abi(
     m: &Module,
     abi: &Abi,
     opts: &EmitOptions,
+    rules: &RulePolicy,
 ) -> Result<String, EmitError> {
     if abi.outputs.is_empty() {
         return Err(EmitError::whole(
@@ -391,7 +393,7 @@ pub(crate) fn emit_sample_abi(
         )
     })?;
     let key_name = "%key".to_string();
-    let mut e = Emitter::for_query(m, opts);
+    let mut e = Emitter::for_query_with_rules(m, opts, rules);
     let resolved_src = resolve_self_ref(m, src);
     let source_input = match m.node(src) {
         Node::Ref(Ref {

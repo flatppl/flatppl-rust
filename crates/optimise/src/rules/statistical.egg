@@ -4,62 +4,62 @@
 (relation stat-fixed-endpoint (Expr i64))
 (rule ((= x (Real 9218868437227405312)))
       ((stat-fixed-endpoint x 1))
-      :ruleset statistical)
+      :ruleset statistical :name "statistical.fixed-positive-infinity")
 (rule ((= x (Real -4503599627370496)))
       ((stat-fixed-endpoint x -1))
-      :ruleset statistical)
+      :ruleset statistical :name "statistical.fixed-negative-infinity")
 (rule ((= x (U "neg" y)) (stat-fixed-endpoint y sign))
       ((stat-fixed-endpoint x (- 0 sign)))
-      :ruleset statistical)
+      :ruleset statistical :name "statistical.negate-fixed-infinity")
 
 ; A scalar endpoint with no value adjoint or status to preserve. An endpoint
 ; selection still evaluates its predicate, so prove that it can be discarded.
 (relation stat-endpoint (Expr i64))
 (rule ((stat-fixed-endpoint x sign))
       ((stat-endpoint x sign))
-      :ruleset statistical)
+      :ruleset statistical :name "statistical.erasable-fixed-infinity")
 (rule ((= x (U "neg" y)) (stat-endpoint y sign))
       ((stat-endpoint x (- 0 sign)))
-      :ruleset statistical)
+      :ruleset statistical :name "statistical.negate-erasable-infinity")
 (rule ((= x (T "ifelse" condition yes no))
        (bool-value condition) (erasable condition)
        (stat-endpoint yes sign) (stat-endpoint no sign))
       ((stat-endpoint x sign))
-      :ruleset statistical)
+      :ruleset statistical :name "statistical.select-matching-infinities")
 
 ; The emitter omits log_ndtr's status result for fixed endpoints. An inert
 ; endpoint select can still make it emit a status result that is always zero.
 (rewrite (U "special-functions.log_ndtr" x) (Real -4503599627370496)
          :when ((stat-fixed-endpoint x -1))
-         :ruleset statistical)
+         :ruleset statistical :name "statistical.log-ndtr-negative-infinity")
 (rewrite (U "special-functions.log_ndtr" x) (Real 0)
          :when ((stat-fixed-endpoint x 1))
-         :ruleset statistical)
+         :ruleset statistical :name "statistical.log-ndtr-positive-infinity")
 
 ; Empty reductions have a -infinity max and a zero shifted sum. An empty
 ; operand may still record a status or be refused during lowering.
 (rewrite (U "logsumexp" v) (Real -4503599627370496)
          :when ((real-vector v 0) (erasable v))
-         :ruleset statistical)
+         :ruleset statistical :name "statistical.empty-logsumexp")
 (rewrite (U "logsumexp" (U "vector" x)) (Real -4503599627370496)
          :when ((stat-endpoint x -1))
-         :ruleset statistical)
+         :ruleset statistical :name "statistical.singleton-logsumexp-negative-infinity")
 (rewrite (U "logsumexp.pair" (B "vector" x y)) (Real -4503599627370496)
          :when ((stat-endpoint x -1) (stat-endpoint y -1))
-         :ruleset statistical)
+         :ruleset statistical :name "statistical.pair-logsumexp-both-negative-infinity")
 
 ; Both forms use the floor-of-max shift. The omitted exponentials are exact
 ; zeros and have no adjoints. Compact to a singleton, keeping the same
 ; reduction path for a live term that can be infinite, NaN, or signed zero.
 (rewrite (U "logsumexp" (T "vector" x a b)) (U "logsumexp" (U "vector" x))
          :when ((real-value x) (stat-endpoint a -1) (stat-endpoint b -1))
-         :ruleset statistical)
+         :ruleset statistical :name "statistical.triple-logsumexp-first-live")
 (rewrite (U "logsumexp" (T "vector" a x b)) (U "logsumexp" (U "vector" x))
          :when ((real-value x) (stat-endpoint a -1) (stat-endpoint b -1))
-         :ruleset statistical)
+         :ruleset statistical :name "statistical.triple-logsumexp-middle-live")
 (rewrite (U "logsumexp" (T "vector" a b x)) (U "logsumexp" (U "vector" x))
          :when ((real-value x) (stat-endpoint a -1) (stat-endpoint b -1))
-         :ruleset statistical)
+         :ruleset statistical :name "statistical.triple-logsumexp-last-live")
 
 ; The bounds are the signed f64 bit encodings of +/- f32::MIN_POSITIVE
 ; through +/- f32::MAX. They guarantee a nonzero normal value in both
@@ -68,24 +68,24 @@
 (relation stat-finite-normal (Expr))
 (rule ((= x (Real bits)) (>= bits 4039728865751334912) (<= bits 5183643170566569984))
       ((stat-finite-normal x))
-      :ruleset statistical)
+      :ruleset statistical :name "statistical.finite-positive-normal-literal")
 (rule ((= x (Real bits)) (>= bits -5183643171103440896) (<= bits -4039728866288205824))
       ((stat-finite-normal x))
-      :ruleset statistical)
+      :ruleset statistical :name "statistical.finite-negative-normal-literal")
 (rule ((= x (U "neg" y)) (stat-finite-normal y))
       ((stat-finite-normal x))
-      :ruleset statistical)
+      :ruleset statistical :name "statistical.negate-finite-normal")
 (rule ((= x (T "ifelse" condition yes no)) (bool-value condition)
        (stat-finite-normal yes) (stat-finite-normal no))
       ((stat-finite-normal x))
-      :ruleset statistical)
+      :ruleset statistical :name "statistical.select-finite-normals")
 
 ; The scalar-pair path returns max + log1p(exp(-abs(a-b))). The correction
 ; is +0 for one absent term. A finite normal live term survives that addition
 ; exactly. Signed zeros and infinite-input boundary adjoints need the pair.
 (rewrite (U "logsumexp.pair" (B "vector" x a)) x
          :when ((stat-finite-normal x) (stat-endpoint a -1))
-         :ruleset statistical)
+         :ruleset statistical :name "statistical.pair-logsumexp-left-live")
 (rewrite (U "logsumexp.pair" (B "vector" a x)) x
          :when ((stat-finite-normal x) (stat-endpoint a -1))
-         :ruleset statistical)
+         :ruleset statistical :name "statistical.pair-logsumexp-right-live")

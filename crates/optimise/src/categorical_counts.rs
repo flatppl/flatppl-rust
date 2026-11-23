@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::engine::integer_plan_rows;
+use crate::{RulePolicy, engine::integer_plan_rows};
 
 const RULES: &str = include_str!("rules/categorical_counts.egg");
 
@@ -19,16 +19,30 @@ pub fn plan_simplex_rows(
     observations: u64,
     index: impl FnMut(usize) -> Option<i64>,
 ) -> Option<SimplexRowCheck> {
-    plan(row_extent, observations, index, RULES)
+    plan_simplex_rows_with_rules(row_extent, observations, index, &RulePolicy::default())
+}
+
+/// Select the required simplex row checks using the caller's egglog rules.
+pub fn plan_simplex_rows_with_rules(
+    row_extent: u64,
+    observations: u64,
+    index: impl FnMut(usize) -> Option<i64>,
+    rules: &RulePolicy,
+) -> Option<SimplexRowCheck> {
+    plan(row_extent, observations, index, RULES, rules)
 }
 
 fn plan(
     row_extent: u64,
     observations: u64,
     mut index: impl FnMut(usize) -> Option<i64>,
-    rules: &str,
+    program: &str,
+    rules: &RulePolicy,
 ) -> Option<SimplexRowCheck> {
-    if !(2..=65_536).contains(&observations) || row_extent == 0 {
+    if !(2..=65_536).contains(&observations)
+        || row_extent == 0
+        || !rules.enables_ruleset("simplex-row-checks")
+    {
         return None;
     }
     let row_extent = i64::try_from(row_extent).ok()?;
@@ -56,10 +70,11 @@ fn plan(
     ];
     let plans = integer_plan_rows(
         "categorical_counts.egg",
-        rules,
+        program,
         "simplex-row-checks",
         &[("fixed-row-partition", &partition)],
         "check-occupied-rows",
+        rules,
     )?;
     match plans.as_slice() {
         [plan] if identity && plan.as_slice() == [occupied, 1] => Some(SimplexRowCheck::All),
@@ -78,7 +93,7 @@ mod tests {
         assert!(plan_simplex_rows(3, 16, small).is_none());
         let lower_floor = RULES.replace("(>= selected 64)", "(>= selected 8)");
         assert!(matches!(
-            plan(3, 16, small, &lower_floor),
+            plan(3, 16, small, &lower_floor, &RulePolicy::default()),
             Some(SimplexRowCheck::Select(rows)) if rows == [2, 0]
         ));
 
@@ -86,7 +101,7 @@ mod tests {
         assert!(plan_simplex_rows(24, 64, modest_reuse).is_none());
         let lower_ratio = RULES.replace("(* 3 occupied)", "(* 2 occupied)");
         assert!(matches!(
-            plan(24, 64, modest_reuse, &lower_ratio),
+            plan(24, 64, modest_reuse, &lower_ratio, &RulePolicy::default()),
             Some(SimplexRowCheck::All)
         ));
     }

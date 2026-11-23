@@ -1,4 +1,4 @@
-use flatppl_host::{BatchSpec, Context, EmitOptions};
+use flatppl_host::{BatchSpec, Context, EmitOptions, RulePolicy};
 use serde_json::json;
 
 #[test]
@@ -375,6 +375,14 @@ fn a_batched_terminal_scan_keeps_the_mapped_history() -> Result<(), Box<dyn std:
         unbatched.matches("stablehlo.dynamic_update_slice").count(),
         1
     );
+    let rules = RulePolicy::new(&["scan-demand.terminal-choice"], &[])?;
+    let masked = query.compile_with_rules(&options, &rules)?.stablehlo;
+    let scan = masked
+        .lines()
+        .find(|line| line.contains("stablehlo.while"))
+        .expect("scan loop");
+    assert!(scan.contains("tensor<5xf32>"), "{scan}");
+    assert_eq!(query.compile(&options)?.stablehlo, unbatched);
     assert_eq!(batched.matches("stablehlo.while").count(), 1);
     assert!(
         batched.contains("stablehlo.dynamic_update_slice"),

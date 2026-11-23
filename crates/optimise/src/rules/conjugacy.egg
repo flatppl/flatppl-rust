@@ -25,28 +25,28 @@
        (real-value score) (int-value point) (conjugate-unit-predictive score probability))
       ((conjugate-original-measure measure 3)
        (union score (B head (U "Bernoulli" (Real probability)) point)))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.beta-bernoulli")
 
 ; NegativeBinomial(alpha, beta) is the Gamma(shape, rate)-Poisson mixture.
 (rule ((= score (B head measure point)) (= measure (Leaf opaque)) (conjugate-density-head head)
        (real-value score) (int-value point) (conjugate-gamma-poisson score shape rate))
       ((conjugate-original-measure measure 3)
        (union score (B head (B "NegativeBinomial" (Real shape) (Real rate)) point)))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.gamma-poisson")
 
 ; Independent Normal deviations add in variance coordinates.
 (rule ((= score (B head measure point)) (= measure (Leaf opaque)) (conjugate-density-head head)
        (real-value score) (real-value point) (conjugate-normal-mean score location scale))
       ((conjugate-original-measure measure 3)
        (union score (B head (B "Normal" (Real location) (Real scale)) point)))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.normal-mean")
 
 ; Exponential mixing of the variance gives Laplace with scale 1/sqrt(2*rate).
 (rule ((= score (B head measure point)) (= measure (Leaf opaque)) (conjugate-density-head head)
        (real-value score) (real-value point) (conjugate-exponential-variance score location scale))
       ((conjugate-original-measure measure 3)
        (union score (B head (B "Laplace" (Real location) (Real scale)) point)))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.exponential-variance")
 
 ; InverseGamma mixing gives StudentT(2*shape) with scale sqrt(beta/shape).
 ; Keep the standardized-square and log1p form used by the marginal integral.
@@ -58,13 +58,13 @@
        (let square (B "pow" standardized (Real 4611686018427387904)))
        (let tail (B "mul" (Real tail_weight) (U "log1p" (B "divide" square (Real nu)))))
        (conjugate-student-log-density score (U "neg" (B "add" (Real norm) tail))))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.inverse-gamma-variance")
 (rule ((= score (B "logdensityof" measure point)) (conjugate-student-log-density score value))
       ((union score value))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.student-log-density")
 (rule ((= score (B "densityof" measure point)) (conjugate-student-log-density score value))
       ((union score (U "exp" value)))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.student-density")
 
 ; Select a proved count's negative log mass without adding a checked index.
 ; The log and ordinary density share this selection and its original point.
@@ -73,25 +73,25 @@
        (real-value score) (conjugate-beta-binomial score masses))
       ((conjugate-original-measure measure 16)
        (conjugate-count-select point masses))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.beta-binomial-site")
 (rule ((conjugate-count-select point masses) (= masses (ConjugateMass k log tail)))
       ((conjugate-count-select point tail))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.beta-binomial-next-count")
 (rule ((conjugate-count-select point last) (= last (ConjugateLastMass log)))
       ((conjugate-count-score point last (Real log)))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.beta-binomial-last-mass")
 (rule ((conjugate-count-select point masses) (= masses (ConjugateMass k log tail))
        (conjugate-count-score point tail rest))
       ((conjugate-count-score point masses
          (T "ifelse" (B "equal" point (Integer k)) (Real log) rest)))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.beta-binomial-select-mass")
 (rule ((= score (B "densityof" measure point)) (= measure (Leaf opaque))
        (conjugate-beta-binomial score masses)
        (conjugate-count-score point masses negative_log))
       ((union score (U "exp" (U "neg" negative_log))))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.beta-binomial-density")
 (rule ((= score (B "logdensityof" measure point)) (= measure (Leaf opaque))
        (conjugate-beta-binomial score masses)
        (conjugate-count-score point masses negative_log))
       ((union score (U "neg" negative_log)))
-  :ruleset conjugacy)
+  :ruleset conjugacy :name "conjugacy.beta-binomial-log-density")

@@ -19,6 +19,21 @@ impl Emitter<'_> {
         valid: NodeId,
         parameters: &[NodeId],
     ) -> Option<Vec<f64>> {
+        Self::fixed_distribution_parameters_with_rules(
+            m,
+            valid,
+            parameters,
+            &crate::RulePolicy::default(),
+        )
+    }
+
+    /// Read fixed posterior parameters using the caller's egglog rule policy.
+    pub fn fixed_distribution_parameters_with_rules(
+        m: &Module,
+        valid: NodeId,
+        parameters: &[NodeId],
+        rules: &crate::RulePolicy,
+    ) -> Option<Vec<f64>> {
         let inputs = flatppl_core::query::promoted_input_names(m);
         let mut seen = std::collections::HashSet::new();
         let mut todo = parameters.to_vec();
@@ -37,6 +52,7 @@ impl Emitter<'_> {
             }
         }
         let mut emitter = Emitter::new(m, Dtype::F64);
+        emitter.rules = rules.clone();
         let valid = emitter.lower_node(valid).ok()?;
         if emitter.fixed_scalar_at(&valid, 0)? != Scalar::Bool(true) {
             return None;

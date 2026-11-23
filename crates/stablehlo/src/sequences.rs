@@ -509,7 +509,7 @@ impl Emitter<'_> {
         self.scan_demand
             .as_ref()
             .expect("checked scan demand scope")
-            .get_or_init(|| flatppl_optimise::scan_output_demand(self.m))
+            .get_or_init(|| flatppl_optimise::scan_output_demand_with_rules(self.m, &self.rules))
     }
 
     pub(super) fn lower_scan_terminal(
@@ -922,13 +922,20 @@ impl Emitter<'_> {
                 && self.region_depth == 0
                 && self.call_frame.is_empty()
                 && self.runtime_batch_rank == 0
+                && self.rules.enables_ruleset("ordered-scan-index")
                 && xs.fields.is_none()
                 && xs.layout.is_none()
                 && let [value] = xs.values.as_slice()
             {
                 self.consecutive_scan_index(value, n)
                     .and_then(|(first, last)| {
-                        flatppl_optimise::plan_ordered_scan_index(first, last, n, width)
+                        flatppl_optimise::plan_ordered_scan_index_with_rules(
+                            first,
+                            last,
+                            n,
+                            width,
+                            &self.rules,
+                        )
                     })
             } else {
                 None
@@ -1222,7 +1229,7 @@ impl Emitter<'_> {
             }
         }
         if allow_wide {
-            flatppl_optimise::ordered_scan_width(length, seen.len())
+            flatppl_optimise::ordered_scan_width_with_rules(length, seen.len(), &self.rules)
         } else {
             4
         }

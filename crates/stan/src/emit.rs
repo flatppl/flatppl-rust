@@ -2966,8 +2966,12 @@ pub(crate) struct ImportNames {
     pub public: HashSet<Symbol>,
 }
 
-pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgram> {
-    let (target, optimised) = prepare(m, opts, &flatppl_infer::ModuleBundle::new())?;
+pub(crate) fn program(
+    m: &Module,
+    opts: &EmitOptions,
+    rules: &crate::RulePolicy,
+) -> Result<crate::StanProgram> {
+    let (target, optimised) = prepare(m, opts, &flatppl_infer::ModuleBundle::new(), rules)?;
     program_printed(
         optimised.as_ref().unwrap_or(m),
         opts,
@@ -2981,13 +2985,15 @@ pub(crate) fn prepare(
     m: &Module,
     opts: &EmitOptions,
     bundle: &flatppl_infer::ModuleBundle,
+    rules: &crate::RulePolicy,
 ) -> Result<(Symbol, Option<Module>)> {
     let target = select_target(m, opts)?;
-    let optimised = flatppl_optimise::optimise_with_bundle(
+    let optimised = flatppl_optimise::optimise_with_bundle_and_rules(
         m,
         Some(&[target]),
         flatppl_optimise::Profile::Stan,
         bundle,
+        rules,
     );
     Ok((target, optimised))
 }

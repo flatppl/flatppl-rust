@@ -1,12 +1,17 @@
 //! Size-bounded grouping for a verified scalar GPU scan.
 
-use crate::engine::integer_plan_rows;
+use crate::{RulePolicy, engine::integer_plan_rows};
 
 const RULES: &str = include_str!("rules/ordered_scan.egg");
 
 /// Choose an ordered block width for an already eligible GPU scalar scan.
 /// Callback size includes its distinct syntax nodes, before repeated lowering.
 pub fn ordered_scan_width(length: u64, body_nodes: usize) -> u64 {
+    ordered_scan_width_with_rules(length, body_nodes, &RulePolicy::default())
+}
+
+/// Choose a block width using the caller's egglog rules.
+pub fn ordered_scan_width_with_rules(length: u64, body_nodes: usize, rules: &RulePolicy) -> u64 {
     const ORIGINAL: u64 = 4;
     if length < 128 || !(1..=48).contains(&body_nodes) {
         return ORIGINAL;
@@ -20,6 +25,7 @@ pub fn ordered_scan_width(length: u64, body_nodes: usize) -> u64 {
         "ordered-scan",
         &[("ordered-scalar-scan", &[length, body_nodes as i64])],
         "ordered-block-choice",
+        rules,
     ) else {
         return ORIGINAL;
     };
@@ -41,6 +47,17 @@ pub fn plan_ordered_scan_index(
     length: u64,
     width: u64,
 ) -> Option<(i64, i64)> {
+    plan_ordered_scan_index_with_rules(first, last, length, width, &RulePolicy::default())
+}
+
+/// Plan a counter-derived scan item using the caller's egglog rules.
+pub fn plan_ordered_scan_index_with_rules(
+    first: i64,
+    last: i64,
+    length: u64,
+    width: u64,
+    rules: &RulePolicy,
+) -> Option<(i64, i64)> {
     last.checked_sub(first)?;
     let length = i64::try_from(length).ok()?;
     let width = i64::try_from(width).ok()?;
@@ -53,6 +70,7 @@ pub fn plan_ordered_scan_index(
             ("ordered-scan-width", &[length, width]),
         ],
         "ordered-index-choice",
+        rules,
     )?
     .iter()
     .find_map(|plan| match plan.as_slice() {

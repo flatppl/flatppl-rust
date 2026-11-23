@@ -186,6 +186,7 @@ pub struct Emitter<'m> {
     fold_design_scans: bool,
     integration: Option<crate::IntegrationOptions>,
     target: crate::Target,
+    rules: crate::RulePolicy,
     /// The program is replayed over host batch axes after lowering.
     host_batch: bool,
     runtime_batch_rank: usize,
@@ -277,6 +278,7 @@ impl<'m> Emitter<'m> {
             fold_design_scans: false,
             integration: None,
             target: crate::Target::Cpu,
+            rules: crate::RulePolicy::default(),
             host_batch: false,
             runtime_batch_rank: 0,
             runtime_status: None,
@@ -312,12 +314,22 @@ impl<'m> Emitter<'m> {
     }
 
     pub fn with_options(m: &'m Module, opts: &crate::EmitOptions) -> Self {
+        Self::with_options_and_rules(m, opts, &crate::RulePolicy::default())
+    }
+
+    /// Create an emitter using a caller-selected egglog rule policy.
+    pub fn with_options_and_rules(
+        m: &'m Module,
+        opts: &crate::EmitOptions,
+        rules: &crate::RulePolicy,
+    ) -> Self {
         let mut emitter = Self::new(m, opts.dtype);
         emitter.restrict_enzyme_compatible = opts.restrict_enzyme_compatible;
         emitter.check_parameters = opts.check_parameters;
         emitter.sufficient_statistics = opts.sufficient_statistics;
         emitter.integration = opts.integration;
         emitter.target = opts.target;
+        emitter.rules = rules.clone();
         emitter
     }
 
@@ -325,8 +337,18 @@ impl<'m> Emitter<'m> {
     /// caller must bind those inputs and lower only leaves of those outputs.
     #[doc(hidden)]
     pub fn for_query(m: &'m Module, opts: &crate::EmitOptions) -> Self {
-        let mut emitter = Self::with_options(m, opts);
-        emitter.scan_demand = opts.target.serial_scans().then(OnceLock::new);
+        Self::for_query_with_rules(m, opts, &crate::RulePolicy::default())
+    }
+
+    #[doc(hidden)]
+    pub fn for_query_with_rules(
+        m: &'m Module,
+        opts: &crate::EmitOptions,
+        rules: &crate::RulePolicy,
+    ) -> Self {
+        let mut emitter = Self::with_options_and_rules(m, opts, rules);
+        emitter.scan_demand = (opts.target.serial_scans() && rules.enables_ruleset("scan-demand"))
+            .then(OnceLock::new);
         emitter
     }
 
@@ -338,6 +360,7 @@ impl<'m> Emitter<'m> {
         emitter.sufficient_statistics = self.sufficient_statistics;
         emitter.integration = self.integration;
         emitter.target = self.target;
+        emitter.rules = self.rules.clone();
         emitter.host_batch = self.host_batch;
         emitter.runtime_batch_rank = self.runtime_batch_rank;
         emitter.region_depth = self.region_depth + 1;

@@ -26,6 +26,20 @@
 //! A construct with no sensible Stan form refuses with a never-kind
 //! [`RefusalKind`]; one this emitter does not write yet refuses with
 //! [`RefusalKind::NotYetSupported`].
+//!
+//! To keep an explicit row Gram product in teaching output, pass a rule policy
+//! to [`emit_with_rules`]. [`emit`] uses the standard Stan profile with every
+//! eligible rule enabled.
+//!
+//! ```
+//! use flatppl_core::Module;
+//! use flatppl_stan::{EmitOptions, RulePolicy, StanProgram, emit_with_rules};
+//!
+//! fn teaching_stan(module: &Module) -> Result<StanProgram, Box<dyn std::error::Error>> {
+//!     let rules = RulePolicy::new(&["stan.row-gram"], &[])?;
+//!     Ok(emit_with_rules(module, &EmitOptions::default(), &rules)?)
+//! }
+//! ```
 
 mod data;
 mod emit;
@@ -34,6 +48,7 @@ mod stan_type;
 mod tables;
 
 pub use data::DataSource;
+pub use flatppl_optimise::{RulePolicy, RuleSelector};
 pub use refuse::{Refusal, RefusalKind};
 
 use std::collections::{HashMap, HashSet};
@@ -182,7 +197,16 @@ pub struct StanProgram {
 
 /// Emit the Stan program for one target of an inferred module.
 pub fn emit(module: &Module, opts: &EmitOptions) -> Result<StanProgram, Refusal> {
-    emit::program(module, opts)
+    emit_with_rules(module, opts, &RulePolicy::default())
+}
+
+/// Emit Stan with explicit control of the egglog rules applied to its target.
+pub fn emit_with_rules(
+    module: &Module,
+    opts: &EmitOptions,
+    rules: &RulePolicy,
+) -> Result<StanProgram, Refusal> {
+    emit::program(module, opts, rules)
 }
 
 /// [`emit`] for a module that reads `load_module` members: the members are
@@ -195,11 +219,21 @@ pub fn emit_with_bundle(
     bundle: &flatppl_infer::ModuleBundle,
     opts: &EmitOptions,
 ) -> Result<StanProgram, Refusal> {
+    emit_with_bundle_and_rules(module, bundle, opts, &RulePolicy::default())
+}
+
+/// Emit a module and its imports with explicit egglog rule controls.
+pub fn emit_with_bundle_and_rules(
+    module: &Module,
+    bundle: &flatppl_infer::ModuleBundle,
+    opts: &EmitOptions,
+    rules: &RulePolicy,
+) -> Result<StanProgram, Refusal> {
     if !module
         .bindings()
         .any(|(_, b)| is_load_module(module, b.rhs))
     {
-        return emit(module, opts);
+        return emit_with_rules(module, opts, rules);
     }
     let grafted = flatppl_determinizer::graft_imports(module, bundle)
         .map_err(|e| Refusal::not_yet(Some(e.node), format!("{}: {}", e.construct, e.reason)))?;
@@ -219,7 +253,7 @@ pub fn emit_with_bundle(
             d.message.clone(),
         ));
     }
-    let (target, optimised) = emit::prepare(&work, opts, bundle).map_err(|mut r| {
+    let (target, optimised) = emit::prepare(&work, opts, bundle, rules).map_err(|mut r| {
         r.node = r.node.map(|n| emit::host_node(module, &work, &grafted, n));
         r
     })?;

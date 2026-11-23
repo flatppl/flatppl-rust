@@ -4,7 +4,7 @@ use crate::engine::{self, Fact, FactArg, Term};
 use crate::fixed_poisson::Partition;
 use crate::selectors::{self, Selectors};
 use crate::types::{TypeFacts, dimensions, fact};
-use crate::{Dtype, Profile, Target, concat, conjugacy, gaussian};
+use crate::{Dtype, Profile, RulePolicy, Target, concat, conjugacy, gaussian};
 use flatppl_core::graph::{build_call, resolve_ref_one};
 use flatppl_core::query::{Component, component};
 use flatppl_core::{
@@ -848,8 +848,9 @@ pub(super) fn optimise(
     profile: Profile,
     bundle: &flatppl_infer::ModuleBundle,
     sufficient_statistics: bool,
+    rules: &RulePolicy,
 ) -> Option<Module> {
-    if !trigger(m, profile) {
+    if rules.is_all_disabled() || !trigger(m, profile) {
         return None;
     }
     let mut project = Project::new(m, profile, sufficient_statistics);
@@ -969,7 +970,7 @@ pub(super) fn optimise(
             }
         }
     }
-    let winners = engine::optimise(&mut project.terms, &roots, &project.facts, profile)?;
+    let winners = engine::optimise(&mut project.terms, &roots, &project.facts, profile, rules)?;
     let mut out = m.clone();
     let chosen = project.rebuild(&mut out, &roots, &winners)?;
     outputs.write(&mut out, &chosen);

@@ -9,4 +9,4 @@
        (> occupied 0) (<= occupied extent)
        (>= selected 64) (>= selected (* 3 occupied)))
       ((check-occupied-rows occupied identity))
-  :ruleset simplex-row-checks)
+  :ruleset simplex-row-checks :name "simplex-row-checks.occupied-rows")

@@ -3,6 +3,7 @@
 use flatppl_core::query::promoted_input_names;
 
 use super::*;
+use crate::RulePolicy;
 
 #[derive(Clone, Default)]
 pub struct ScanOutputDemand {
@@ -177,7 +178,12 @@ fn tensor_value(mut ty: &Type) -> bool {
 /// ABI bindings cut traversal. Unrecognized users and callable captures keep
 /// the full value, and mixed terminal/history consumers share the full scan.
 pub fn scan_output_demand(module: &Module) -> ScanOutputDemand {
-    if module.node_count() > MAX_DEMAND_NODES {
+    scan_output_demand_with_rules(module, &RulePolicy::default())
+}
+
+/// Find scan output demand using the caller's egglog rules.
+pub fn scan_output_demand_with_rules(module: &Module, rules: &RulePolicy) -> ScanOutputDemand {
+    if module.node_count() > MAX_DEMAND_NODES || !rules.enables_ruleset("scan-demand") {
         return ScanOutputDemand::default();
     }
     let Some((_, output)) = module
@@ -266,6 +272,7 @@ pub fn scan_output_demand(module: &Module) -> ScanOutputDemand {
         "scan-demand",
         &facts,
         "scan-output-plan",
+        rules,
     ) else {
         return ScanOutputDemand::default();
     };
