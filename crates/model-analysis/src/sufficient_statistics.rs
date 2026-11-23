@@ -239,6 +239,22 @@ fn materialize(m: &mut Module, expr: Expr) -> NodeId {
             operands.extend(args.into_iter().map(|x| materialize(m, x)));
             build_call(m, "broadcast", &operands)
         }
+        Expr::Call("vector", args) => {
+            // Repeated cells in a generated vector can share a literal node.
+            let mut integers = HashMap::new();
+            let mut reals = HashMap::new();
+            let cells = args
+                .into_iter()
+                .map(|cell| match cell {
+                    Expr::Integer(x) => *integers.entry(x).or_insert_with(|| materialize(m, cell)),
+                    Expr::Number(x) => *reals
+                        .entry(x.to_bits())
+                        .or_insert_with(|| materialize(m, cell)),
+                    _ => materialize(m, cell),
+                })
+                .collect::<Vec<_>>();
+            build_call(m, "vector", &cells)
+        }
         Expr::Call(name, args) => {
             let args: Vec<_> = args.into_iter().map(|x| materialize(m, x)).collect();
             build_call(m, name, &args)
