@@ -151,3 +151,42 @@ outputs = aggregate(sum, [], lanes[.i, .j] * w[.i, .j])
         lower(&flatppl_syntax::print(&result));
     }
 }
+
+#[test]
+fn bernoulli_logit_pullbacks_skip_rounded_probabilities() {
+    for source in [
+        "
+eta = elementof(reals)
+p = invlogit(eta)
+observed = elementof(integers)
+inputs = (eta, observed)
+outputs = logdensityof(Bernoulli(p), observed)
+",
+        "
+eta = elementof(cartpow(reals, 2))
+p = invlogit.(eta)
+observed = elementof(cartpow(integers, 2))
+inputs = (eta, observed)
+outputs = sum(builtin_logdensityof.(Bernoulli, record.(p = p), observed))
+",
+    ] {
+        let model = lower(source);
+        for differentiate in [gradient, jvp, vjp] {
+            let derivative = differentiate(&model, &["eta"]).unwrap();
+            let text = flatppl_syntax::print(&derivative);
+            assert!(!text.contains(" / "), "{text}");
+        }
+    }
+
+    let model = lower(
+        "
+eta = elementof(reals)
+p = invlogit(eta)
+inputs = (eta, p)
+outputs = logdensityof(Bernoulli(p), 0)
+",
+    );
+    let derivative = gradient(&model, &["eta", "p"]).unwrap();
+    let text = flatppl_syntax::print(&derivative);
+    assert!(text.contains(" / "), "{text}");
+}

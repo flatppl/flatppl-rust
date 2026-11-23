@@ -376,6 +376,14 @@
     (CountRatio (Unary "real" (Arg 1)) (Arg 0))
     (CountRatio (Binary "sub" (Real 1.0) (Unary "real" (Arg 1)))
       (Binary "sub" (Real 1.0) (Arg 0))))) :ruleset pullbacks)
+; Match the primal's logit path before the probability rounds to an endpoint.
+; Evaluate the small tail directly for both observations.
+(rewrite (Pullback "Bernoulli logit log density" 2 0)
+  (Binary "mul" (Bar)
+    (Ternary "ifelse" (Unary "iszero" (Binary "sub" (Unary "real" (Arg 1)) (Real 1.0)))
+      (Unary "invlogit" (Unary "neg" (Arg 0)))
+      (Ternary "ifelse" (Unary "iszero" (Unary "real" (Arg 1)))
+        (Unary "neg" (Unary "invlogit" (Arg 0))) (Real 0.0)))) :ruleset pullbacks)
 (rewrite (Pullback "Binomial log density" 3 1)
   (Binary "mul" (Bar) (Binary "sub" (CountRatio (Arg 2) (Arg 1))
     (CountRatio (Binary "sub" (Arg 0) (Arg 2)) (Binary "sub" (Real 1.0) (Arg 1)))))

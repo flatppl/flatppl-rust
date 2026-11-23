@@ -1187,6 +1187,9 @@ fn density_args(
                     .find_map(|&(label, value)| (module.resolve(label) == name).then_some(value))
             })
             .collect::<Option<Vec<_>>>()?;
+        if let Some(stable) = bernoulli_logit_args(module, query, rule, &args, observation) {
+            return Some(stable);
+        }
         if rule == "iid Dirichlet log density" {
             return iid_dirichlet_args(module, query, node, args[0], observation);
         }
@@ -1219,6 +1222,9 @@ fn density_args(
         .iter()
         .map(|&name| field(name))
         .collect::<Option<Vec<_>>>()?;
+    if let Some(stable) = bernoulli_logit_args(module, query, rule, &args, observation) {
+        return Some(stable);
+    }
     if rule == "iid Dirichlet log density" {
         return iid_dirichlet_args(module, query, node, args[0], observation);
     }
@@ -1258,6 +1264,40 @@ fn density_args(
     }
     args.push(observation);
     Some((rule, args))
+}
+
+fn bernoulli_logit_args(
+    module: &Module,
+    query: &Query<'_>,
+    rule: &str,
+    args: &[NodeId],
+    observation: NodeId,
+) -> Option<(&'static str, Vec<NodeId>)> {
+    let ("Bernoulli log density", &[probability]) = (rule, args) else {
+        return None;
+    };
+    // Preserve a declared probability input as an independent variable, even
+    // if its source binding happens to be authored as invlogit(logit).
+    let Key::Node(probability) = query.key(module, probability).ok()? else {
+        return None;
+    };
+    let Node::Call(call) = module.node(probability) else {
+        return None;
+    };
+    if !call.named.is_empty() || call.inputs.is_some() {
+        return None;
+    }
+    let CallHead::Builtin(op) = call.head else {
+        return None;
+    };
+    let logit = match (module.resolve(op), call.args.as_ref()) {
+        ("invlogit", [logit]) => *logit,
+        ("broadcast", [head, logit]) if matches!(module.node(*head), Node::Const(op) if module.resolve(*op) == "invlogit") => {
+            *logit
+        }
+        _ => return None,
+    };
+    Some(("Bernoulli logit log density", vec![logit, observation]))
 }
 
 fn iid_dirichlet_args(
@@ -1484,7 +1524,8 @@ impl<'a> Step<'a> {
                         || self.op == "Uniform log density" && slot == 0
                         || matches!(
                             (self.op, slot),
-                            ("Bernoulli log density", 1) | ("Bernoulli GLM log density", 3)
+                            ("Bernoulli log density" | "Bernoulli logit log density", 1)
+                                | ("Bernoulli GLM log density", 3)
                         ) && tensor::boolean_shape(module, arg)
                 }
             });
