@@ -714,9 +714,24 @@ impl Emitter<'_> {
             let frame = self.call_frame.clone();
             *value = self.finish_broadcast(value, &frame, frame.len());
         }
+        let fixed = if self.fold_design_scans
+            && !reduce
+            && let [seq] = seqs.as_slice()
+            && let [xs] = seq.values.as_slice()
+            && let [init] = state.values.as_slice()
+            && state.fields.is_none()
+            && seq.fields.is_none()
+        {
+            self.fixed_add_scan(body, &entries, init, xs)
+                .map(|out| vec![out])
+        } else {
+            None
+        };
         // A profile without serial scans replaces the loop when the step is
         // affine in the carry.
-        let affine = if reduce || self.target.serial_scans() || keys.iter().any(|&k| k) {
+        let computed = if fixed.is_some() {
+            fixed
+        } else if reduce || self.target.serial_scans() || keys.iter().any(|&k| k) {
             None
         } else {
             let mut types = vec![state_type.clone()];
@@ -737,7 +752,7 @@ impl Emitter<'_> {
             .values
             .iter()
             .zip(&keys)
-            .filter(|(_, key)| !reduce && affine.is_none() && !**key)
+            .filter(|(_, key)| !reduce && computed.is_none() && !**key)
         {
             let mut dims = shape(&value.ty).to_vec();
             dims.insert(self.batch_rank(value), Some(n));
@@ -759,7 +774,7 @@ impl Emitter<'_> {
         // zero. `reduce` begins at the second item, so it runs `n - 1` steps
         // and reads the item after the counter.
         let first = u64::from(reduce);
-        if let Some(values) = affine {
+        if let Some(values) = computed {
             buffers = values;
         } else if n > first {
             let counter = self.int_value_const(0);
@@ -909,6 +924,67 @@ impl Emitter<'_> {
             self.bind(id, buffers[0].clone());
         }
         Ok(result)
+    }
+
+    /// A left scan of scalar integers with the literal callback `(a, x) -> a + x`.
+    /// Every addition must fit the target's integer width. The final axis is
+    /// traversed independently within each mapped lane.
+    fn fixed_add_scan(
+        &mut self,
+        body: NodeId,
+        entries: &[(Symbol, Ref)],
+        init: &Value,
+        xs: &Value,
+    ) -> Option<Value> {
+        let [(_, carry), (_, item)] = entries else {
+            return None;
+        };
+        let Node::Call(call) = self.m.node(body) else {
+            return None;
+        };
+        let [a, b] = call.args.as_ref() else {
+            return None;
+        };
+        let (Node::Ref(a), Node::Ref(b)) = (self.m.node(*a), self.m.node(*b)) else {
+            return None;
+        };
+        if !matches!(call.head, CallHead::Builtin(s) if self.resolve(s) == "add")
+            || !call.named.is_empty()
+            || !((a == carry && b == item) || (a == item && b == carry))
+            || init.elem != ElemKind::Int
+            || xs.elem != ElemKind::Int
+        {
+            return None;
+        }
+        let (last, prefix) = shape(&xs.ty).split_last()?;
+        if prefix != shape(&init.ty)
+            || self.batch_rank(xs) != prefix.len()
+            || self.batch_rank(init) != prefix.len()
+        {
+            return None;
+        }
+        let width = usize::try_from((*last)?).ok()?;
+        let cells = super::constants::element_count(&xs.ty)?;
+        if width == 0 || cells == 0 || cells > super::constants::MAX_FOLDED_ELEMENTS {
+            return None;
+        }
+        let mut values = Vec::with_capacity(cells);
+        for lane in 0..cells / width {
+            let Scalar::Int(mut carry) = self.fixed_scalar_at(init, lane)? else {
+                return None;
+            };
+            for index in lane * width..(lane + 1) * width {
+                let Scalar::Int(next) = self.fixed_scalar_at(xs, index)? else {
+                    return None;
+                };
+                carry = carry.checked_add(next)?;
+                if !self.int_fits(carry) {
+                    return None;
+                }
+                values.push(Scalar::Int(carry));
+            }
+        }
+        self.folded_constant(values, xs.ty.clone(), self.axes_of(xs))
     }
 
     pub(super) fn scan_slice(&mut self, input: &Value, index: &Value) -> Value {

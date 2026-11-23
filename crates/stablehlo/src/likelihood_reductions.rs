@@ -191,6 +191,12 @@ impl Emitter<'_> {
         let Some((ctor, fields, observed)) = self.per_cell_density(call.args.as_ref()) else {
             return Ok(None);
         };
+        if ctor == "Bernoulli"
+            && let [(name, probability)] = fields.as_slice()
+            && name == "p"
+        {
+            return Ok(self.reduce_bernoulli_design(*probability, observed));
+        }
         let names: &[&str] = match ctor.as_str() {
             "Normal" => &["mu", "sigma"],
             "Gamma" => &["shape", "rate"],
