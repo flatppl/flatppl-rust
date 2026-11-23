@@ -31,10 +31,10 @@ fn differentiates_iid_truncated_normal_with_scalar_captures() {
     let source = "
 mu = elementof(reals)
 sigma = elementof(posreals)
-observations = [-1.5, 0.2, 1.8, 2.7]
+observations = elementof(cartpow(reals, 65))
 bounded = normalize(truncate(Normal(mu, sigma), interval(-2.0, 3.0)))
-likelihood = likelihoodof(iid(bounded, 4), observations)
-inputs = (mu, sigma)
+likelihood = likelihoodof(iid(bounded, lengthof(observations)), observations)
+inputs = (mu, sigma, observations)
 outputs = logdensityof(likelihood, record(mu = mu, sigma = sigma))
 ";
     check_transforms(source, &["mu", "sigma"]);
