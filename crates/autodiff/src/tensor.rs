@@ -211,6 +211,17 @@ pub(super) fn insert(emitter: &mut Emitter, value: NodeId, index: i64, length: u
     build_call(m, "mul", &[basis, value])
 }
 
+fn cat_extent(module: &Module, input: NodeId) -> Option<(i64, bool)> {
+    if let Some((count, _)) = nested_vector(module, input) {
+        return Some((i64::from(count), true));
+    }
+    match numeric_shape(module, input)? {
+        [] => Some((1, false)),
+        [Dim::Static(n)] => Some((i64::from(*n), true)),
+        _ => None,
+    }
+}
+
 pub(super) fn cat_slice(
     emitter: &mut Emitter,
     bar: NodeId,
@@ -219,18 +230,9 @@ pub(super) fn cat_slice(
 ) -> Option<NodeId> {
     let &input = args.get(slot)?;
     let offset = args[..slot].iter().try_fold(0i64, |offset, &arg| {
-        let length = match numeric_shape(&emitter.module, arg)? {
-            [] => 1,
-            [Dim::Static(n)] => i64::from(*n),
-            _ => return None,
-        };
-        offset.checked_add(length)
+        offset.checked_add(cat_extent(&emitter.module, arg)?.0)
     })?;
-    let is_vector = match numeric_shape(&emitter.module, input)? {
-        [] => false,
-        [_] => true,
-        _ => return None,
-    };
+    let (_, is_vector) = cat_extent(&emitter.module, input)?;
     let input = emitter.primal(input);
     let m = &mut emitter.module;
     let start = int(m, offset);
@@ -260,6 +262,9 @@ pub(super) fn cat_embed(
         .map(|(index, &primal)| {
             if index == slot {
                 return Some(tangent);
+            }
+            if nested_vector(&emitter.module, primal).is_some() {
+                return emitter.zero_like(primal).ok();
             }
             match numeric_shape(&emitter.module, primal)? {
                 [] => Some(zero),
@@ -446,36 +451,44 @@ pub(super) fn scatter(
     if let Some(Type::Record(fields)) = emitter.module.type_of(primal).cloned() {
         return crate::record::scatter(emitter, bar, primal, &fields, selectors);
     }
-    if let Some((count, cols)) = nested_vector(&emitter.module, primal) {
+    if let Some((count, _)) = nested_vector(&emitter.module, primal) {
         let [selector] = *selectors else {
             return None;
         };
-        if index_axes(&emitter.module, selector)? != 0 {
+        let is_keyword = |keyword| {
+            matches!(
+                emitter.module.node(selector), Node::Const(name) if emitter.module.resolve(*name) == keyword
+            )
+        };
+        if is_keyword("all") {
+            return Some(bar);
+        }
+        if is_keyword("only") && count != 1 {
             return None;
         }
-        let m = &mut emitter.module;
-        let selector = if matches!(m.node(selector), Node::Const(name) if m.resolve(*name) == "only")
-        {
-            if count != 1 {
-                return None;
-            }
-            int(m, base)
-        } else {
-            selector
+        let rank = index_axes(&emitter.module, selector)?;
+        let primal = emitter.primal(primal);
+        let matrix = build_call(&mut emitter.module, "rowstack", &[primal]);
+        let bar = match rank {
+            0 => bar,
+            1 => build_call(&mut emitter.module, "rowstack", &[bar]),
+            _ => return None,
         };
-        let zero = real(m, 0.0);
-        let cols = int(m, i64::from(cols));
-        let zero_row = build_call(m, "fill", &[zero, cols]);
-        let parts: Vec<_> = (base..base + i64::from(count))
-            .map(|index| {
-                let index = int(m, index);
-                let equal = build_call(m, "equal", &[index, selector]);
-                build_call(m, "ifelse", &[equal, bar, zero_row])
-            })
-            .collect();
-        return Some(build_call(m, "vector", &parts));
+        let matrix = scatter_axes(emitter, bar, matrix, selectors, base, 2)?;
+        return Some(unstack(&mut emitter.module, matrix, count, false));
     }
     let rank = real_shape(&emitter.module, primal)?.len();
+    scatter_axes(emitter, bar, primal, selectors, base, rank)
+}
+
+fn scatter_axes(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    primal: NodeId,
+    selectors: &[NodeId],
+    base: i64,
+    rank: usize,
+) -> Option<NodeId> {
     if rank == 0 || selectors.len() > rank {
         return None;
     }
@@ -565,6 +578,14 @@ fn indexed(module: &mut Module, value: NodeId, selectors: &[NodeId]) -> NodeId {
         .chain(selectors.iter().copied())
         .collect();
     build_call(module, "get", &args)
+}
+
+pub(super) fn reduce_rows(module: &mut Module, operation: &str, matrix: NodeId) -> NodeId {
+    let axes = axes(module, 2);
+    let cell = indexed(module, matrix, &axes);
+    let row_axis = build_call(module, "vector", &axes[..1]);
+    let reduction = constant(module, operation);
+    build_call(module, "aggregate", &[reduction, row_axis, cell])
 }
 
 fn aggregate(module: &mut Module, output_axes: &[NodeId], expression: NodeId) -> NodeId {

@@ -3695,6 +3695,7 @@ fn get_array_type(
     for (dim, (node, ty, _)) in shape.iter().zip(selectors) {
         match inf.module.node(*node) {
             Node::Const(name) if inf.module.resolve(*name) == "all" => retained.push(*dim),
+            Node::Const(name) if inf.module.resolve(*name) == "only" && *dim == Dim::Static(1) => {}
             Node::Axis(_) | Node::Lit(Scalar::Int(_)) => {}
             _ => match ty {
                 Type::Scalar(ScalarType::Integer) => {}

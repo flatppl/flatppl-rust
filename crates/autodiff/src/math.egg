@@ -112,3 +112,6 @@
 
 (rewrite (Pullback "indexed sum product" 2 slot) (IndexedProduct slot 0) :ruleset pullbacks)
 (rewrite (Pushforward "indexed sum product" 2 slot) (IndexedProduct slot 1) :ruleset pullbacks)
+
+(rewrite (Pullback "diag" 1 0) (Unary "diagmat" (Bar)) :ruleset pullbacks)
+(rewrite (Pushforward "diag" 1 0) (ForwardCall "diag" 0) :ruleset pullbacks)

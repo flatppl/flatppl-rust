@@ -1640,6 +1640,7 @@ fn stablehlo_cmd(
     #[cfg(feature = "autodiff")]
     if source_ad {
         lowered = differentiate(&lowered, ad.0, ad.1, &lowering)?;
+        flatppl_determinizer::prepare_serialization(&mut lowered, None);
     }
     if let Some((path, data_inputs)) = preparation {
         if !opts.sufficient_statistics || !matches!(mode, flatppl_stablehlo::Mode::LogDensity) {

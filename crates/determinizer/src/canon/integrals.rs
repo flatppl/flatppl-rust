@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{Binding, CallHead, Idx, Inputs, Module, Node, NodeId, Ref, RefNs};
 
-pub(super) fn hoist_integrals(m: &mut Module) -> bool {
+pub(crate) fn hoist_integrals(m: &mut Module) -> bool {
     let bindings: Vec<_> = m
         .bindings()
         .filter(|(bid, _)| !super::is_reserved_abi_binding(m, *bid))

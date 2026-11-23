@@ -28,13 +28,23 @@ impl<'a> Rules<'a> {
             "\n",
             include_str!("math.egg"),
             "\n",
-            include_str!("complex.egg")
+            include_str!("complex.egg"),
+            "\n",
+            include_str!("glm.egg")
         )
         .to_owned();
         for (catalog, op, arity, slot) in &keys {
             program.push_str(&format!("({catalog} {op:?} {arity} {slot})\n"));
         }
-        program.push_str("(run pullbacks 4)\n");
+        if keys.iter().any(|(_, op, _, _)| {
+            op.ends_with(" GLM log density")
+                || op.starts_with("rowwise Categorical")
+                || matches!(*op, "LKJ log density" | "LKJCholesky log density")
+        }) {
+            program.push_str("(run-schedule (saturate (run pullbacks)))\n");
+        } else {
+            program.push_str("(run pullbacks 4)\n");
+        }
         for (catalog, op, arity, slot) in &keys {
             program.push_str(&format!("(extract ({catalog} {op:?} {arity} {slot}))\n"));
         }
@@ -255,6 +265,27 @@ impl Template {
                     .collect();
                 *args.get_mut(slot)? = values.bar;
                 build_call(&mut emitter.module, name, &args)
+            }
+            ("RowReduce", [op, matrix]) => {
+                let Term::Lit(Literal::String(op)) = self.dag.get(*op) else {
+                    return None;
+                };
+                let matrix = self.emit(*matrix, emitter, values)?;
+                tensor::reduce_rows(&mut emitter.module, op, matrix)
+            }
+            ("FlattenRows" | "RestoreRows", [value, slot]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                let primal = *values.step.args.get(slot)?;
+                let value = self.emit(*value, emitter, values)?;
+                if let Some((rows, _)) = tensor::nested_vector(&emitter.module, primal) {
+                    if head == "FlattenRows" {
+                        build_call(&mut emitter.module, "rowstack", &[value])
+                    } else {
+                        tensor::unstack(&mut emitter.module, value, rows, false)
+                    }
+                } else {
+                    value
+                }
             }
             ("MathDot", [left, right]) => {
                 let left = self.emit(*left, emitter, values)?;

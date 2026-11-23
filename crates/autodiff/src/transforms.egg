@@ -169,3 +169,17 @@
 (rewrite (Pullback "log_betainc" 3 2) (TailContribution (BetaLogPdf) (Out)) :ruleset pullbacks)
 (rewrite (Pullback "log_betaincc" 3 2)
   (Unary "neg" (TailContribution (BetaLogPdf) (Out))) :ruleset pullbacks)
+
+; The normalizing constants use the same digamma difference as Beta density.
+(rewrite (Pullback "loggamma" 1 0)
+  (Binary "mul" (Bar) (SpecialUnary "digamma" (Arg 0))) :ruleset pullbacks)
+(rewrite (Pullback "logbeta" 2 0)
+  (Unary "neg" (Binary "mul" (Bar) (DigammaDifference (Arg 0) (Arg 1)))) :ruleset pullbacks)
+(rewrite (Pullback "logbeta" 2 1)
+  (Unary "neg" (Binary "mul" (Bar) (DigammaDifference (Arg 1) (Arg 0)))) :ruleset pullbacks)
+(rewrite (Pullback "beta" 2 0)
+  (Unary "neg" (Binary "mul" (Binary "mul" (Bar) (Out)) (DigammaDifference (Arg 0) (Arg 1))))
+  :ruleset pullbacks)
+(rewrite (Pullback "beta" 2 1)
+  (Unary "neg" (Binary "mul" (Binary "mul" (Bar) (Out)) (DigammaDifference (Arg 1) (Arg 0))))
+  :ruleset pullbacks)

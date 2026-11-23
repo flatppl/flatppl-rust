@@ -3018,7 +3018,10 @@ fn lower_get(e: &mut Emitter, id: NodeId, args: &[NodeId], base: i64) -> Result<
     if let Ok(selector) = literal_index(e, id, index) {
         return lower_get_literal(e, id, container, selector, base);
     }
-    if matches!(e.type_of(container), Some(Type::Array { shape, .. }) if shape.len() > 1) {
+    let axis_keyword =
+        matches!(e.node(index), Node::Const(name) if matches!(e.resolve(*name), "all" | "only"));
+    if matches!(e.type_of(container), Some(Type::Array { shape, .. }) if shape.len() > 1 || axis_keyword)
+    {
         return crate::indexing::lower_multi_axis(e, id, args, base);
     }
     lower_get_gather(e, id, container, index, base)

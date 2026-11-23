@@ -1,10 +1,10 @@
 //! Differentiate the mathematical integral, independently of the quadrature mesh.
 
 use flatppl_core::graph::{build_call, expect_builtin_call, rebuild_with_children};
-use flatppl_core::{CallHead, Dim, LOG_INTEGRAL, MASS_INTEGRAL, Scalar};
+use flatppl_core::{CallHead, Dim, INTEGRATION_POINT, LOG_INTEGRAL, MASS_INTEGRAL, Scalar};
 
-use crate::{Emitter, Error, HashMap, HashSet, Key, Module, Node, NodeId, Plan, Query, Step};
-use crate::{forward_values, real, rules::Rules, tensor};
+use crate::{Emitter, Error, HashMap, HashSet, Key, Mode, Module, Node, NodeId, Plan, Query, Step};
+use crate::{combine_contributions, forward_values, real, reverse_values, rules::Rules, tensor};
 
 pub(super) struct Scope<'a> {
     pub(super) plan: Plan<'a>,
@@ -45,16 +45,8 @@ pub(super) fn visit<'a>(
             "expected one or two integration axes",
         ));
     }
-    if outer.in_integrand {
-        return Err(Error::new(
-            Some(node),
-            "differentiation through a numerical integral inside an integrand requires hoisting",
-        ));
-    }
-
     let root = outer.query.key(outer.module, *body)?;
     let mut plan = Plan::new(outer.module, outer.query);
-    plan.in_integrand = true;
     let interior_active = plan.visit(root, depth + 1)?;
     let breakpoints = find_cuts(outer.module, outer.query, *body, axes)?;
     let mut active_cuts = Vec::new();
@@ -111,19 +103,50 @@ pub(super) fn visit<'a>(
 }
 
 impl<'a> Scope<'a> {
-    pub(super) fn pullback(
+    pub(super) fn integrand_adjoints(
         &self,
         emitter: &mut Emitter,
         rules: &Rules<'a>,
+        mode: Mode,
+    ) -> Result<HashMap<Key, NodeId>, Error> {
+        if !self.plan.activity[&self.root] {
+            return Ok(HashMap::new());
+        }
+        let one = real(&mut emitter.module, 1.0);
+        let inline = std::mem::replace(&mut emitter.inline, true);
+        let contributions = reverse_values(emitter, &self.plan, rules, &[self.root], &[one], mode);
+        emitter.inline = inline;
+        let mut contributions = contributions?;
+        Ok(self
+            .plan
+            .query
+            .wrt
+            .iter()
+            .filter_map(|input| {
+                let key = Key::Input(input.binding);
+                let terms = contributions.remove(&key)?;
+                Some((key, combine_contributions(emitter, input.reference, terms)))
+            })
+            .collect())
+    }
+
+    pub(super) fn pullback(
+        &self,
+        emitter: &mut Emitter,
         step: &Step<'_>,
         slot: usize,
         cotangent: NodeId,
+        adjoints: &HashMap<Key, NodeId>,
     ) -> Result<NodeId, Error> {
         let fixed = self.axes.len() * 2 + self.active_cuts.len();
         let factor = if slot < fixed {
             self.boundary(emitter, step.node, slot)
         } else {
-            self.capture_pullback(emitter, rules, step, slot)?
+            let key = step.targets[slot].unwrap();
+            let &adjoint = adjoints.get(&key).ok_or_else(|| {
+                Error::new(Some(step.node), "missing active integrand derivative")
+            })?;
+            self.capture_pullback(emitter, step.node, step.args[slot], adjoint)?
         };
         Ok(build_call(&mut emitter.module, "mul", &[cotangent, factor]))
     }
@@ -131,45 +154,37 @@ impl<'a> Scope<'a> {
     fn capture_pullback(
         &self,
         emitter: &mut Emitter,
-        rules: &Rules<'a>,
-        step: &Step<'_>,
-        slot: usize,
+        primal: NodeId,
+        arg: NodeId,
+        adjoint: NodeId,
     ) -> Result<NodeId, Error> {
-        let arg = step.args[slot];
-        let key = step.targets[slot].unwrap();
-        let integrate = |emitter: &mut Emitter, direction| {
-            self.interior(emitter, rules, step.node, HashMap::from([(key, direction)]))?
-                .ok_or_else(|| Error::new(Some(step.node), "missing active integrand derivative"))
+        let integrate = |emitter: &mut Emitter, indices: &[u32]| {
+            let mut args = vec![adjoint];
+            args.extend(
+                indices
+                    .iter()
+                    .map(|&index| tensor::int(&mut emitter.module, i64::from(index))),
+            );
+            let component = build_call(&mut emitter.module, "get", &args);
+            self.integrate(emitter, primal, component)
         };
-        // Quadrature emits a scalar. Integrate one basis direction per cell,
-        // then restore the capture's shape outside the integration binder.
+        // Quadrature emits a scalar. Project each component of the shared
+        // adjoint and restore the capture's shape outside the binder.
         match tensor::real_shape(self.plan.module, arg) {
-            Some([]) => {
-                let one = real(&mut emitter.module, 1.0);
-                integrate(emitter, one)
-            }
+            Some([]) => Ok(self.integrate(emitter, primal, adjoint)),
             Some(shape) if shape.contains(&Dim::Static(0)) => emitter.zero_like(arg),
             Some([Dim::Static(n)]) => {
                 let terms = (1..=*n)
-                    .map(|i| {
-                        let basis = basis_vector(&mut emitter.module, i, *n);
-                        integrate(emitter, basis)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(|i| integrate(emitter, &[i]))
+                    .collect::<Vec<_>>();
                 Ok(build_call(&mut emitter.module, "vector", &terms))
             }
             Some([Dim::Static(rows), Dim::Static(cols)]) => {
                 let mut vectors = Vec::new();
                 for i in 1..=*rows {
-                    let axis = basis_vector(&mut emitter.module, i, *rows);
-                    let rows = singleton_axis(&mut emitter.module, axis, false);
-                    let mut terms = Vec::new();
-                    for j in 1..=*cols {
-                        let axis = basis_vector(&mut emitter.module, j, *cols);
-                        let cols = singleton_axis(&mut emitter.module, axis, true);
-                        let basis = tensor::broadcast(&mut emitter.module, "mul", &[rows, cols]);
-                        terms.push(integrate(emitter, basis)?);
-                    }
+                    let terms = (1..=*cols)
+                        .map(|j| integrate(emitter, &[i, j]))
+                        .collect::<Vec<_>>();
                     vectors.push(build_call(&mut emitter.module, "vector", &terms));
                 }
                 let vectors = build_call(&mut emitter.module, "vector", &vectors);
@@ -225,6 +240,10 @@ impl<'a> Scope<'a> {
         let Some(&derivative) = tangents?.get(&self.root) else {
             return Ok(None);
         };
+        Ok(Some(self.integrate(emitter, primal, derivative)))
+    }
+
+    fn integrate(&self, emitter: &mut Emitter, primal: NodeId, derivative: NodeId) -> NodeId {
         let (derivative, center) = if self.logarithmic {
             // Center the score before integration. A nearly constant score in a
             // tail interval would otherwise amplify rounding of the mass ratio.
@@ -246,10 +265,10 @@ impl<'a> Scope<'a> {
         let positive = self.integral_part(emitter, primal, derivative);
         let negative = self.integral_part(emitter, primal, negative);
         let signed = build_call(&mut emitter.module, "sub", &[positive, negative]);
-        Ok(Some(match center {
+        match center {
             Some(center) => build_call(&mut emitter.module, "add", &[signed, center]),
             None => signed,
-        }))
+        }
     }
 
     fn integral_part(&self, emitter: &mut Emitter, primal: NodeId, derivative: NodeId) -> NodeId {
@@ -257,15 +276,14 @@ impl<'a> Scope<'a> {
         let zero = real(module, 0.0);
         let part = build_call(module, "max", &[derivative, zero]);
         if !self.logarithmic {
-            return integral(module, MASS_INTEGRAL, part, self.axes.iter());
+            return integral(emitter, MASS_INTEGRAL, part, self.axes.iter());
         }
         let part = build_call(module, "log", &[part]);
         let weighted = build_call(module, "add", &[self.body, part]);
         let neg_inf = real(module, f64::NEG_INFINITY);
         let outside = build_call(module, "isinf", &[self.body]);
         let weighted = build_call(module, "ifelse", &[outside, neg_inf, weighted]);
-        let value = integral(module, LOG_INTEGRAL, weighted, self.axes.iter());
-        log_ratio(emitter, primal, value)
+        normalized_log_integral(emitter, primal, weighted, self.axes.iter())
     }
 
     fn boundary(&self, emitter: &mut Emitter, primal: NodeId, slot: usize) -> NodeId {
@@ -305,20 +323,11 @@ impl<'a> Scope<'a> {
             }
         }
         let body = substitute(&mut emitter.module, self.body, &mut values);
-        let value = if self.axes.len() == 1 {
-            body
-        } else {
-            let op = if self.logarithmic {
-                LOG_INTEGRAL
-            } else {
-                MASS_INTEGRAL
-            };
-            integral(&mut emitter.module, op, body, [&self.axes[1 - axis]])
-        };
-        let value = if self.logarithmic {
-            log_ratio(emitter, primal, value)
-        } else {
-            value
+        let value = match (self.axes.len(), self.logarithmic) {
+            (1, false) => body,
+            (1, true) => log_ratio(emitter, primal, body),
+            (_, false) => integral(emitter, MASS_INTEGRAL, body, [&self.axes[1 - axis]]),
+            (_, true) => normalized_log_integral(emitter, primal, body, [&self.axes[1 - axis]]),
         };
         if sign == 0 {
             build_call(&mut emitter.module, "neg", &[value])
@@ -369,18 +378,6 @@ impl<'a> Scope<'a> {
     }
 }
 
-fn basis_vector(module: &mut Module, index: u32, len: u32) -> NodeId {
-    let index = tensor::int(module, i64::from(index));
-    let len = tensor::int(module, i64::from(len));
-    build_call(module, "onehot", &[index, len])
-}
-
-fn singleton_axis(module: &mut Module, vector: NodeId, leading: bool) -> NodeId {
-    let left = tensor::int(module, i64::from(leading));
-    let right = tensor::int(module, i64::from(!leading));
-    build_call(module, "addaxes", &[vector, left, right])
-}
-
 fn interior_point(module: &mut Module, lo: NodeId, hi: NodeId) -> NodeId {
     let lo_finite = build_call(module, "isfinite", &[lo]);
     let hi_finite = build_call(module, "isfinite", &[hi]);
@@ -398,16 +395,46 @@ fn interior_point(module: &mut Module, lo: NodeId, hi: NodeId) -> NodeId {
 }
 
 fn integral<'a>(
-    module: &mut Module,
+    emitter: &mut Emitter,
     op: &str,
     body: NodeId,
     axes: impl IntoIterator<Item = &'a [NodeId; 3]>,
 ) -> NodeId {
+    let module = &mut emitter.module;
     let mut args = vec![body];
-    for axis in axes {
-        args.extend(axis);
+    let mut coordinates = HashMap::new();
+    for &[coordinate, lo, hi] in axes {
+        // A named inner integral can reuse the primal's own coordinate.
+        // Give this binder distinct IDs so quadrature rebinding keeps it fixed.
+        let token = module.node_count() as i64;
+        let token = tensor::int(module, token);
+        let point = build_call(module, INTEGRATION_POINT, &[token]);
+        coordinates.insert(coordinate, point);
+        args.extend([point, lo, hi]);
     }
-    build_call(module, op, &args)
+    args[0] = substitute(module, body, &mut coordinates);
+    let integral = build_call(module, op, &args);
+    // Primal conformance permits inner integrals only through closed
+    // bindings. Keep derivative integrals at the same lexical boundary.
+    if emitter.inline {
+        emitter.define("_ad_integral", integral)
+    } else {
+        integral
+    }
+}
+
+fn normalized_log_integral<'a>(
+    emitter: &mut Emitter,
+    primal: NodeId,
+    body: NodeId,
+    axes: impl IntoIterator<Item = &'a [NodeId; 3]>,
+) -> NodeId {
+    // Apply the normalization before quadrature. Otherwise a small primal
+    // mass magnifies the numerator's absolute quadrature error.
+    let denominator = emitter.primal(primal);
+    let body = build_call(&mut emitter.module, "sub", &[body, denominator]);
+    let value = integral(emitter, LOG_INTEGRAL, body, axes);
+    build_call(&mut emitter.module, "exp", &[value])
 }
 
 fn log_ratio(emitter: &mut Emitter, primal: NodeId, numerator: NodeId) -> NodeId {

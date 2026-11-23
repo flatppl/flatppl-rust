@@ -24,6 +24,9 @@
   (Int i64)
   (Real f64)
   (MathDot Expr Expr)
+  (FlattenRows Expr i64)
+  (RestoreRows Expr i64)
+  (RowReduce String Expr)
   (IndexedProduct i64 i64)
   (MatrixPullback i64 Expr)
   (PolynomialSlope)
@@ -220,25 +223,25 @@
 ; The first six Bernoulli terms approximate log(x) - digamma(x) at x >= 16.
 (constructor DigammaCorrection (Expr Expr) Expr :unextractable)
 (rewrite (DigammaCorrection inverse squared)
-  (Binary "add" (Binary "mul" (Real 0.5) inverse)
-    (Binary "mul" squared
-      (Binary "add" (Real 0.08333333333333333) (Binary "mul" squared
-        (Binary "add" (Real -0.008333333333333333) (Binary "mul" squared
-          (Binary "add" (Real 0.003968253968253968) (Binary "mul" squared
-            (Binary "add" (Real -0.004166666666666667) (Binary "mul" squared
-              (Binary "add" (Real 0.007575757575757576)
-                (Binary "mul" squared (Real -0.021092796092796094)))))))))))))
+  (MapBinary "add" (MapBinary "mul" (Real 0.5) inverse)
+    (MapBinary "mul" squared
+      (MapBinary "add" (Real 0.08333333333333333) (MapBinary "mul" squared
+        (MapBinary "add" (Real -0.008333333333333333) (MapBinary "mul" squared
+          (MapBinary "add" (Real 0.003968253968253968) (MapBinary "mul" squared
+            (MapBinary "add" (Real -0.004166666666666667) (MapBinary "mul" squared
+              (MapBinary "add" (Real 0.007575757575757576)
+                (MapBinary "mul" squared (Real -0.021092796092796094)))))))))))))
   :ruleset pullbacks)
 (constructor DigammaDifference (Expr Expr) Expr :unextractable)
 (rewrite (DigammaDifference x y)
-  (Ternary "ifelse" (Binary "ge" x (Real 16.0))
-    (Binary "add" (Unary "log1p" (Binary "divide" y x))
-      (Binary "sub"
-        (DigammaCorrection (Binary "divide" (Real 1.0) x)
-          (Unary "abs2" (Binary "divide" (Real 1.0) x)))
-        (DigammaCorrection (Binary "divide" (Real 1.0) (Binary "add" x y))
-          (Unary "abs2" (Binary "divide" (Real 1.0) (Binary "add" x y))))))
-    (Binary "sub" (SpecialUnary "digamma" (Binary "add" x y)) (SpecialUnary "digamma" x)))
+  (MapTernary "ifelse" (MapBinary "ge" x (Real 16.0))
+    (MapBinary "add" (MapUnary "log1p" (MapBinary "divide" y x))
+      (MapBinary "sub"
+        (DigammaCorrection (MapBinary "divide" (Real 1.0) x)
+          (MapUnary "abs2" (MapBinary "divide" (Real 1.0) x)))
+        (DigammaCorrection (MapBinary "divide" (Real 1.0) (MapBinary "add" x y))
+          (MapUnary "abs2" (MapBinary "divide" (Real 1.0) (MapBinary "add" x y))))))
+    (MapBinary "sub" (MapSpecialUnary "digamma" (MapBinary "add" x y)) (MapSpecialUnary "digamma" x)))
   :ruleset pullbacks)
 (rewrite (Pullback "Beta log density" 3 0)
   (Binary "mul" (Bar) (Binary "add" (Unary "log" (Arg 2))
@@ -501,6 +504,32 @@
 (rewrite (Pushforward "Multinomial log density" 3 1)
   (MathDot (Bar) (MultinomialProbability)) :ruleset pullbacks)
 
+(constructor CategoryMask (Expr Expr) Expr :unextractable)
+(rewrite (CategoryMask observed categories)
+  (MapBinary "equal" (Ternary "addaxes" observed (Int 0) (Int 1))
+    (Ternary "addaxes" categories (Int 1) (Int 0))) :ruleset pullbacks)
+(constructor CategoryFirstRow () Expr :unextractable)
+(rewrite (CategoryFirstRow) (Binary "get" (FlattenRows (Arg 0) 0) (Int 1)) :ruleset pullbacks)
+(constructor RowCategoryRatio (String Expr) Expr :unextractable)
+(rewrite (RowCategoryRatio index_names numerator)
+  (MapTernary "ifelse"
+    (CategoryMask (Arg 1) (Unary index_names (CategoryFirstRow)))
+    (MapTernary "ifelse" (MapUnary "iszero" numerator) (Real 0.0)
+      (MapBinary "divide" numerator (FlattenRows (Arg 0) 0)))
+    (Real 0.0)) :ruleset pullbacks)
+(rewrite (Pullback "rowwise Categorical log density" 2 0)
+  (RestoreRows (RowCategoryRatio "indicesof" (Ternary "addaxes" (Bar) (Int 0) (Int 1))) 0)
+  :ruleset pullbacks)
+(rewrite (Pullback "rowwise Categorical0 log density" 2 0)
+  (RestoreRows (RowCategoryRatio "indicesof0" (Ternary "addaxes" (Bar) (Int 0) (Int 1))) 0)
+  :ruleset pullbacks)
+(rewrite (Pushforward "rowwise Categorical log density" 2 0)
+  (Binary "mul" (RowCategoryRatio "indicesof" (FlattenRows (Bar) 0))
+    (Unary "ones" (Unary "lengthof" (CategoryFirstRow)))) :ruleset pullbacks)
+(rewrite (Pushforward "rowwise Categorical0 log density" 2 0)
+  (Binary "mul" (RowCategoryRatio "indicesof0" (FlattenRows (Bar) 0))
+    (Unary "ones" (Unary "lengthof" (CategoryFirstRow)))) :ruleset pullbacks)
+
 ; These density rules operate on one vector-valued event, with a scalar score.
 (constructor DirichletShape () Expr :unextractable)
 (rewrite (DirichletShape)
@@ -608,6 +637,58 @@
 (rewrite (Pushforward "InverseWishart log density" 3 2)
   (Binary "mul" (Real 0.5) (MathDot (Bar) (InverseWishartObservationDerivative)))
   :ruleset pullbacks)
+
+(constructor LkjDiag () Expr :unextractable)
+(rewrite (LkjDiag) (Unary "diag" (Arg 2)) :ruleset pullbacks)
+(constructor LkjIndex () Expr :unextractable)
+(rewrite (LkjIndex) (Unary "indicesof0" (LkjDiag)) :ruleset pullbacks)
+
+; Differentiate the beta-function normalizer using digamma duplication:
+; 2 log(2) + 2 psi(x) - 2 psi(2x) = -(psi(x + 1/2) - psi(x)).
+(constructor LkjNormalizerSlope () Expr :unextractable)
+(rewrite (LkjNormalizerSlope)
+  (Unary "sum" (MapTernary "ifelse"
+    (MapBinary "lt" (LkjIndex) (Binary "sub" (Arg 0) (Int 1)))
+    (MapBinary "mul" (MapBinary "add" (LkjIndex) (Int 1))
+      (DigammaDifference (MapBinary "add" (Arg 1) (MapBinary "mul" (Real 0.5) (LkjIndex)))
+        (Real 0.5)))
+    (Real 0.0)))
+  :ruleset pullbacks)
+(constructor LkjCholeskyDiagSlope () Expr :unextractable)
+(rewrite (LkjCholeskyDiagSlope)
+  (Unary "diagmat" (MapTernary "ifelse" (MapUnary "iszero" (LkjIndex)) (Real 0.0)
+    (MapBinary "divide"
+      (MapBinary "sub" (Binary "add" (Arg 0) (Binary "mul" (Real 2.0) (Arg 1)))
+        (MapBinary "add" (LkjIndex) (Int 3)))
+      (LkjDiag)))) :ruleset pullbacks)
+(constructor LkjCholeskyEtaSlope () Expr :unextractable)
+(rewrite (LkjCholeskyEtaSlope)
+  (Binary "add" (LkjNormalizerSlope)
+    (Binary "mul" (Real 2.0) (Unary "sum" (MapTernary "ifelse"
+      (MapUnary "iszero" (LkjIndex)) (Real 0.0) (MapUnary "log" (LkjDiag))))))
+  :ruleset pullbacks)
+(constructor LkjEtaSlope () Expr :unextractable)
+(rewrite (LkjEtaSlope) (Binary "add" (Unary "logabsdet" (Arg 2)) (LkjNormalizerSlope))
+  :ruleset pullbacks)
+(constructor LkjVariateSlope () Expr :unextractable)
+(rewrite (LkjVariateSlope)
+  (Binary "mul" (Binary "sub" (Arg 1) (Real 1.0)) (Unary "inv" (Arg 2))) :ruleset pullbacks)
+(rewrite (Pullback "LKJ log density" 3 1)
+  (Binary "mul" (Bar) (LkjEtaSlope)) :ruleset pullbacks)
+(rewrite (Pullback "LKJ log density" 3 2)
+  (Binary "mul" (Bar) (LkjVariateSlope)) :ruleset pullbacks)
+(rewrite (Pushforward "LKJ log density" 3 1)
+  (Binary "mul" (Bar) (LkjEtaSlope)) :ruleset pullbacks)
+(rewrite (Pushforward "LKJ log density" 3 2)
+  (MathDot (Bar) (LkjVariateSlope)) :ruleset pullbacks)
+(rewrite (Pullback "LKJCholesky log density" 3 1)
+  (Binary "mul" (Bar) (LkjCholeskyEtaSlope)) :ruleset pullbacks)
+(rewrite (Pullback "LKJCholesky log density" 3 2)
+  (Binary "mul" (Bar) (LkjCholeskyDiagSlope)) :ruleset pullbacks)
+(rewrite (Pushforward "LKJCholesky log density" 3 1)
+  (Binary "mul" (Bar) (LkjCholeskyEtaSlope)) :ruleset pullbacks)
+(rewrite (Pushforward "LKJCholesky log density" 3 2)
+  (MathDot (Bar) (LkjCholeskyDiagSlope)) :ruleset pullbacks)
 
 ; Treat the zero exponent before forming the base power.
 (constructor ZeroExponent () Expr :unextractable)

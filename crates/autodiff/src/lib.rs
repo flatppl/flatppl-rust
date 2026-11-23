@@ -8,7 +8,9 @@ mod callbacks;
 mod contract;
 mod integral;
 mod math;
+mod metric;
 mod record;
+mod recurrence;
 mod rules;
 mod tensor;
 mod transforms;
@@ -260,6 +262,7 @@ fn transform(
 }
 
 type Derived = Vec<(String, NodeId, NodeId)>;
+type Contributions = HashMap<Key, Vec<(NodeId, bool)>>;
 
 fn reverse(
     emitter: &mut Emitter,
@@ -269,7 +272,29 @@ fn reverse(
     seeds: &[NodeId],
     mode: Mode,
 ) -> Result<Derived, Error> {
-    let mut contributions: HashMap<Key, Vec<(NodeId, bool)>> = HashMap::new();
+    let mut contributions = reverse_values(emitter, plan, rules, roots, seeds, mode)?;
+    plan.query
+        .wrt
+        .iter()
+        .map(|input| {
+            let derivative = match contributions.remove(&Key::Input(input.binding)) {
+                Some(terms) => combine_contributions(emitter, input.reference, terms),
+                None => emitter.zero_like(input.reference)?,
+            };
+            Ok((format!("d_{}", input.name), input.reference, derivative))
+        })
+        .collect()
+}
+
+fn reverse_values(
+    emitter: &mut Emitter,
+    plan: &Plan<'_>,
+    rules: &rules::Rules<'_>,
+    roots: &[Key],
+    seeds: &[NodeId],
+    mode: Mode,
+) -> Result<Contributions, Error> {
+    let mut contributions = Contributions::new();
     for (&root, &seed) in roots.iter().zip(seeds) {
         contributions.entry(root).or_default().push((seed, false));
     }
@@ -294,12 +319,15 @@ fn reverse(
                 format!("`{}` needs a mask-aware pullback", step.op),
             ));
         }
+        let integral = scope
+            .map(|scope| Ok::<_, Error>((scope, scope.integrand_adjoints(emitter, rules, mode)?)))
+            .transpose()?;
         for (slot, target) in step.targets.iter().enumerate() {
             let Some(target) = target.filter(|key| plan.activity[key]) else {
                 continue;
             };
-            let mut contribution = if let Some(scope) = scope {
-                scope.pullback(emitter, rules, step, slot, bar)?
+            let mut contribution = if let Some((scope, adjoints)) = &integral {
+                scope.pullback(emitter, step, slot, bar, adjoints)?
             } else if let Some(scope) = aggregate {
                 scope.pullback(emitter, rules, slot, bar, masked)?
             } else {
@@ -339,20 +367,16 @@ fn reverse(
                 .push((contribution, masked || step.op == "ifelse"));
         }
     }
-    plan.query
-        .wrt
-        .iter()
-        .map(|input| {
-            let derivative = match contributions.remove(&Key::Input(input.binding)) {
-                Some(terms) => {
-                    let terms: Vec<_> = terms.into_iter().map(|(value, _)| value).collect();
-                    tensor::add_terms(emitter, input.reference, &terms)
-                }
-                None => emitter.zero_like(input.reference)?,
-            };
-            Ok((format!("d_{}", input.name), input.reference, derivative))
-        })
-        .collect()
+    Ok(contributions)
+}
+
+fn combine_contributions(
+    emitter: &mut Emitter,
+    primal: NodeId,
+    terms: Vec<(NodeId, bool)>,
+) -> NodeId {
+    let terms: Vec<_> = terms.into_iter().map(|(value, _)| value).collect();
+    tensor::add_terms(emitter, primal, &terms)
 }
 
 fn forward(
@@ -680,7 +704,6 @@ struct Plan<'a> {
     steps: Vec<Step<'a>>,
     integrals: HashMap<NodeId, integral::Scope<'a>>,
     aggregates: HashMap<NodeId, aggregate::Scope<'a>>,
-    in_integrand: bool,
 }
 
 impl<'a> Plan<'a> {
@@ -692,14 +715,13 @@ impl<'a> Plan<'a> {
             steps: Vec::new(),
             integrals: HashMap::new(),
             aggregates: HashMap::new(),
-            in_integrand: false,
         }
     }
 
     fn collect_rules(&self, mode: Mode, requests: &mut BTreeSet<rules::RuleKey<'a>>) {
         for step in &self.steps {
             if let Some(scope) = self.integrals.get(&step.node) {
-                scope.plan.collect_rules(Mode::Jvp, requests);
+                scope.plan.collect_rules(mode, requests);
                 continue;
             }
             if let Some(scope) = self.aggregates.get(&step.node) {
@@ -853,6 +875,8 @@ fn special_op(module: &Module, callee: NodeId) -> Option<&'static str> {
         "betaincc" => Some("betaincc"),
         "log_betainc" => Some("log_betainc"),
         "log_betaincc" => Some("log_betaincc"),
+        "beta" => Some("beta"),
+        "logbeta" => Some("logbeta"),
         "digamma" => Some("digamma"),
         "polygamma" => Some("polygamma"),
         _ => None,
@@ -889,6 +913,28 @@ fn density_args(
     };
     let (rule, fields): (&str, &[&str]) = match module.resolve(*tag) {
         "Normal" => ("Normal log density", &["mu", "sigma"]),
+        "NormalGLM" if !batched => ("Normal GLM log density", &["x", "alpha", "beta", "sigma"]),
+        "CategoricalLogitGLM" if !batched => {
+            ("Categorical GLM log density", &["x", "alpha", "beta"])
+        }
+        "OrderedLogitGLM" if !batched => ("Ordered GLM log density", &["x", "beta", "cutpoints"]),
+        "BernoulliLogitGLM" if !batched => ("Bernoulli GLM log density", &["x", "alpha", "beta"]),
+        "BinomialLogitGLM" if !batched => {
+            ("Binomial GLM log density", &["x", "alpha", "beta", "n"])
+        }
+        "PoissonLogGLM" if !batched => ("Poisson GLM log density", &["x", "alpha", "beta"]),
+        "NegativeBinomial2LogGLM" if !batched => (
+            "NegativeBinomial2 GLM log density",
+            &["x", "alpha", "beta", "psi"],
+        ),
+        "StudentTGLM" if !batched => (
+            "StudentT GLM log density",
+            &["x", "alpha", "beta", "sigma", "nu"],
+        ),
+        "GammaLogGLM" if !batched => ("Gamma GLM log density", &["x", "alpha", "beta", "shape"]),
+        "BetaLogitGLM" if !batched => {
+            ("Beta GLM log density", &["x", "alpha", "beta", "precision"])
+        }
         "GeneralizedNormal" => ("GeneralizedNormal log density", &["mean", "alpha", "beta"]),
         "VonMises" => ("VonMises log density", &["mu", "kappa"]),
         "ChiSquared" => ("ChiSquared log density", &["k"]),
@@ -920,6 +966,8 @@ fn density_args(
         "Dirichlet" if !batched => ("Dirichlet log density", &["alpha"]),
         "MvNormal" if !batched => ("MvNormal log density", &["mu", "cov"]),
         "Wishart" if !batched => ("Wishart log density", &["nu", "scale"]),
+        "LKJ" if !batched => ("LKJ log density", &["n", "eta"]),
+        "LKJCholesky" if !batched => ("LKJCholesky log density", &["n", "eta"]),
         "InverseWishart" if !batched => ("InverseWishart log density", &["nu", "scale"]),
         "Multinomial" if !batched => ("Multinomial log density", &["n", "p"]),
         "Uniform" => ("Uniform log density", &["support"]),
@@ -975,19 +1023,28 @@ fn density_args(
         rule,
         "iid Categorical log density" | "iid Categorical0 log density"
     ) {
-        let Key::Node(wrapped) = query.key(module, args[0]).ok()? else {
-            return None;
-        };
-        let call = expect_builtin_call(module, wrapped, "vector")?;
-        let &[probabilities] = call.args.as_ref() else {
-            return None;
-        };
-        if !matches!(tensor::real_shape(module, probabilities), Some([_]))
-            || !matches!(tensor::numeric_shape(module, observation), Some([_]))
-        {
+        if !matches!(tensor::numeric_shape(module, observation), Some([_])) {
             return None;
         }
-        args[0] = probabilities;
+        if let Ok(Key::Node(wrapped)) = query.key(module, args[0])
+            && let Some(call) = expect_builtin_call(module, wrapped, "vector")
+            && let &[probabilities] = call.args.as_ref()
+            && matches!(tensor::real_shape(module, probabilities), Some([_]))
+        {
+            args[0] = probabilities;
+        } else if matches!(tensor::real_shape(module, args[0]), Some([_, _]))
+            || tensor::nested_vector(module, args[0]).is_some()
+        {
+            let rule = if rule == "iid Categorical log density" {
+                "rowwise Categorical log density"
+            } else {
+                "rowwise Categorical0 log density"
+            };
+            args.push(observation);
+            return Some((rule, args));
+        } else {
+            return None;
+        }
     }
     args.push(observation);
     Some((rule, args))
@@ -1034,11 +1091,13 @@ fn multivariate_density(op: &str) -> bool {
         "Dirichlet log density"
             | "MvNormal log density"
             | "Wishart log density"
+            | "LKJ log density"
+            | "LKJCholesky log density"
             | "InverseWishart log density"
             | "Multinomial log density"
             | "Categorical log density"
             | "Categorical0 log density"
-    )
+    ) || op.ends_with(" GLM log density")
 }
 
 fn structural(op: &str) -> bool {
@@ -1066,6 +1125,8 @@ fn structural(op: &str) -> bool {
             | "transpose"
             | "iid Categorical log density"
             | "iid Categorical0 log density"
+            | "rowwise Categorical log density"
+            | "rowwise Categorical0 log density"
     ) || math::structural(op)
         || multivariate_density(op)
 }
@@ -1132,7 +1193,7 @@ impl<'a> Step<'a> {
             ));
         }
         let have_shapes = (tensor::real_shape(module, self.node).is_some()
-            || self.op == "vector" && nested_vector(self.node)
+            || matches!(self.op, "vector" | "cat" | "get" | "get0") && nested_vector(self.node)
             || record_access
                 && module
                     .type_of(self.node)
@@ -1146,19 +1207,28 @@ impl<'a> Step<'a> {
                 } else if matches!(self.op, "get" | "get0") && slot > 0 {
                     let axes = tensor::index_axes(module, arg);
                     if nested_vector(self.args[0]) {
-                        self.args.len() == 2 && axes == Some(0)
+                        self.args.len() == 2 && axes.is_some_and(|rank| rank <= 1)
                     } else {
                         axes.is_some()
                     }
                 } else {
                     tensor::numeric_shape(module, arg).is_some()
-                        || matches!(self.op, "rowstack" | "colstack" | "get" | "get0")
-                            && slot == 0
+                        || matches!(
+                            self.op,
+                            "rowstack"
+                                | "colstack"
+                                | "get"
+                                | "get0"
+                                | "rowwise Categorical log density"
+                                | "rowwise Categorical0 log density"
+                        ) && slot == 0
                             && nested_vector(arg)
+                        || self.op == "cat" && nested_vector(arg)
                         || self.op == "Uniform log density" && slot == 0
-                        || self.op == "Bernoulli log density"
-                            && slot == 1
-                            && tensor::boolean_shape(module, arg)
+                        || matches!(
+                            (self.op, slot),
+                            ("Bernoulli log density", 1) | ("Bernoulli GLM log density", 3)
+                        ) && tensor::boolean_shape(module, arg)
                 }
             });
         if !have_shapes {
@@ -1188,6 +1258,12 @@ impl<'a> Step<'a> {
             return Err(Error::new(
                 Some(self.node),
                 "cumulative and reverse pullbacks require a fixed-length real vector",
+            ));
+        }
+        if self.op == "diag" && math::square_size(module, self.args[0]).is_none() {
+            return Err(Error::new(
+                Some(self.node),
+                "diagonal pullback requires a nonempty real square matrix",
             ));
         }
         if self.op == "det" && !math::cofactor_shape(module, self.args[0]) {
@@ -1246,11 +1322,14 @@ impl Emitter {
     }
 
     fn primal(&mut self, id: NodeId) -> NodeId {
-        if self.inline || !matches!(self.module.node(id), Node::Call(_)) {
+        if !matches!(self.module.node(id), Node::Call(_)) {
             return id;
         }
         if let Some(&name) = self.names.get(&id) {
             return self.reference(name);
+        }
+        if self.inline {
+            return id;
         }
         let id_ref = self.define("_ad_value", id);
         let Node::Ref(reference) = self.module.node(id_ref) else {

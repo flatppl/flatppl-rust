@@ -173,7 +173,7 @@ pub(super) fn matrix_pullback(
     Some(aggregate(m, sum, target_axes, term))
 }
 
-fn axis(module: &mut Module, name: &str) -> NodeId {
+pub(super) fn axis(module: &mut Module, name: &str) -> NodeId {
     let name = module.intern(name);
     module.alloc(Node::Axis(Axis {
         name,

@@ -64,7 +64,7 @@ pub(super) fn lift_broadcast(m: &mut Module, id: NodeId) -> Option<NodeId> {
             if uses[&id] > 1 && super::is_numeric_broadcast(m, id) && !super::contains_axis(m, rhs)
             {
                 if let Some(batch) = map_cell(m, rhs, &inputs) {
-                    let values = super::bind(m, batch);
+                    let values = super::bind(m, batch, "__broadcast");
                     let (label, reference, local) = placeholder(m, m.type_of(id)?.clone(), &inputs);
                     inputs.push(Input {
                         label,

@@ -13,6 +13,7 @@ pub(super) fn structural(op: &str) -> bool {
             | "l2norm"
             | "trace"
             | "diagmat"
+            | "diag"
             | "det"
             | "logabsdet"
             | "inv"
@@ -33,7 +34,7 @@ pub(super) fn symmetric(module: &mut Module, value: NodeId) -> NodeId {
     build_call(module, "mul", &[half, sum])
 }
 
-fn square_size(module: &Module, primal: NodeId) -> Option<i64> {
+pub(super) fn square_size(module: &Module, primal: NodeId) -> Option<i64> {
     match tensor::real_shape(module, primal)? {
         [Dim::Static(rows), Dim::Static(cols)] if rows == cols && *rows > 0 => {
             Some(i64::from(*rows))

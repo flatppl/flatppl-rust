@@ -1365,3 +1365,31 @@ fn set_constructor_presets_carry_their_set() {
         "interval preset value-set should be the denoted interval, got:\n{out}"
     );
 }
+
+#[test]
+fn fixed_filter_counts_baked_matrix_cells_in_dimension_order() {
+    let out = ir(
+        "data = record(grade = array([1, -1, -1, -1, 1, -1], [2, 3], [2, 1]))\n\
+         kept = filter(c -> data.grade[div(c - 1, 3) + 1, mod(c - 1, 3) + 1] != -1, indicesof(zeros(3)))\n\
+         y = elementof(cartpow(reals, lengthof(kept)))\n",
+    );
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (2) (%scalar integer))"),
+        "{out}"
+    );
+    assert!(
+        out.contains("(%bind y (%meta ((%array 1 (2) (%scalar real))"),
+        "{out}"
+    );
+}
+
+#[test]
+fn filter_over_a_promoted_alias_uses_runtime_contents() {
+    let out = ir(
+        "data = [1, 2, 3]\npromoted = data\ninputs = promoted\nkept = filter(c -> c > 1, data)\n",
+    );
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (%dynamic) (%scalar integer))"),
+        "{out}"
+    );
+}

@@ -280,6 +280,14 @@ fn determinize_inner(
                     }
                     let _ = flatppl_infer::infer(&mut work);
                 }
+                // Closed inner integrals need their own binding before the
+                // nonnested-integral check, including on the AD input path.
+                if options.disable_optimizations
+                    && options.numerical_integrals
+                    && crate::canon::hoist_integrals(&mut work)
+                {
+                    let _ = flatppl_infer::infer(&mut work);
+                }
                 if !options.disable_optimizations && !options.disable_sufficient_statistics {
                     crate::sufficient_statistics_for_target(
                         &mut work,

@@ -40,7 +40,6 @@ pub(super) fn visit<'a>(
         return Ok(None);
     };
     let mut plan = Plan::new(outer.module, outer.query);
-    plan.in_integrand = outer.in_integrand;
     let root = outer.query.key(outer.module, body)?;
     let mut inputs = Vec::with_capacity(sites.len());
     let mut targets = Vec::with_capacity(sites.len());

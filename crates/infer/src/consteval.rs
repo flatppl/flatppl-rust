@@ -25,7 +25,12 @@
 //! diagnostic at the demand site, never a silent `%dynamic`. `Dynamic` dominates
 //! `Gap`: a value that is dynamic anyway is not worth nagging about.
 
-use flatppl_core::{Call, CallHead, Dim, Node, NodeId, Phase, RefNs, Scalar, Type};
+use std::collections::HashSet;
+
+use flatppl_core::query::promoted_input_names;
+use flatppl_core::{
+    Call, CallHead, Dim, Node, NodeId, Phase, RefNs, Scalar, ScalarType, Symbol, Type,
+};
 
 use crate::trace::Inferencer;
 use crate::{Diagnostic, Level};
@@ -44,9 +49,8 @@ use crate::{Diagnostic, Level};
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum FixedValue {
     Int(i64),
-    /// A real element of fixed data. Produced only by the `filter` fold below,
-    /// so `lengthof(filter(pred, data))` can count the kept elements; no other
-    /// op folds reals, and a real in a shape position stays `%dynamic`.
+    /// A real element of fixed filter data. A real shape position stays
+    /// `%dynamic`.
     Real(f64),
     Vec(Vec<FixedValue>),
 }
@@ -396,15 +400,41 @@ fn dim_to_ce(d: Dim) -> ConstEval {
 }
 
 // ---------------------------------------------------------------------------
-// `filter` over fixed data with a fixed mask (spec §07 `filter`). Narrow on
-// purpose: the data is a fixed vector of numbers and the predicate a
-// `functionof` of one placeholder whose body is a membership test against a
-// fixed interval, a comparison with a fixed number, or a `land`/`lor`/`lnot`
-// of those. Anything else stays `%dynamic`, as before.
-// ---------------------------------------------------------------------------
+// Shape inference can count a fixed filter over literal values or a small
+// index range. A runtime source or an unsupported predicate stays dynamic.
+const MAX_FIXED_FILTER_INDICES: u32 = 65_536;
 
-/// The kept count of `filter(pred, data)` when the fold below applies (type
-/// rule entry point; only at `Level::Shape`, like every value-domain read).
+struct Filter<'a, 'm, 's> {
+    inf: &'a Inferencer<'m, 's>,
+    promoted: HashSet<Symbol>,
+}
+
+impl<'a, 'm, 's> Filter<'a, 'm, 's> {
+    fn new(inf: &'a Inferencer<'m, 's>) -> Self {
+        let promoted = promoted_input_names(inf.module);
+        Self { inf, promoted }
+    }
+
+    fn fold_kept<T>(
+        &self,
+        pred: NodeId,
+        data: NodeId,
+        initial: T,
+        mut keep: impl FnMut(T, FixedValue) -> T,
+    ) -> Option<T> {
+        let (param, body) = self.single_input_function(pred)?;
+        self.vector(data, 0)?
+            .into_iter()
+            .try_fold(initial, |state, value| {
+                if self.predicate(body, (param, &value), 0)? {
+                    Some(keep(state, value))
+                } else {
+                    Some(state)
+                }
+            })
+    }
+}
+
 pub(crate) fn fixed_filter_count(
     inf: &mut Inferencer<'_, '_>,
     pred: Option<NodeId>,
@@ -413,16 +443,7 @@ pub(crate) fn fixed_filter_count(
     if inf.level < Level::Shape {
         return None;
     }
-    let (pred, data) = (pred?, data?);
-    let xs = real_vector(inf, data, 1)?;
-    let (param, body) = single_input_function(inf, pred, 1)?;
-    let mut kept = 0;
-    for x in xs {
-        if predicate_holds(inf, body, param, x, 1)? {
-            kept += 1;
-        }
-    }
-    Some(kept)
+    Filter::new(inf).fold_kept(pred?, data?, 0, |count, _| count + 1)
 }
 
 /// The `filter` call behind `node`, through refs to fixed bindings.
@@ -444,128 +465,343 @@ fn fixed_filter_call(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> 
 }
 
 fn filter_value(inf: &mut Inferencer<'_, '_>, c: &Call, depth: u32) -> ConstEval {
-    let (Some(&pred), Some(&data)) = (c.args.first(), c.args.get(1)) else {
-        return ConstEval::Dynamic;
-    };
-    if c.args.len() != 2 || !c.named.is_empty() {
+    if depth > 64 || !c.named.is_empty() {
         return ConstEval::Dynamic;
     }
-    let Some(xs) = real_vector(inf, data, depth + 1) else {
+    let [pred, data] = *c.args else {
         return ConstEval::Dynamic;
     };
-    let Some((param, body)) = single_input_function(inf, pred, depth + 1) else {
-        return ConstEval::Dynamic;
-    };
-    let mut kept = Vec::new();
-    for x in xs {
-        match predicate_holds(inf, body, param, x, depth + 1) {
-            Some(true) => kept.push(FixedValue::Real(x)),
-            Some(false) => {}
-            None => return ConstEval::Dynamic,
-        }
-    }
-    ConstEval::Val(FixedValue::Vec(kept))
+    Filter::new(inf)
+        .fold_kept(pred, data, Vec::new(), |mut kept, value| {
+            kept.push(value);
+            kept
+        })
+        .map_or(ConstEval::Dynamic, |kept| {
+            ConstEval::Val(FixedValue::Vec(kept))
+        })
 }
 
-/// A `functionof` with exactly one placeholder input, through refs: the
-/// placeholder's name and the body.
-fn single_input_function(
-    inf: &mut Inferencer<'_, '_>,
-    node: NodeId,
-    depth: u32,
-) -> Option<(flatppl_core::Symbol, NodeId)> {
-    if depth > 64 {
-        return None;
-    }
-    match inf.module.node(node).clone() {
-        Node::Ref(r) if r.ns == RefNs::SelfMod => {
-            let rhs = inf.module.binding(inf.module.binding_by_name(r.name)?).rhs;
-            single_input_function(inf, rhs, depth + 1)
+impl Filter<'_, '_, '_> {
+    // Resolve literal containers and record projections without observing the
+    // authored value of a promoted input.
+    fn container(&self, node: NodeId, depth: u32) -> Option<NodeId> {
+        if depth > 64 || self.inf.is_substituted(node) {
+            return None;
         }
-        Node::Call(c) => {
-            let CallHead::Builtin(op) = c.head else {
-                return None;
-            };
-            if inf.module.resolve(op) != "functionof" {
-                return None;
+        let module = &self.inf.module;
+        match module.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                if self.promoted.contains(&r.name) {
+                    return None;
+                }
+                let rhs = module.binding(module.binding_by_name(r.name)?).rhs;
+                (self.inf.node_annotation(rhs).1 == Phase::Fixed).then_some(())?;
+                self.container(rhs, depth + 1)
             }
-            let Some(flatppl_core::Inputs::Spec(inputs)) = &c.inputs else {
-                return None;
-            };
-            let [(_, r)] = inputs.as_ref() else {
-                return None;
-            };
-            if r.ns != RefNs::Local {
-                return None;
+            Node::Call(c) if is_builtin(self.inf, c, "get") && c.named.is_empty() => {
+                let [record, field] = *c.args else {
+                    return Some(node);
+                };
+                let Node::Lit(Scalar::Str(field)) = module.node(field) else {
+                    return Some(node);
+                };
+                let record = self.container(record, depth + 1)?;
+                let Node::Call(record) = module.node(record) else {
+                    return None;
+                };
+                if !is_builtin(self.inf, record, "record") || !record.args.is_empty() {
+                    return None;
+                }
+                let value = record
+                    .named
+                    .iter()
+                    .find(|a| module.resolve(a.name) == &**field)?
+                    .value;
+                self.container(value, depth + 1)
             }
-            Some((r.name, *c.args.first()?))
+            _ => Some(node),
         }
-        _ => None,
     }
-}
 
-/// A fixed number: an int/real literal, `neg` of one, or a ref to a fixed
-/// binding holding one.
-fn real_number(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Option<f64> {
-    if depth > 64 {
-        return None;
-    }
-    match inf.module.node(node).clone() {
-        Node::Lit(Scalar::Int(n)) => Some(n as f64),
-        Node::Lit(Scalar::Real(x)) => Some(x),
-        Node::Ref(r) if r.ns == RefNs::SelfMod => {
-            let rhs = inf.module.binding(inf.module.binding_by_name(r.name)?).rhs;
-            (inf.node_annotation(rhs).1 == Phase::Fixed).then_some(())?;
-            real_number(inf, rhs, depth + 1)
+    fn single_input_function(&self, node: NodeId) -> Option<(Symbol, NodeId)> {
+        let node = self.container(node, 0)?;
+        let Node::Call(c) = self.inf.module.node(node) else {
+            return None;
+        };
+        if !is_builtin(self.inf, c, "functionof") {
+            return None;
         }
-        Node::Call(c) if is_builtin(inf, &c, "neg") && c.args.len() == 1 => {
-            Some(-real_number(inf, c.args[0], depth + 1)?)
-        }
-        _ => None,
+        let Some(flatppl_core::Inputs::Spec(inputs)) = &c.inputs else {
+            return None;
+        };
+        let [(_, r)] = inputs.as_ref() else {
+            return None;
+        };
+        (r.ns == RefNs::Local).then_some((r.name, *c.args.first()?))
     }
-}
 
-/// A fixed vector of numbers: a `vector` literal of fixed numbers, or a ref to
-/// a fixed binding holding one.
-fn real_vector(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Option<Vec<f64>> {
-    if depth > 64 {
-        return None;
-    }
-    match inf.module.node(node).clone() {
-        Node::Ref(r) if r.ns == RefNs::SelfMod => {
-            let rhs = inf.module.binding(inf.module.binding_by_name(r.name)?).rhs;
-            (inf.node_annotation(rhs).1 == Phase::Fixed).then_some(())?;
-            real_vector(inf, rhs, depth + 1)
+    fn vector(&self, node: NodeId, depth: u32) -> Option<Vec<FixedValue>> {
+        let node = self.container(node, depth)?;
+        let Node::Call(c) = self.inf.module.node(node) else {
+            return None;
+        };
+        if !c.named.is_empty() {
+            return None;
         }
-        Node::Call(c) if is_builtin(inf, &c, "vector") && c.named.is_empty() => c
-            .args
+        if is_builtin(self.inf, c, "vector") {
+            let real = matches!(
+                self.inf.node_annotation(node).0,
+                Type::Array { elem, .. } if *elem == Type::Scalar(ScalarType::Real)
+            );
+            return c
+                .args
+                .iter()
+                .map(|&a| {
+                    let value = self.number(a, None, depth + 1)?;
+                    if real {
+                        Some(FixedValue::Real(as_real(&value)?))
+                    } else {
+                        Some(value)
+                    }
+                })
+                .collect();
+        }
+        let [array] = *c.args else {
+            return None;
+        };
+        let first = if is_builtin(self.inf, c, "indicesof") {
+            1i64
+        } else if is_builtin(self.inf, c, "indicesof0") {
+            0
+        } else {
+            return None;
+        };
+        let Type::Array { shape, .. } = self.inf.node_annotation(array).0 else {
+            return None;
+        };
+        let [Dim::Static(len)] = *shape else {
+            return None;
+        };
+        if len > MAX_FIXED_FILTER_INDICES {
+            return None;
+        }
+        Some(
+            (first..first + i64::from(len))
+                .map(FixedValue::Int)
+                .collect(),
+        )
+    }
+
+    fn number(
+        &self,
+        node: NodeId,
+        param: Option<(Symbol, &FixedValue)>,
+        depth: u32,
+    ) -> Option<FixedValue> {
+        let node = self.container(node, depth)?;
+        match self.inf.module.node(node) {
+            Node::Lit(Scalar::Int(n)) => Some(FixedValue::Int(*n)),
+            Node::Lit(Scalar::Real(x)) => Some(FixedValue::Real(*x)),
+            Node::Ref(r) if r.ns == RefNs::Local => {
+                let (name, value) = param?;
+                (r.name == name).then(|| value.clone())
+            }
+            Node::Call(c) if c.named.is_empty() => {
+                let CallHead::Builtin(head) = c.head else {
+                    return None;
+                };
+                match self.inf.module.resolve(head) {
+                    "neg" => {
+                        let [arg] = *c.args else { return None };
+                        match self.number(arg, param, depth + 1)? {
+                            FixedValue::Int(x) => Some(FixedValue::Int(x.checked_neg()?)),
+                            FixedValue::Real(x) => Some(FixedValue::Real(-x)),
+                            FixedValue::Vec(_) => None,
+                        }
+                    }
+                    op @ ("add" | "sub" | "mul" | "div" | "mod") => {
+                        let [a, b] = *c.args else { return None };
+                        let a = self.number(a, param, depth + 1)?;
+                        let b = self.number(b, param, depth + 1)?;
+                        eval_arith(op, &a, &b)
+                    }
+                    op @ ("get" | "get0") => {
+                        let (&data, selectors) = c.args.split_first()?;
+                        let base = i64::from(op == "get");
+                        let element =
+                            self.integer_element(data, selectors, base, param, depth + 1)?;
+                        self.number(element, param, depth + 1)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn integer_element(
+        &self,
+        data: NodeId,
+        selectors: &[NodeId],
+        base: i64,
+        param: Option<(Symbol, &FixedValue)>,
+        depth: u32,
+    ) -> Option<NodeId> {
+        let data = self.container(data, depth)?;
+        if !matches!(
+            self.inf.node_annotation(data).0,
+            Type::Array { elem, .. } if *elem == Type::Scalar(ScalarType::Integer)
+        ) {
+            return None;
+        }
+        let Node::Call(c) = self.inf.module.node(data) else {
+            return None;
+        };
+        if !c.named.is_empty() {
+            return None;
+        }
+        let coordinates: Vec<_> = selectors
             .iter()
-            .map(|&a| real_number(inf, a, depth + 1))
-            .collect(),
-        _ => None,
+            .map(|&selector| {
+                let FixedValue::Int(index) = self.number(selector, param, depth + 1)? else {
+                    return None;
+                };
+                usize::try_from(index.checked_sub(base)?).ok()
+            })
+            .collect::<Option<_>>()?;
+        if is_builtin(self.inf, c, "vector") {
+            let [index] = *coordinates.as_slice() else {
+                return None;
+            };
+            return c.args.get(index).copied();
+        }
+        if !is_builtin(self.inf, c, "array") {
+            return None;
+        }
+        let [values, sizes, order] = *c.args else {
+            return None;
+        };
+        let sizes = self.literal_sizes(sizes, depth + 1)?;
+        let order = self.literal_sizes(order, depth + 1)?;
+        if sizes.len() != coordinates.len() || sizes.len() != order.len() {
+            return None;
+        }
+        let expected = sizes
+            .iter()
+            .try_fold(1usize, |len, &size| len.checked_mul(size))?;
+        let mut used = HashSet::new();
+        let offset = order.into_iter().try_fold(0usize, |offset, axis| {
+            let axis = axis.checked_sub(1)?;
+            let size = *sizes.get(axis)?;
+            let coordinate = coordinates[axis];
+            if !used.insert(axis) || coordinate >= size {
+                return None;
+            }
+            offset.checked_mul(size)?.checked_add(coordinate)
+        })?;
+        let values = self.container(values, depth + 1)?;
+        let Node::Call(values) = self.inf.module.node(values) else {
+            return None;
+        };
+        if !is_builtin(self.inf, values, "vector")
+            || !values.named.is_empty()
+            || values.args.len() != expected
+        {
+            return None;
+        }
+        values.args.get(offset).copied()
+    }
+
+    fn literal_sizes(&self, node: NodeId, depth: u32) -> Option<Vec<usize>> {
+        let node = self.container(node, depth)?;
+        let Node::Call(c) = self.inf.module.node(node) else {
+            return None;
+        };
+        if !is_builtin(self.inf, c, "vector") || !c.named.is_empty() {
+            return None;
+        }
+        c.args
+            .iter()
+            .map(|&id| {
+                let Node::Lit(Scalar::Int(n)) = self.inf.module.node(id) else {
+                    return None;
+                };
+                usize::try_from(*n).ok()
+            })
+            .collect()
+    }
+
+    fn interval(&self, node: NodeId, depth: u32) -> Option<(f64, f64)> {
+        let node = self.container(node, depth)?;
+        let Node::Call(c) = self.inf.module.node(node) else {
+            return None;
+        };
+        if !is_builtin(self.inf, c, "interval") || !c.named.is_empty() {
+            return None;
+        }
+        let [lo, hi] = *c.args else {
+            return None;
+        };
+        Some((
+            as_real(&self.number(lo, None, depth + 1)?)?,
+            as_real(&self.number(hi, None, depth + 1)?)?,
+        ))
+    }
+
+    fn predicate(&self, body: NodeId, param: (Symbol, &FixedValue), depth: u32) -> Option<bool> {
+        if depth > 64 || self.inf.is_substituted(body) {
+            return None;
+        }
+        let Node::Call(c) = self.inf.module.node(body) else {
+            return None;
+        };
+        let CallHead::Builtin(op) = c.head else {
+            return None;
+        };
+        if !c.named.is_empty() {
+            return None;
+        }
+        let op = self.inf.module.resolve(op);
+        match (op, c.args.as_ref()) {
+            ("in", [a, set]) => {
+                let x = as_real(&self.number(*a, Some(param), depth + 1)?)?;
+                let (lo, hi) = self.interval(*set, depth + 1)?;
+                Some(lo <= x && x <= hi)
+            }
+            (cmp @ ("lt" | "le" | "gt" | "ge" | "equal" | "unequal"), [a, b]) => {
+                let lhs = self.number(*a, Some(param), depth + 1)?;
+                let rhs = self.number(*b, Some(param), depth + 1)?;
+                let order = match (&lhs, &rhs) {
+                    (FixedValue::Int(a), FixedValue::Int(b)) => Some(a.cmp(b)),
+                    _ if matches!(cmp, "equal" | "unequal") => return None,
+                    _ => as_real(&lhs)?.partial_cmp(&as_real(&rhs)?),
+                };
+                Some(match cmp {
+                    "lt" => order.is_some_and(|o| o.is_lt()),
+                    "le" => order.is_some_and(|o| o.is_le()),
+                    "gt" => order.is_some_and(|o| o.is_gt()),
+                    "ge" => order.is_some_and(|o| o.is_ge()),
+                    "equal" => order.is_some_and(|o| o.is_eq()),
+                    _ => !order.is_some_and(|o| o.is_eq()),
+                })
+            }
+            ("land", [a, b]) => Some(
+                self.predicate(*a, param, depth + 1)? && self.predicate(*b, param, depth + 1)?,
+            ),
+            ("lor", [a, b]) => Some(
+                self.predicate(*a, param, depth + 1)? || self.predicate(*b, param, depth + 1)?,
+            ),
+            ("lnot", [a]) => Some(!self.predicate(*a, param, depth + 1)?),
+            _ => None,
+        }
     }
 }
 
-/// A fixed closed interval (spec §03 `interval`), through refs.
-fn real_interval(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Option<(f64, f64)> {
-    if depth > 64 {
-        return None;
-    }
-    match inf.module.node(node).clone() {
-        Node::Ref(r) if r.ns == RefNs::SelfMod => {
-            let rhs = inf.module.binding(inf.module.binding_by_name(r.name)?).rhs;
-            (inf.node_annotation(rhs).1 == Phase::Fixed).then_some(())?;
-            real_interval(inf, rhs, depth + 1)
-        }
-        Node::Call(c)
-            if is_builtin(inf, &c, "interval") && c.args.len() == 2 && c.named.is_empty() =>
-        {
-            Some((
-                real_number(inf, c.args[0], depth + 1)?,
-                real_number(inf, c.args[1], depth + 1)?,
-            ))
-        }
-        _ => None,
+fn as_real(value: &FixedValue) -> Option<f64> {
+    match value {
+        FixedValue::Int(x) => Some(*x as f64),
+        FixedValue::Real(x) => Some(*x),
+        FixedValue::Vec(_) => None,
     }
 }
 
@@ -575,60 +811,6 @@ fn is_builtin(inf: &Inferencer<'_, '_>, c: &Call, name: &str) -> bool {
 
 /// The predicate body's truth at `param = x`, or `None` outside the narrow
 /// shapes this fold reads.
-fn predicate_holds(
-    inf: &mut Inferencer<'_, '_>,
-    body: NodeId,
-    param: flatppl_core::Symbol,
-    x: f64,
-    depth: u32,
-) -> Option<bool> {
-    if depth > 64 {
-        return None;
-    }
-    let Node::Call(c) = inf.module.node(body).clone() else {
-        return None;
-    };
-    let CallHead::Builtin(op) = c.head else {
-        return None;
-    };
-    if !c.named.is_empty() {
-        return None;
-    }
-    let is_param = |inf: &Inferencer<'_, '_>, n: NodeId| matches!(inf.module.node(n), Node::Ref(r) if r.ns == RefNs::Local && r.name == param);
-    let op = inf.module.resolve(op).to_string();
-    match (op.as_str(), c.args.as_ref()) {
-        ("in", [a, set]) if is_param(inf, *a) => {
-            let (lo, hi) = real_interval(inf, *set, depth + 1)?;
-            Some(lo <= x && x <= hi)
-        }
-        (cmp @ ("lt" | "le" | "gt" | "ge"), [a, b]) => {
-            let (l, r) = if is_param(inf, *a) {
-                (x, real_number(inf, *b, depth + 1)?)
-            } else if is_param(inf, *b) {
-                (real_number(inf, *a, depth + 1)?, x)
-            } else {
-                return None;
-            };
-            Some(match cmp {
-                "lt" => l < r,
-                "le" => l <= r,
-                "gt" => l > r,
-                _ => l >= r,
-            })
-        }
-        ("land", [a, b]) => Some(
-            predicate_holds(inf, *a, param, x, depth + 1)?
-                && predicate_holds(inf, *b, param, x, depth + 1)?,
-        ),
-        ("lor", [a, b]) => Some(
-            predicate_holds(inf, *a, param, x, depth + 1)?
-                || predicate_holds(inf, *b, param, x, depth + 1)?,
-        ),
-        ("lnot", [a]) => Some(!predicate_holds(inf, *a, param, x, depth + 1)?),
-        _ => None,
-    }
-}
-
 /// Value types can carry a fixed value; measures/kernels/functions/etc. cannot.
 fn is_value_type(t: &Type) -> bool {
     matches!(

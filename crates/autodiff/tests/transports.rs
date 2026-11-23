@@ -135,3 +135,21 @@ fn differentiates_incomplete_tails_in_the_integration_limit() {
         }
     }
 }
+
+#[test]
+fn differentiates_beta_and_gamma_normalizing_constants() {
+    for call in ["loggamma(a)", "sp.logbeta(a, b)", "sp.beta(a, b)"] {
+        let source = format!(
+            "sp = standard_module(\"special-functions\", \"0.1\")\n\
+             a = elementof(posreals)\n\
+             b = elementof(posreals)\n\
+             inputs = (a, b)\n\
+             outputs = {call}\n"
+        );
+        let mut module = flatppl_syntax::parse(&source).unwrap();
+        let diagnostics = flatppl_infer::infer(&mut module);
+        assert!(diagnostics.iter().all(|d| d.severity != Severity::Error));
+        let deterministic = determinize_query(&module, &ModuleBundle::new()).unwrap();
+        gradient(&deterministic, &["a", "b"]).unwrap_or_else(|error| panic!("{call}: {error}"));
+    }
+}

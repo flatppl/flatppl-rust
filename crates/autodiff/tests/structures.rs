@@ -128,3 +128,19 @@ outputs = sum(weighted)
         flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
     }
 }
+
+#[test]
+fn directional_products_transport_gathered_nested_vector_cells() {
+    let module = lower(
+        "
+x = elementof(cartpow(cartpow(reals, 3), 2))
+y = elementof(cartpow(cartpow(reals, 3), 1))
+inputs = (x, y)
+outputs = (get0(cat(x, y), [2, 0, 2]), get(y, only), get0(y, all))
+",
+    );
+    for transformed in [jvp, vjp] {
+        let derivative = transformed(&module, &["x", "y"]).unwrap();
+        lower(&flatppl_syntax::print(&derivative));
+    }
+}
