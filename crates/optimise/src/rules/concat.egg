@@ -1,0 +1,58 @@
+(ruleset concat)
+
+; The host identifies written reads and their original partitions, including
+; a cat reached by an unshadowed name. It also accounts for opaque consumers.
+(relation concat-read (Expr String i64 i64))
+(relation concat-pair (Expr Expr Expr))
+(relation concat-triple (Expr Expr Expr Expr))
+(relation concat-part (Expr))
+(relation concat-fixed-part (Expr))
+(relation concat-exclusive-part (Expr Expr))
+(relation concat-extent (Expr i64))
+(relation concat-capable (Expr Expr))
+(relation concat-segment (Expr Expr i64 i64 i64))
+
+(rule ((concat-pair r a b)) ((concat-part a) (concat-part b)) :ruleset concat)
+(rule ((concat-triple r a b c)) ((concat-part a) (concat-part b) (concat-part c)) :ruleset concat)
+(rule ((concat-part x) (real-vector x n)) ((concat-extent x n)) :ruleset concat)
+(rule ((concat-part x) (real-value x)) ((concat-extent x 1)) :ruleset concat)
+(rule ((concat-part x) (portable-discardable x)) ((concat-fixed-part x)) :ruleset concat)
+(rule ((concat-exclusive-part r x)) ((concat-capable r x)) :ruleset concat)
+(rule ((concat-fixed-part x) (concat-segment r x start width total))
+      ((concat-capable r x)) :ruleset concat)
+
+; A certified segment can forward its read only if dropping all other
+; inputs preserves evaluation. Reused, nonconstant operands require their
+; original scatter and accumulation order.
+(rule ((concat-pair r a b) (concat-extent a m) (concat-extent b n) (concat-fixed-part b))
+      ((concat-segment r a 0 m (+ m n))) :ruleset concat)
+(rule ((concat-pair r a b) (concat-extent a m) (concat-extent b n) (concat-fixed-part a))
+      ((concat-segment r b m n (+ m n))) :ruleset concat)
+(rule ((concat-triple r a b c) (concat-extent a m) (concat-extent b n) (concat-extent c p)
+       (concat-fixed-part b) (concat-fixed-part c))
+      ((concat-segment r a 0 m (+ (+ m n) p))) :ruleset concat)
+(rule ((concat-triple r a b c) (concat-extent a m) (concat-extent b n) (concat-extent c p)
+       (concat-fixed-part a) (concat-fixed-part c))
+      ((concat-segment r b m n (+ (+ m n) p))) :ruleset concat)
+(rule ((concat-triple r a b c) (concat-extent a m) (concat-extent b n) (concat-extent c p)
+       (concat-fixed-part a) (concat-fixed-part b))
+      ((concat-segment r c (+ m n) p (+ (+ m n) p))) :ruleset concat)
+
+(relation concat-cell (Expr String Expr i64))
+(rule ((concat-read r op k total) (portable-index-base op base)
+       (concat-segment r x start width total) (concat-capable r x)
+       (<= total 2147483647) (>= k (+ start base)) (< k (+ (+ start width) base)))
+      ((concat-cell r op x (- k start))) :ruleset concat)
+(rule ((concat-cell r op x k) (real-vector x n) (real-value r))
+      ((union r (B op x (Integer k)))) :ruleset concat)
+(rule ((concat-cell r op x k) (real-value x) (real-value r))
+      ((union r x)) :ruleset concat)
+
+; A singleton real stack inserts a matrix axis without reordering entries.
+; The original producer must be fixed, keeping differentiated shared reads
+; outside the replacement and the original data dependency inside it.
+(relation fixed-singleton-stack (Expr String Expr))
+(rule ((fixed-singleton-stack r "rowstack" v) (real-vector v n) (real-matrix r 1 n))
+      ((union r (T "addaxes" v (Integer 1) (Integer 0)))) :ruleset concat)
+(rule ((fixed-singleton-stack r "colstack" v) (real-vector v n) (real-matrix r n 1))
+      ((union r (T "addaxes" v (Integer 0) (Integer 1)))) :ruleset concat)

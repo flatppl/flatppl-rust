@@ -25,6 +25,27 @@
 (real-value $normal-score)
 (conjugate-normal-mean $normal-score 4609434218613702656 4617315517961601024)
 
+; Two certified atoms select their own density and log density.
+(let $binomial-chain (Leaf 7))
+(let $binomial-score (B "logdensityof" $binomial-chain $point))
+(let $binomial-density (B "densityof" $binomial-chain $point))
+(let $masses (ConjugateMass 1 1 (ConjugateLastMass 3)))
+(real-value $binomial-score)
+(real-value $binomial-density)
+(conjugate-beta-binomial $binomial-score $masses)
+(conjugate-beta-binomial $binomial-density $masses)
+
+(let $exponential-chain (Leaf 8))
+(let $exponential-score (B "logdensityof" $exponential-chain $normal-point))
+(real-value $exponential-score)
+(conjugate-exponential-variance $exponential-score 0 4602678819172646912)
+
+(let $inverse-gamma-chain (Leaf 9))
+(let $inverse-gamma-score (B "densityof" $inverse-gamma-chain $normal-point))
+(real-value $inverse-gamma-score)
+(conjugate-inverse-gamma-variance $inverse-gamma-score
+  0 4611686018427387904 4618441417868443648 1 2)
+
 ; These uses keep the actual measure. Weights and unsupported shapes have no
 ; proof, and the predictive rewrite has no rule over sampling or total mass.
 (let $weighted-chain (Leaf 3))
@@ -38,7 +59,7 @@
 (real-value $ill-typed)
 (conjugate-unit-predictive $ill-typed 4598175219545276416)
 
-(run conjugacy 4)
+(run conjugacy 8)
 (let $bernoulli (U "Bernoulli" (Real 4598175219545276416)))
 (let $nb (B "NegativeBinomial" (Real 4611686018427387904) (Real 4613937818241073152)))
 (let $normal (B "Normal" (Real 4609434218613702656) (Real 4617315517961601024)))
@@ -46,9 +67,20 @@
 (check (= $beta-probability (B "densityof" $bernoulli $point)))
 (check (= $gamma-score (B "logdensityof" $nb $point)))
 (check (= $normal-score (B "logdensityof" $normal $normal-point)))
-(check (conjugate-original-measure $beta-chain))
-(check (conjugate-original-measure $gamma-chain))
-(fail (check (conjugate-original-measure $bernoulli)))
+(check (= $binomial-score (U "neg" (T "ifelse" (B "equal" $point (Integer 1)) (Real 1) (Real 3)))))
+(check (= $binomial-density (U "exp" $binomial-score)))
+(check (= $exponential-score
+  (B "logdensityof" (B "Laplace" (Real 0) (Real 4602678819172646912)) $normal-point)))
+(let $student-z (B "divide" (B "sub" $normal-point (Real 0)) (Real 4611686018427387904)))
+(let $student-tail
+  (U "log1p" (B "divide" (B "pow" $student-z (Real 4611686018427387904))
+    (Real 4618441417868443648))))
+(check (= $inverse-gamma-score
+  (U "exp" (U "neg" (B "add" (Real 2) (B "mul" (Real 1) $student-tail))))))
+(check (conjugate-original-measure $beta-chain 3))
+(check (conjugate-original-measure $gamma-chain 3))
+(check (conjugate-original-measure $binomial-chain 16))
+(fail (check (conjugate-original-measure $bernoulli 3)))
 (fail (check (= $weighted-score $beta-score)))
 (fail (check (= $sample (B "rand" $bernoulli (Leaf 4)))))
 (fail (check (= $mass (U "totalmass" $bernoulli))))

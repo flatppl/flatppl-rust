@@ -81,7 +81,6 @@ fn unit_trial_predictive_shares_binary_score_proof_across_flatppl_and_flatpir() 
 #[test]
 fn unit_trial_predictive_requires_a_fixed_trial_count_and_binary_support() {
     let cases = [
-        UNIT_TRIAL.replace("trials = 1", "trials = 2"),
         UNIT_TRIAL.replace("trials = 1", "trials = ifelse(flag, 1, 2)"),
         UNIT_TRIAL.replace("inputs = flag", "inputs = (flag, trials)"),
         UNIT_TRIAL.replace("point = ifelse(flag, 1, 0)", "point = ifelse(flag, -1, 0)"),

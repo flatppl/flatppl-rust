@@ -1,5 +1,6 @@
 //! Typed rewrites of an inferred FlatPPL model or a determinized query.
 
+mod concat;
 mod conjugacy;
 mod demand;
 mod engine;

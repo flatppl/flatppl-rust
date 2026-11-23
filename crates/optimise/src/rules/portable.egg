@@ -179,6 +179,38 @@
        (portable-cutoff p cmp x a) (portable-cutoff q cmp x b) (<= a b))
       ((union e q)) :ruleset portable)
 
+; An integer interval with one member is a point. Two half-lines whose
+; gap has one member exclude that point. Exact equality requires a source
+; known to keep integer storage when this portable graph reaches a backend.
+(relation portable-stored-integer (Expr))
+(rule ((= x (Integer n))) ((portable-stored-integer x)) :ruleset portable)
+(rule ((portable-compared-bounds e "land" p q) (portable-stored-integer x)
+       (portable-cutoff p "upper" x n) (portable-cutoff q "lower" x n))
+      ((union e (B "equal" x (Integer n)))) :ruleset portable)
+(rule ((portable-compared-bounds e "lor" p q) (portable-stored-integer x)
+       (portable-cutoff p "upper" x low) (portable-cutoff q "lower" x high)
+       (= high (+ low 2)))
+      ((union e (B "unequal" x (Integer (+ low 1))))) :ruleset portable)
+
+; Including or excluding the boundary point closes or opens a half-line.
+(relation portable-point-head (String))
+(portable-point-head "equal")
+(portable-point-head "unequal")
+(relation portable-point (Expr String Expr i64))
+(rule ((= p (B head x (Integer n))) (portable-point-head head) (portable-stored-integer x))
+      ((portable-point p head x n)) :ruleset portable)
+(rule ((= p (B head (Integer n) x)) (portable-point-head head) (portable-stored-integer x))
+      ((portable-point p head x n)) :ruleset portable)
+(relation portable-point-edge (String String String i64 String))
+(portable-point-edge "lor" "equal" "upper" 1 "le")
+(portable-point-edge "lor" "equal" "lower" -1 "ge")
+(portable-point-edge "land" "unequal" "upper" 0 "lt")
+(portable-point-edge "land" "unequal" "lower" 0 "gt")
+(rule ((portable-compared-bounds e op p q) (portable-point p head x n)
+       (portable-cutoff q side x cut) (portable-point-edge op head side delta cmp)
+       (= n (+ cut delta)))
+      ((union e (B cmp x (Integer n)))) :ruleset portable)
+
 (rewrite (T "ifelse" p (Boolean true) (Boolean false)) p
   :when ((bool-value p)) :ruleset portable)
 (rewrite (T "ifelse" p (Boolean false) (Boolean true)) (U "lnot" p)
