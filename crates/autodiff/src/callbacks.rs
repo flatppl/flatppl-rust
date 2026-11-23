@@ -102,6 +102,7 @@ impl Walker<'_> {
                     .or_else(|| metric::lower(self.module, current))
                     .or_else(|| recurrence::lower(self.module, self.inputs, current))
                     .or_else(|| affine_scan::square_scan(self.module, self.inputs, current))
+                    .or_else(|| affine_scan::residual_projection(self.module, self.inputs, current))
                     .unwrap_or(current)
             }
             _ => node,
@@ -146,11 +147,7 @@ pub(super) fn lift_broadcast(
                 value,
                 shape: shape.to_vec(),
             }),
-            Type::Array { shape, elem } => {
-                let (layout, width) = event_layout(elem)?;
-                let cells = scope.nested_components(value, shape, layout, width)?;
-                Operand::Vector(Event { layout, cells })
-            }
+            Type::Array { shape, elem } => scope.array_operand(value, shape, elem)?,
             ty if scalar(ty) => Operand::Scalar(Cell::scalar(value)),
             _ => return None,
         };
@@ -196,7 +193,7 @@ pub(super) fn annotate_equivalent(
     Some(result)
 }
 
-fn resolve_unpromoted(
+pub(super) fn resolve_unpromoted(
     module: &Module,
     inputs: &HashSet<BindingId>,
     mut node: NodeId,
@@ -280,6 +277,12 @@ impl Event {
 enum Operand {
     Scalar(Cell),
     Vector(Event),
+    WideRows {
+        value: NodeId,
+        rows: u32,
+        width: u32,
+    },
+    HeldMatrix(NodeId),
 }
 
 impl Operand {
@@ -290,6 +293,7 @@ impl Operand {
                 .cells
                 .get(if event.cells.len() == 1 { 0 } else { index })
                 .cloned(),
+            Self::WideRows { .. } | Self::HeldMatrix(_) => None,
         }
     }
 }
@@ -321,6 +325,29 @@ impl Scope<'_> {
         self.bound
             .iter()
             .find_map(|(target, value)| (*target == reference).then_some(value))
+    }
+
+    fn array_operand(&mut self, value: NodeId, shape: &[Dim], elem: &Type) -> Option<Operand> {
+        if let Some((layout, width)) = event_layout(elem) {
+            let cells = self.nested_components(value, shape, layout, width)?;
+            return Some(Operand::Vector(Event { layout, cells }));
+        }
+        let [Dim::Static(rows)] = *shape else {
+            return None;
+        };
+        match tensor::real_shape_of(elem)? {
+            [Dim::Static(width)] if rows > 0 && *width > 0 => Some(Operand::WideRows {
+                value,
+                rows,
+                width: *width,
+            }),
+            [_, _] => {
+                let m = &*self.module;
+                let root = resolve_unpromoted(m, self.inputs, value)?;
+                Some(Operand::HeldMatrix(repeated_value(m, root, shape)?))
+            }
+            _ => None,
+        }
     }
 
     fn nested_components(
@@ -476,7 +503,7 @@ impl Scope<'_> {
                     let reference = *reference;
                     match self.target(reference) {
                         Some(Operand::Scalar(cell)) => cell.clone(),
-                        Some(Operand::Vector(_)) => return None,
+                        Some(_) => return None,
                         None => self.expression(self.rhs(reference)?)?,
                     }
                 }
@@ -500,7 +527,7 @@ impl Scope<'_> {
                 let reference = *reference;
                 match self.target(reference) {
                     Some(Operand::Scalar(cell)) => cell.value,
-                    Some(Operand::Vector(_)) => return None,
+                    Some(_) => return None,
                     None => self.instantiate(self.rhs(reference)?)?,
                 }
             }
@@ -603,7 +630,7 @@ impl Scope<'_> {
                     let reference = *reference;
                     match self.target(reference) {
                         Some(Operand::Vector(terms)) => terms.clone(),
-                        Some(Operand::Scalar(_)) => return None,
+                        Some(_) => return None,
                         None => self.vector(self.rhs(reference)?)?,
                     }
                 }
@@ -629,6 +656,7 @@ impl Scope<'_> {
                         }
                         "broadcast" => self.vector_broadcast(&call.args)?,
                         "softmax" => Event::vector(self.softmax(&call.args)?),
+                        "mul" => self.apply_matrix(&call.args)?,
                         "cumsum" => self.prefix_sum(&call.args)?,
                         "add" | "sub" => self
                             .map_builtin_vector(self.module.resolve(head).to_owned(), &call.args)?,
@@ -654,6 +682,73 @@ impl Scope<'_> {
         };
         self.vectors.insert(node, terms.clone());
         Some(terms)
+    }
+
+    fn apply_matrix(&mut self, args: &[NodeId]) -> Option<Event> {
+        let [matrix, vectors] = *args else {
+            return None;
+        };
+        let (matrix, transposed) =
+            held_matrix_argument(self.module, self.resolve_structure(matrix))?;
+        let matrix = self.resolve_structure(matrix);
+        let Node::Ref(reference) = self.module.node(matrix) else {
+            return None;
+        };
+        let Operand::HeldMatrix(matrix) = *self.target(*reference)? else {
+            return None;
+        };
+        let [Dim::Static(a), Dim::Static(b)] = *tensor::real_shape(self.module, matrix)? else {
+            return None;
+        };
+        let (expected, width) = if transposed { (a, b) } else { (b, a) };
+        if !(1..=MAX_EXPLICIT_EVENT_WIDTH).contains(&width) {
+            return None;
+        }
+        let (rows_value, rows, inner) = self.rows_matrix(vectors)?;
+        if inner != expected {
+            return None;
+        }
+        let m = &mut *self.module;
+        let lhs = rows_value;
+        let product = multiply_rows(m, lhs, matrix, transposed);
+        self.shared.insert(product);
+        let cells = (1..=width)
+            .map(|index| Cell {
+                value: tensor::stack_pick(m, product, i64::from(index), true),
+                shape: vec![Dim::Static(rows)],
+            })
+            .collect();
+        Some(Event::vector(cells))
+    }
+
+    fn rows_matrix(&mut self, node: NodeId) -> Option<(NodeId, u32, u32)> {
+        let direct = self.resolve_structure(node);
+        if let Node::Ref(reference) = self.module.node(direct)
+            && let Some(Operand::WideRows { value, rows, width }) = self.target(*reference).cloned()
+        {
+            let matrix = build_call(self.module, "rowstack", &[value]);
+            return Some((matrix, rows, width));
+        }
+        let cols = self.vector(node)?.into_vector()?;
+        self.column_matrix(cols)
+    }
+
+    fn column_matrix(&mut self, cols: Vec<Cell>) -> Option<(NodeId, u32, u32)> {
+        let shape = joined_shape(&cols)?;
+        let rows = match *shape.as_slice() {
+            [] => 1,
+            [Dim::Static(rows)] => rows,
+            _ => return None,
+        };
+        let width = u32::try_from(cols.len()).ok()?;
+        let shape = [Dim::Static(rows)];
+        let values = cols
+            .into_iter()
+            .map(|cell| Some(expand(self.module, cell, &shape, &crate::REAL)?.value))
+            .collect::<Option<Vec<_>>>()?;
+        let columns = build_call(self.module, "vector", &values);
+        let matrix = build_call(self.module, "colstack", &[columns]);
+        Some((matrix, rows, width))
     }
 
     fn prefix_sum(&mut self, args: &[NodeId]) -> Option<Event> {
@@ -1019,6 +1114,9 @@ impl Scope<'_> {
             Node::Const(symbol) => self.module.resolve(*symbol),
             _ => return None,
         };
+        if tag_name == "MvNormal" {
+            return self.mvnormal_rows(tag, &fields, observation);
+        }
         if matches!(tag_name, "Categorical" | "Categorical0") {
             let base = i64::from(tag_name == "Categorical");
             let [(field, probabilities)] = *fields.as_slice() else {
@@ -1049,6 +1147,83 @@ impl Scope<'_> {
             .map(|(name, arg)| Some((name, self.expression(arg)?)))
             .collect::<Option<_>>()?;
         self.score(tag, fields, observation)
+    }
+
+    fn mvnormal_rows(
+        &mut self,
+        tag: NodeId,
+        fields: &[(Symbol, NodeId)],
+        observation: NodeId,
+    ) -> Option<Cell> {
+        if fields.len() != 2 {
+            return None;
+        }
+        let find = |name: &str| {
+            fields
+                .iter()
+                .copied()
+                .find(|&(field, _)| self.module.resolve(field) == name)
+        };
+        let (mu_field, mean) = find("mu")?;
+        let (cov_field, covariance) = find("cov")?;
+        if self.depends(covariance, 0)? {
+            return None;
+        }
+        let mean = self.vector(mean)?.into_vector()?;
+        let observed = self.vector(observation)?.into_vector()?;
+        if mean.len() != observed.len() {
+            return None;
+        }
+        let residuals = observed
+            .into_iter()
+            .zip(mean)
+            .map(|(x, mu)| self.pointwise_call("sub", vec![x, mu]))
+            .collect::<Option<Vec<_>>>()?;
+        let width = u32::try_from(residuals.len()).ok()?;
+        if tensor::real_shape(self.module, covariance)? != [Dim::Static(width), Dim::Static(width)]
+        {
+            return None;
+        }
+        let lower = build_call(self.module, "lower_cholesky", &[covariance]);
+        self.shared.insert(lower);
+        let indices: Vec<_> = (1..=width)
+            .map(|index| tensor::int(self.module, i64::from(index)))
+            .collect();
+        // Forward substitution on event coordinates, vectorized over all
+        // observations. The vector-only FlatPPL solve never sees a matrix RHS.
+        let mut solved: Vec<Cell> = Vec::with_capacity(residuals.len());
+        for (&row, mut value) in indices.iter().zip(residuals) {
+            for (&column, previous) in indices.iter().zip(&solved) {
+                let coefficient = build_call(self.module, "get", &[lower, row, column]);
+                let term =
+                    self.pointwise_call("mul", vec![Cell::scalar(coefficient), previous.clone()])?;
+                value = self.pointwise_call("sub", vec![value, term])?;
+            }
+            let diagonal = build_call(self.module, "get", &[lower, row, row]);
+            let value = self.pointwise_call("divide", vec![value, Cell::scalar(diagonal)])?;
+            self.shared.insert(value.value);
+            solved.push(value);
+        }
+        let (first, rest) = solved.split_first()?;
+        let first = self.pointwise_call("mul", vec![first.clone(), first.clone()])?;
+        let quadratic = rest.iter().try_fold(first, |sum, value| {
+            let square = self.pointwise_call("mul", vec![value.clone(), value.clone()])?;
+            self.pointwise_call("add", vec![sum, square])
+        })?;
+        let width = tensor::int(self.module, i64::from(width));
+        let zeros = build_call(self.module, "zeros", &[width]);
+        // Keep exactly the MvNormal primitive's normalizer and support checks.
+        let normalizer = self.score(
+            tag,
+            vec![
+                (mu_field, Cell::scalar(zeros)),
+                (cov_field, Cell::scalar(covariance)),
+            ],
+            Cell::scalar(zeros),
+        )?;
+        let half = Cell::scalar(crate::real(self.module, 0.5));
+        let penalty = self.pointwise_call("mul", vec![half, quadratic])?;
+        self.pointwise_call("sub", vec![normalizer, penalty])
     }
 
     fn categorical(
@@ -1364,6 +1539,25 @@ fn callback_input(module: &mut Module, label: &str, entries: &mut Vec<(Symbol, R
     module.alloc(Node::Ref(target))
 }
 
+fn held_matrix_argument(module: &Module, node: NodeId) -> Option<(NodeId, bool)> {
+    if let Some(transpose) = expect_builtin_call(module, node, "transpose") {
+        let [matrix] = *transpose.args else {
+            return None;
+        };
+        return transpose.named.is_empty().then_some((matrix, true));
+    }
+    Some((node, false))
+}
+
+fn multiply_rows(module: &mut Module, lhs: NodeId, matrix: NodeId, transposed: bool) -> NodeId {
+    let rhs = if transposed {
+        matrix
+    } else {
+        build_call(module, "transpose", &[matrix])
+    };
+    build_call(module, "mul", &[lhs, rhs])
+}
+
 /// Map matrix-vector multiplication with a held matrix as one ordinary
 /// matrix product. Row packing below restores the original array layers.
 fn lift_matrix_vector_map(
@@ -1392,18 +1586,7 @@ fn lift_matrix_vector_map(
     if !product.named.is_empty() {
         return None;
     }
-    let transposed = expect_builtin_call(module, matrix, "transpose");
-    let matrix = match transposed {
-        Some(transpose) if transpose.named.is_empty() => {
-            let [matrix] = *transpose.args else {
-                return None;
-            };
-            matrix
-        }
-        Some(_) => return None,
-        None => matrix,
-    };
-    let transposed = transposed.is_some();
+    let (matrix, transposed) = held_matrix_argument(module, matrix)?;
     let index = |id| {
         let Node::Ref(reference) = module.node(id) else {
             return None;
@@ -1440,12 +1623,7 @@ fn lift_matrix_vector_map(
         return None;
     }
     let lhs = build_call(module, "rowstack", &[vectors]);
-    let rhs = if transposed {
-        matrix
-    } else {
-        build_call(module, "transpose", &[matrix])
-    };
-    let result = build_call(module, "mul", &[lhs, rhs]);
+    let result = multiply_rows(module, lhs, matrix, transposed);
     let result = pack_rows(module, result, rows);
     let expected = module.type_of(node)?.clone();
     annotate_equivalent(module, result, &expected)
@@ -1758,6 +1936,7 @@ fn pointwise(name: &str) -> bool {
             | "sqrt"
             | "sub"
             | "tan"
+            | "tanh"
     )
 }
 

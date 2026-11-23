@@ -53,7 +53,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use flatppl_core::{Axis, CallHead, Node, NodeId, Scalar, Symbol, Variance};
+use flatppl_core::{Axis, CallHead, Dim, Node, NodeId, Scalar, ScalarType, Symbol, Type, Variance};
 
 use crate::emitter::{Axes, AxisReduce, Emitter, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
@@ -176,6 +176,12 @@ pub(crate) fn lower_aggregate(
     let reduction = read_reduction(e, f_id)?;
     let output_axes = read_output_axes(e, axes_id, false)?;
     let output_axes = output_axes.iter().map(|axis| axis.name).collect::<Vec<_>>();
+    if reduction == Reduction::Sum
+        && let Some(scatter) = RowScatter::read(e, &output_axes, body)
+        && let Some(result) = scatter.lower(e)?
+    {
+        return Ok(result);
+    }
 
     let mut sites = Vec::new();
     collect_sites(e, body, &mut sites, &mut HashSet::new(), false)?;
@@ -191,6 +197,155 @@ pub(crate) fn lower_aggregate(
     let cell = e.lower_with_bindings(body, bindings)?;
     let cell = require_frame_shaped(e, id, &cell, &frame)?;
     reduce(e, id, reduction, &cell, &frame)
+}
+
+/// A sum of updates gated by equality with a leading axis position is a
+/// scatter-add. Recognize it before allocating the Cartesian reduction frame.
+struct RowScatter {
+    len: u64,
+    base: i64,
+    indices: NodeId,
+    updates: NodeId,
+}
+
+impl RowScatter {
+    fn read(e: &Emitter, output_axes: &[Symbol], body: NodeId) -> Option<Self> {
+        let [row, window @ ..] = output_axes else {
+            return None;
+        };
+        let [mask, update, zero] = *builtin_args(e, body, "ifelse")? else {
+            return None;
+        };
+        match e.node(zero) {
+            Node::Lit(Scalar::Real(x)) if x.to_bits() == 0 => {}
+            Node::Lit(Scalar::Int(0)) => {}
+            _ => return None,
+        }
+        let [a, b] = *builtin_args(e, mask, "equal")? else {
+            return None;
+        };
+        let (len, base, indices, use_axis) =
+            Self::match_index(e, *row, a, b).or_else(|| Self::match_index(e, *row, b, a))?;
+        if output_axes.contains(&use_axis) {
+            return None;
+        }
+        let [updates, axes @ ..] = builtin_args(e, update, "get")? else {
+            return None;
+        };
+        let Type::Array { shape, elem } = e.type_of(*updates)? else {
+            return None;
+        };
+        if shape.len() != axes.len()
+            || **elem != Type::Scalar(ScalarType::Real)
+            || axes.len() != output_axes.len()
+            || !axes
+                .iter()
+                .zip(std::iter::once(&use_axis).chain(window))
+                .all(|(&node, &axis)| matches_axis(e, node, axis))
+        {
+            return None;
+        }
+        Some(Self {
+            len,
+            base,
+            indices,
+            updates: *updates,
+        })
+    }
+
+    fn match_index(
+        e: &Emitter,
+        row: Symbol,
+        range_cell: NodeId,
+        index_cell: NodeId,
+    ) -> Option<(u64, i64, NodeId, Symbol)> {
+        let [range, row_axis] = *builtin_args(e, range_cell, "get")? else {
+            return None;
+        };
+        if !matches_axis(e, row_axis, row) {
+            return None;
+        }
+        let [indices, index_axis] = *builtin_args(e, index_cell, "get")? else {
+            return None;
+        };
+        let Node::Axis(Axis {
+            name,
+            variance: None,
+        }) = e.node(index_axis)
+        else {
+            return None;
+        };
+        let range_expr = if let Some(&[ranges, dim]) = builtin_args(e, range, "get") {
+            if !matches!(e.node(dim), Node::Lit(Scalar::Int(1))) {
+                return None;
+            }
+            ranges
+        } else {
+            range
+        };
+        let base = if matches!(builtin_args(e, range_expr, "indicesof"), Some([_])) {
+            1
+        } else if matches!(builtin_args(e, range_expr, "indicesof0"), Some([_])) {
+            0
+        } else {
+            return None;
+        };
+        let Type::Array { shape, elem } = e.type_of(range)? else {
+            return None;
+        };
+        let [Dim::Static(len)] = *shape.as_ref() else {
+            return None;
+        };
+        // Subtracting one from i32::MIN wraps to i32::MAX, which must
+        // remain out of bounds just as it was in the equality predicate.
+        if **elem != Type::Scalar(ScalarType::Integer) || len > i32::MAX as u32 {
+            return None;
+        }
+        Some((u64::from(len), base, indices, *name))
+    }
+
+    fn lower(self, e: &mut Emitter) -> Result<Option<Value>, EmitError> {
+        let indices = e.lower_node(self.indices)?;
+        let updates = e.lower_node(self.updates)?;
+        let (MlirTy::Ranked(index_dims), MlirTy::Ranked(update_dims)) = (&indices.ty, &updates.ty)
+        else {
+            return Ok(None);
+        };
+        if indices.elem != ElemKind::Int
+            || updates.elem != ElemKind::Real
+            || e.batch_rank(&indices) != 0
+            || e.batch_rank(&updates) != 0
+            || index_dims.len() != 1
+            || index_dims[0].is_none()
+            || update_dims.first() != index_dims.first()
+            || update_dims.iter().any(Option::is_none)
+        {
+            return Ok(None);
+        }
+        let indices = if self.base == 0 {
+            indices
+        } else {
+            let base = e.int_value_const(self.base);
+            e.sub(&indices, &base)
+        };
+        Ok(Some(e.scatter_add_rows(self.len, &indices, &updates)))
+    }
+}
+
+fn builtin_args<'m>(e: &'m Emitter, node: NodeId, name: &str) -> Option<&'m [NodeId]> {
+    let Node::Call(call) = e.node(node) else {
+        return None;
+    };
+    if !call.named.is_empty()
+        || !matches!(call.head, CallHead::Builtin(op) if e.resolve(op) == name)
+    {
+        return None;
+    }
+    Some(&call.args)
+}
+
+fn matches_axis(e: &Emitter, node: NodeId, name: Symbol) -> bool {
+    matches!(e.node(node), Node::Axis(Axis { name: symbol, variance: None }) if *symbol == name)
 }
 
 /// §04 lowers each covariant input axis with inv(g), then raises covariant

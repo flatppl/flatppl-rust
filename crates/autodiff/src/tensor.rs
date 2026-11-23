@@ -61,7 +61,7 @@ pub(super) fn add_typed(emitter: &mut Emitter, ty: &Type, terms: &[NodeId]) -> N
             .map(|&term| build_call(m, "rowstack", &[term]))
             .collect();
         let matrix = fold_add(m, &matrices);
-        unstack(m, matrix, count, false)
+        crate::callbacks::pack_rows(m, matrix, count)
     } else {
         fold_add(&mut emitter.module, terms)
     }
@@ -287,7 +287,9 @@ pub(super) fn stack_pick(module: &mut Module, bar: NodeId, index: i64, columns: 
     indexed(module, bar, &selectors)
 }
 
-pub(super) fn unstack(module: &mut Module, bar: NodeId, count: u32, columns: bool) -> NodeId {
+pub(super) fn unstack(emitter: &mut Emitter, bar: NodeId, count: u32, columns: bool) -> NodeId {
+    let bar = emitter.primal(bar);
+    let module = &mut emitter.module;
     let parts: Vec<_> = (1..=i64::from(count))
         .map(|index| stack_pick(module, bar, index, columns))
         .collect();
@@ -475,7 +477,7 @@ pub(super) fn scatter(
             _ => return None,
         };
         let matrix = scatter_axes(emitter, bar, matrix, selectors, base, 2)?;
-        return Some(unstack(&mut emitter.module, matrix, count, false));
+        return Some(unstack(emitter, matrix, count, false));
     }
     let rank = real_shape(&emitter.module, primal)?.len();
     scatter_axes(emitter, bar, primal, selectors, base, rank)

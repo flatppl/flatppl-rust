@@ -255,3 +255,126 @@ pub(super) fn lag(module: &mut Module, initial: NodeId, states: NodeId, length: 
     let previous = build_call(module, "get", &[states, indices]);
     build_call(module, "cat", &[first, previous])
 }
+
+/// Project the prediction of a record scan that copies its current item to
+/// the next lag and advances an affine prediction residual.
+pub(super) fn residual_projection(
+    module: &mut Module,
+    inputs: &HashSet<BindingId>,
+    node: NodeId,
+) -> Option<NodeId> {
+    let [projection, sequence] = positional(module, node, "broadcast")? else {
+        return None;
+    };
+    let (view, formals) = recurrence::callback(module, inputs, *projection)?;
+    let [view_state] = *formals.as_slice() else {
+        return None;
+    };
+    let output = field_key(module, view, view_state)?;
+    let sequence = callbacks::resolve_unpromoted(module, inputs, *sequence)?;
+    let [callback, initial, items, parameters] = *positional(module, sequence, "scan")? else {
+        return None;
+    };
+    let &[Dim::Static(length)] = tensor::real_shape(module, items)? else {
+        return None;
+    };
+    if length == 0 {
+        return None;
+    }
+
+    let (body, formals) = recurrence::callback(module, inputs, callback)?;
+    let [state, item, capture] = *formals.as_slice() else {
+        return None;
+    };
+    if formals.iter().any(|formal| formal.ns != RefNs::Local) {
+        return None;
+    }
+    let record = expect_builtin_call(module, body, "record")?;
+    let fields = &record.named;
+    if !record.args.is_empty() || fields.len() != 3 {
+        return None;
+    }
+    let prediction = fields
+        .iter()
+        .find(|field| module.resolve(field.name) == output)?
+        .value;
+    let lag = fields
+        .iter()
+        .find(|field| is_ref(module, field.value, item))?
+        .name;
+    let residual = fields.iter().find_map(|field| {
+        let [observation, fitted] = *positional(module, field.value, "sub")? else {
+            return None;
+        };
+        (module.resolve(field.name) != output
+            && field.name != lag
+            && is_ref(module, observation, item)
+            && module.structural_eq(fitted, prediction))
+        .then_some(field.name)
+    })?;
+    if module.resolve(lag) == output {
+        return None;
+    }
+
+    let (base, residual_weight) = term_and_weight(module, prediction, state, residual)?;
+    let (location, lag_weight) = term_and_weight(module, base, state, lag)?;
+    let bindings = [(capture, parameters)];
+    let parameter = |module: &mut Module, term| {
+        if refers_to(module, term, &[state, item]) {
+            return None;
+        }
+        recurrence::substitute(module, inputs, term, &bindings, &mut HashMap::new(), 0)
+    };
+    let location = parameter(module, location)?;
+    let lag_weight = parameter(module, lag_weight)?;
+    let residual_weight = parameter(module, residual_weight)?;
+
+    let expected = module.type_of(node)?.clone();
+    let first_item = record_field(module, initial, lag);
+    let first_residual = record_field(module, initial, residual);
+    let lagged_items = self::lag(module, first_item, items, length);
+    let lagged_part = tensor::broadcast(module, "mul", &[lag_weight, lagged_items]);
+    let drive = tensor::broadcast(module, "add", &[location, lagged_part]);
+    let offsets = build_call(module, "sub", &[items, drive]);
+    let neg_weight = build_call(module, "neg", &[residual_weight]);
+    let errors = scan(module, first_residual, offsets, neg_weight, false);
+    let lagged_errors = self::lag(module, first_residual, errors, length);
+    let residual_part = tensor::broadcast(module, "mul", &[residual_weight, lagged_errors]);
+    let prediction = build_call(module, "add", &[drive, residual_part]);
+    callbacks::annotate_equivalent(module, prediction, &expected)
+}
+
+fn term_and_weight(
+    module: &Module,
+    body: NodeId,
+    state: Ref,
+    field: flatppl_core::Symbol,
+) -> Option<(NodeId, NodeId)> {
+    let is_projection = |node| field_key(module, node, state) == Some(module.resolve(field));
+    let (base, weighted) = sum(module, body, |node| {
+        product(module, node, is_projection).is_some()
+    })?;
+    let (_, weight) = product(module, weighted, is_projection)?;
+    Some((base, weight))
+}
+
+fn field_key(module: &Module, node: NodeId, state: Ref) -> Option<&str> {
+    let [source, selector] = *positional(module, node, "get")? else {
+        return None;
+    };
+    let Node::Lit(Scalar::Str(name)) = module.node(selector) else {
+        return None;
+    };
+    is_ref(module, source, state).then_some(())?;
+    Some(name)
+}
+
+fn record_field(module: &mut Module, record: NodeId, field: flatppl_core::Symbol) -> NodeId {
+    let key = module.alloc(Node::Lit(Scalar::Str(module.resolve(field).into())));
+    build_call(module, "get", &[record, key])
+}
+
+fn positional<'a>(module: &'a Module, node: NodeId, head: &str) -> Option<&'a [NodeId]> {
+    let call = expect_builtin_call(module, node, head)?;
+    call.named.is_empty().then_some(&call.args)
+}

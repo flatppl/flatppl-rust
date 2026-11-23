@@ -21,7 +21,7 @@ use std::fmt;
 
 use flatppl_core::graph::{build_call, expect_builtin_call};
 use flatppl_core::{
-    Binding, BindingId, CallHead, DEFAULT_MAX_DEPTH, Module, Node, NodeId, Ref, RefNs, Scalar,
+    Binding, BindingId, CallHead, DEFAULT_MAX_DEPTH, Dim, Module, Node, NodeId, Ref, RefNs, Scalar,
     ScalarType, Symbol, Type,
 };
 
@@ -972,7 +972,8 @@ fn density_args(
         "NegativeBinomial" => ("NegativeBinomial log density", &["alpha", "beta"]),
         "NegativeBinomial2" => ("NegativeBinomial2 log density", &["mu", "psi"]),
         "Poisson" => ("Poisson log density", &["rate"]),
-        "Dirichlet" if !batched => ("Dirichlet log density", &["alpha"]),
+        "Dirichlet" if batched => ("iid Dirichlet log density", &["alpha"]),
+        "Dirichlet" => ("Dirichlet log density", &["alpha"]),
         "MvNormal" if !batched => ("MvNormal log density", &["mu", "cov"]),
         "Wishart" if !batched => ("Wishart log density", &["nu", "scale"]),
         "LKJ" if !batched => ("LKJ log density", &["n", "eta"]),
@@ -992,6 +993,9 @@ fn density_args(
                     .find_map(|&(label, value)| (module.resolve(label) == name).then_some(value))
             })
             .collect::<Option<Vec<_>>>()?;
+        if rule == "iid Dirichlet log density" {
+            return iid_dirichlet_args(module, query, node, args[0], observation);
+        }
         args.push(observation);
         return Some((rule, args));
     }
@@ -1021,6 +1025,9 @@ fn density_args(
         .iter()
         .map(|&name| field(name))
         .collect::<Option<Vec<_>>>()?;
+    if rule == "iid Dirichlet log density" {
+        return iid_dirichlet_args(module, query, node, args[0], observation);
+    }
     if rule == "Uniform log density"
         && let Some([lo, hi]) = uniform_interval(module, query, args[0], batched)
     {
@@ -1057,6 +1064,34 @@ fn density_args(
     }
     args.push(observation);
     Some((rule, args))
+}
+
+fn iid_dirichlet_args(
+    module: &Module,
+    query: &Query<'_>,
+    score: NodeId,
+    boxed_alpha: NodeId,
+    observation: NodeId,
+) -> Option<(&'static str, Vec<NodeId>)> {
+    let Key::Node(wrapper) = query.key(module, boxed_alpha).ok()? else {
+        return None;
+    };
+    let wrapper = expect_builtin_call(module, wrapper, "vector")?;
+    let &[alpha] = wrapper.args.as_ref() else {
+        return None;
+    };
+    if !wrapper.named.is_empty() {
+        return None;
+    }
+    let [Dim::Static(cols)] = *tensor::real_shape(module, alpha)? else {
+        return None;
+    };
+    let (rows, event_cols) = match tensor::real_shape(module, observation) {
+        Some([Dim::Static(rows), Dim::Static(event_cols)]) => (*rows, *event_cols),
+        _ => tensor::nested_vector(module, observation)?,
+    };
+    (cols == event_cols && tensor::real_shape(module, score) == Some(&[Dim::Static(rows)]))
+        .then_some(("iid Dirichlet log density", vec![alpha, observation]))
 }
 
 fn uniform_interval(
@@ -1135,6 +1170,7 @@ fn structural(op: &str) -> bool {
             | "scoped aggregate"
             | "affine scan"
             | "transpose"
+            | "iid Dirichlet log density"
             | "iid Categorical log density"
             | "iid Categorical0 log density"
             | "rowwise Categorical log density"
@@ -1238,6 +1274,7 @@ impl<'a> Step<'a> {
                                 | "rowwise Categorical0 log density"
                         ) && slot == 0
                             && nested_vector(arg)
+                        || self.op == "iid Dirichlet log density" && slot == 1 && nested_vector(arg)
                         || self.op == "cat" && nested_vector(arg)
                         || self.op == "Uniform log density" && slot == 0
                         || matches!(

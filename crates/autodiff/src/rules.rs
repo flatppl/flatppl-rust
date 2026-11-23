@@ -208,12 +208,7 @@ impl Template {
                     return None;
                 };
                 let (count, _) = tensor::nested_vector(&emitter.module, primal)?;
-                tensor::unstack(
-                    &mut emitter.module,
-                    values.bar,
-                    count,
-                    self.int(*columns)? != 0,
-                )
+                tensor::unstack(emitter, values.bar, count, self.int(*columns)? != 0)
             }
             ("DropAxes", [bar]) => {
                 let bar = self.emit(*bar, emitter, values)?;
@@ -298,7 +293,7 @@ impl Template {
                     if head == "FlattenRows" {
                         build_call(&mut emitter.module, "rowstack", &[value])
                     } else {
-                        tensor::unstack(&mut emitter.module, value, rows, false)
+                        crate::callbacks::pack_rows(&mut emitter.module, value, rows)
                     }
                 } else {
                     value

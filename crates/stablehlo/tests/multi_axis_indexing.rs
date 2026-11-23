@@ -254,3 +254,21 @@ fn unsupported_advanced_selectors_refuse() {
             .contains("one shared rank-1 integer vector")
     );
 }
+
+#[test]
+fn aggregate_of_position_matched_update_rows_lowers_to_scatter() {
+    let source = "x = external(cartpow(reals, [4, 2]))\n\
+                  row = external(cartpow(integers, 3))\n\
+                  updates = external(cartpow(reals, [3, 2]))\n\
+                  inputs = (x, row, updates)\n\
+                  d = aggregate(sum, [.r, .c], ifelse(indicesof(x)[1][.r] == row[.i], updates[.i, .c], 0.0))\n\
+                  outputs = d\n";
+    let ir = emit(source).unwrap();
+    assert!(ir.contains(r#""stablehlo.scatter""#), "{ir}");
+    assert!(ir.contains("update_window_dims = [1]"), "{ir}");
+    assert!(!ir.contains("tensor<4x2x3x"), "{ir}");
+
+    let nonzero = emit(&source.replace(", 0.0))", ", -1.0))")).unwrap();
+    assert!(!nonzero.contains(r#""stablehlo.scatter""#), "{nonzero}");
+    assert!(nonzero.contains("stablehlo.reduce"), "{nonzero}");
+}
