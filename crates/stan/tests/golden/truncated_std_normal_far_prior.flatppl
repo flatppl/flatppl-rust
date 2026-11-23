@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+z ~ normalize(truncate(Normal(0.0, 1.0), interval(39.0, 40.0)))
+y ~ Normal(z, 1.0)
+prior = lawof(record(z = z))
+L = likelihoodof(kernelof(record(y = y), z = z), record(y = 39.4))
+post = bayesupdate(L, prior)

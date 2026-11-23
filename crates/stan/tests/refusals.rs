@@ -244,17 +244,244 @@ fn no_and_ambiguous_target() {
     assert!(r.reason.contains("a, b"), "{r}");
 }
 
+/// A Poisson process query `lp = logdensityof(<law>, <x>)` over `inputs`.
+fn process_query(decls: &str, law: &str, x: &str, inputs: &str) -> String {
+    format!("{decls}\nlp = logdensityof({law}, {x})\ninputs = {inputs}\noutputs = lp\n")
+}
+
+/// A function-weighted intensity has no closed mass here; Stan's
+/// `integrate_1d` and a polynomial's closed mass are later forms.
 #[test]
 fn point_process_is_not_yet() {
-    let r = refuse(
-        "rate ~ Gamma(shape = 2.0, rate = 1.0)\n\
-         y ~ BinnedPoissonProcess([0.0, 1.0, 2.0], weighted(rate, Lebesgue(support = interval(0.0, 2.0))))\n\
-         prior = lawof(record(rate = rate))\n\
-         L = likelihoodof(kernelof(record(y = y), rate = rate), record(y = [1, 2]))\n\
-         post = bayesupdate(L, prior)\n",
+    let r = refuse_with(
+        &process_query(
+            "a = elementof(nonnegreals)\n\
+             I = weighted((x, p) -> p * exp(x), Lebesgue(interval(0.0, 1.0)), a)",
+            "BinnedPoissonProcess([0.0, 0.5, 1.0], I)",
+            "[0, 1]",
+            "a",
+        ),
+        Some("lp"),
     );
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("BinnedPoissonProcess"), "{r}");
+    assert!(
+        r.reason
+            .contains("an intensity weighted by a function of the variate"),
+        "{r}"
+    );
+}
+
+/// A truncation to an interval outside the support has no mass, and
+/// `normalize` of it has no density.
+#[test]
+fn normalized_truncation_outside_the_support_is_ill_formed() {
+    let r = refuse_with(
+        &process_query(
+            "r = elementof(posreals)",
+            "normalize(truncate(Exponential(r), interval(-2.0, -1.0)))",
+            "0.5",
+            "r",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason
+            .contains("a truncation to an interval outside the support has zero mass"),
+        "{r}"
+    );
+}
+
+/// The same for a normalized intensity.
+#[test]
+fn normalized_intensity_of_zero_mass_is_ill_formed() {
+    let r = refuse_with(
+        &process_query(
+            "r = elementof(posreals)",
+            "PoissonProcess(normalize(truncate(Exponential(r), interval(-2.0, -1.0))))",
+            "[0.5]",
+            "r",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason.contains("§06") && r.reason.contains("has zero mass"),
+        "{r}"
+    );
+}
+
+#[test]
+fn discrete_intensity_is_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "r = elementof(posreals)",
+            "BinnedPoissonProcess([0.5, 1.5, 2.5], weighted(3.0, Poisson(r)))",
+            "[1, 2]",
+            "r",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a discrete intensity (`Poisson`)"), "{r}");
+}
+
+#[test]
+fn atom_intensity_is_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "s = elementof(posreals)",
+            "PoissonProcess(weighted(s, Dirac(1.0)))",
+            "[1.0]",
+            "s",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("an intensity with an atom (`Dirac`)"),
+        "{r}"
+    );
+}
+
+/// §06 takes a finite-mass intensity: `Lebesgue(reals)` has none.
+#[test]
+fn infinite_mass_intensity_is_ill_formed() {
+    let r = refuse_with(
+        &process_query(
+            "b = elementof(posreals)",
+            "PoissonProcess(weighted(b, Lebesgue(support = reals)))",
+            "[1.0]",
+            "b",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason.contains("§06") && r.reason.contains("finite mass"),
+        "{r}"
+    );
+}
+
+/// The binned law takes a finite-mass intensity too (§06), even where each
+/// bin's mass is finite.
+#[test]
+fn infinite_mass_binned_intensity_is_ill_formed() {
+    let r = refuse_with(
+        &process_query(
+            "s = elementof(posreals)",
+            "BinnedPoissonProcess([0.0, 1.0], weighted(s, Lebesgue(support = reals)))",
+            "[1]",
+            "s",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason.contains("§06") && r.reason.contains("finite mass"),
+        "{r}"
+    );
+}
+
+/// A negative literal weight is ill-formed (§06 `weighted`), as in a mixture.
+#[test]
+fn negative_intensity_weight_is_ill_formed() {
+    let r = refuse_with(
+        &process_query(
+            "s = elementof(posreals)",
+            "PoissonProcess(weighted(-2.0, Normal(0.0, 1.0)))",
+            "[0.5]",
+            "s",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(r.reason.contains("the weight -2 is negative"), "{r}");
+}
+
+#[test]
+fn kernel_intensity_is_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "mu = elementof(reals)\nK = functionof(weighted(2.0, Normal(mu, 1.0)), mu = mu)",
+            "PoissonProcess(K)",
+            "[0.5]",
+            "mu",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a kernel intensity"), "{r}");
+}
+
+#[test]
+fn record_bin_edges_are_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "s = elementof(posreals)\n\
+             I = weighted(s, joint(x = Uniform(interval(0, 2)), y = Uniform(interval(0, 3))))",
+            "BinnedPoissonProcess(record(x = [0, 0.5, 2], y = [0, 1, 2, 3]), I)",
+            "rowstack([[1, 1, 1], [3, 3, 3]])",
+            "s",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a record of edge vectors"), "{r}");
+}
+
+/// Record-valued points are a table, and a table value refuses before the
+/// process does: the record-point refusal waits for tables.
+#[test]
+fn record_valued_points_are_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "s = elementof(posreals)\npts = elementof(cartpow(cartprod(x = reals, y = reals), 2))",
+            "PoissonProcess(weighted(s, joint(x = Normal(0.0, 1.0), y = Normal(0.0, 1.0))))",
+            "pts",
+            "(s, pts)",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a record value"), "{r}");
+}
+
+#[test]
+fn intensity_without_lcdf_is_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "hep = standard_module(\"particle-physics\", \"0.1\")\ns = elementof(posreals)",
+            "BinnedPoissonProcess([5.0, 5.2, 5.4], weighted(s, hep.CrystalBall(5.28, 0.05, 1.5, 3.0)))",
+            "[1, 2]",
+            "s",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("the intensity law `CrystalBall`, which has no `_lcdf` in Stan"),
+        "{r}"
+    );
+}
+
+#[test]
+fn dynamic_bin_edge_count_is_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "n = elementof(posintegers)",
+            "BinnedPoissonProcess(linspace(0.0, 2.0, n), weighted(5.0, Normal(1.0, 0.5)))",
+            "[1, 3]",
+            "n",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("a bin-edge vector of non-static length"),
+        "{r}"
+    );
 }
 
 #[test]

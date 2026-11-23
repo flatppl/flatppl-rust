@@ -27,15 +27,23 @@ pub(crate) struct LawRow {
     pub lcdf: bool,
     pub normalized: bool,
     pub guard: String,
-    /// The pair the interval-mass helper takes far in the upper tail:
-    /// `lccdf`, or `mirror_lcdf` for a symmetric law. Set only where a
-    /// BridgeStan probe matched scipy; absent rows keep `T[lo, hi]`.
+    /// How the interval-mass helper keeps the far upper tail: `lccdf` (the
+    /// survival pair), or `normal_lphi` for the normal law (its interval mass
+    /// through its own log Φ; a statement keeps `T[]` only for ends decided
+    /// at emit time on the mean's side of the far tail, `interval.rs`). Set
+    /// only where a BridgeStan
+    /// probe matched an independent oracle. An absent row keeps `T[lo, hi]`
+    /// unless its support has an end that a written end may reach.
     #[serde(default)]
     pub tail: String,
     /// The argument (`{scale}`) that is the support's lower end, where the
-    /// variate type has no literal one: the helper clamps the interval to it.
+    /// variate type has no literal one: no CDF is evaluated at or below it.
     #[serde(default)]
     pub floor: String,
+    /// The argument (`{b}`) that is the support's upper end, where the
+    /// variate type has no literal one: no CDF is evaluated at or beyond it.
+    #[serde(default)]
+    pub ceil: String,
     /// The Stan function does not enforce the `variate` support (von Mises
     /// returns a finite value outside (-pi, pi), `lkj_corr_cholesky` for rows
     /// that are not unit length): a variate whose declaration does not state

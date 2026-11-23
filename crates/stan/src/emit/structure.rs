@@ -48,6 +48,8 @@ pub(super) struct Law {
     pub tail: String,
     /// The position among the Stan arguments of the row's `floor` argument.
     pub floor_arg: Option<usize>,
+    /// The position among the Stan arguments of the row's `ceil` argument.
+    pub ceil_arg: Option<usize>,
     /// Statements the law adds after its `~` line (`target += lgamma(K + 1);`).
     pub extra: Vec<String>,
     /// The restriction lives in the variate's declaration (`ordered[K]`):
@@ -101,26 +103,32 @@ impl Law {
         s
     }
 
-    /// The literal ends of the law's support: its variate bounds, or the
-    /// argument its row names as `floor`.
-    fn support_ends(&self) -> (Option<String>, Option<String>) {
+    /// The ends of the law's support: its literal variate bounds, or the
+    /// arguments its row names as `floor` and `ceil`.
+    pub(super) fn support_ends(&self) -> (Option<String>, Option<String>) {
+        let open = self.call.find('(').unwrap_or(self.call.len());
+        let args = self.call[open..]
+            .strip_prefix('(')
+            .and_then(|v| v.strip_suffix(')'))
+            .map(super::mixture::split_args)
+            .unwrap_or_default();
+        self.support_ends_in(|k| args.get(k).cloned().unwrap_or_default())
+    }
+
+    /// The support's ends with an argument end printed by `arg` (its
+    /// position among the Stan arguments).
+    pub(super) fn support_ends_in(
+        &self,
+        arg: impl Fn(usize) -> String,
+    ) -> (Option<String>, Option<String>) {
         // A literal end: a number, or von Mises's `±pi()`.
         let num = |b: &Option<String>| {
             b.clone()
                 .filter(|v| v.parse::<f64>().is_ok() || matches!(v.as_str(), "pi()" | "-pi()"))
         };
-        let floor = match self.floor_arg {
-            Some(k) => {
-                let open = self.call.find('(').unwrap_or(self.call.len());
-                self.call[open..]
-                    .strip_prefix('(')
-                    .and_then(|v| v.strip_suffix(')'))
-                    .map(super::mixture::split_args)
-                    .and_then(|a| a.get(k).cloned())
-            }
-            None => num(&self.bounds.0),
-        };
-        (floor, num(&self.bounds.1))
+        let floor = self.floor_arg.map(&arg).or_else(|| num(&self.bounds.0));
+        let ceil = self.ceil_arg.map(&arg).or_else(|| num(&self.bounds.1));
+        (floor, ceil)
     }
 
     fn pick(&self, x: &str, b: &str, larger: bool) -> String {
@@ -709,10 +717,16 @@ impl<'m> Emitter<'m> {
         for f in fields {
             let lhs = self.fields[&f.field].clone();
             self.relies_on_bounds = false;
-            let mut lines = match f.law {
-                Some(law) => self.tilde(&lhs, law)?,
-                None => vec![],
+            // The caller's test below is the law's support and window unless
+            // the field carries its own point guard.
+            self.point_statement =
+                self.point_fields.contains(&f.field) && !self.point_guards.contains_key(&f.field);
+            let lines = match f.law {
+                Some(law) => self.tilde(&lhs, law),
+                None => Ok(vec![]),
             };
+            self.point_statement = false;
+            let mut lines = lines?;
             let relies_on_bounds = std::mem::take(&mut self.relies_on_bounds);
             // A field set from a point is tested against its support only where
             // the line alone gives a finite value outside it: a declared set's
@@ -2013,6 +2027,9 @@ impl<'m> Emitter<'m> {
 
     /// Sampling statements for `lhs ~ measure`.
     fn tilde(&mut self, lhs: &str, measure: NodeId) -> Result<Vec<String>> {
+        if self.is_process(measure) {
+            return self.process_statements(lhs, measure);
+        }
         self.constrain_variate(lhs, measure)?;
         let lhs_rank = self.lhs_rank(lhs);
         let m = self.resolve(measure);
@@ -2415,7 +2432,7 @@ impl<'m> Emitter<'m> {
         Ok(vec![rl.statement(lhs, &n)])
     }
 
-    fn fresh_index(&mut self) -> String {
+    pub(super) fn fresh_index(&mut self) -> String {
         for c in ["i", "j", "k", "n"] {
             if !self.used.contains(c) && !self.reserved.contains(c) {
                 self.used.insert(c.to_string());
@@ -2493,6 +2510,9 @@ impl<'m> Emitter<'m> {
     }
 
     pub(super) fn density_call(&mut self, id: NodeId, m: NodeId, x: NodeId) -> Result<String> {
+        if self.is_process(m) {
+            return self.process_density(id, m, x);
+        }
         let mut law = self.law(m, false)?;
         let restricted = law
             .trunc
@@ -2539,6 +2559,7 @@ impl<'m> Emitter<'m> {
         };
         let lp = if normalized {
             let mass = self.interval_lmass(&law, lo.as_deref(), hi.as_deref());
+            let mass = self.nonzero_normalizer(mass);
             format!("{lp} - {mass}")
         } else {
             lp
@@ -3638,11 +3659,14 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    /// A scalar's number when it is a literal, and its Stan text.
-    fn folded(&mut self, x: NodeId) -> Result<(Option<f64>, Ex)> {
+    /// A scalar as a folding operand ([`Folded`]).
+    pub(super) fn folded(&mut self, x: NodeId) -> Result<Folded> {
         match self.literal_number(x) {
             Some(n) => Ok(number_ex(n)),
-            None => Ok((None, self.real(x)?)),
+            None => {
+                let int = self.shape(x).is_none_or(|s| s.int);
+                Ok((None, self.real(x)?, int))
+            }
         }
     }
 
@@ -3793,7 +3817,7 @@ impl<'m> Emitter<'m> {
         })
     }
 
-    fn interval(&mut self, s: NodeId) -> Result<(Option<String>, Option<String>)> {
+    pub(super) fn interval(&mut self, s: NodeId) -> Result<(Option<String>, Option<String>)> {
         match self.m.node(s) {
             Node::Const(c) => match self.name(*c) {
                 "unitinterval" => Ok((Some("0".into()), Some("1".into()))),
@@ -4018,6 +4042,14 @@ impl<'m> Emitter<'m> {
                     format!("`{name}` has no Stan density: {}", row.note),
                 ));
             }
+            // Lowered by its own code where it stands as an observed variate
+            // or in `logdensityof` (`intensity.rs`), not as a law elsewhere.
+            "structural" => {
+                return Err(Refusal::not_yet(
+                    Some(m),
+                    format!("the law `{name}` in this position"),
+                ));
+            }
             // A user-defined `_lpdf`: its text goes into `functions` once.
             "custom_lpdf" => self.add_functions(&row.functions),
             _ => {}
@@ -4164,6 +4196,9 @@ impl<'m> Emitter<'m> {
             tail: row.tail.clone(),
             floor_arg: (!row.floor.is_empty())
                 .then(|| row.args.split(", ").position(|a| a == row.floor))
+                .flatten(),
+            ceil_arg: (!row.ceil.is_empty())
+                .then(|| row.args.split(", ").position(|a| a == row.ceil))
                 .flatten(),
             extra: vec![],
             declared: false,
@@ -4444,8 +4479,14 @@ fn variate_bounds(variate: &str) -> (Option<String>, Option<String>) {
     out
 }
 
-fn number_ex(x: f64) -> (Option<f64>, Ex) {
+/// A scalar as a folding operand: its number when it is a literal, its Stan
+/// text, and whether that text can be integer-typed in Stan. `/` of two
+/// integers rounds in Stan, so [`fold_div`] reads the last.
+pub(super) type Folded = (Option<f64>, Ex, bool);
+
+pub(super) fn number_ex(x: f64) -> Folded {
     let s = crate::stan_type::number(x);
+    let int = !s.contains(['.', 'e', 'i', 'N']);
     let ex = if x < 0.0 {
         Ex {
             s,
@@ -4454,11 +4495,11 @@ fn number_ex(x: f64) -> (Option<f64>, Ex) {
     } else {
         Ex::atom(s)
     };
-    (Some(x), ex)
+    (Some(x), ex, int)
 }
 
 /// `x + y`, folded for literals and 0.
-fn fold_add(x: &(Option<f64>, Ex), y: &(Option<f64>, Ex)) -> (Option<f64>, Ex) {
+pub(super) fn fold_add(x: &Folded, y: &Folded) -> Folded {
     match (x.0, y.0) {
         (Some(a), Some(b)) => number_ex(a + b),
         (Some(0.0), _) => y.clone(),
@@ -4469,12 +4510,13 @@ fn fold_add(x: &(Option<f64>, Ex), y: &(Option<f64>, Ex)) -> (Option<f64>, Ex) {
                 s: format!("{} + {}", x.1.at(super::P_ADD), y.1.at(super::P_ADD + 1)),
                 prec: super::P_ADD,
             },
+            x.2 && y.2,
         ),
     }
 }
 
 /// `x * y`, folded for literals, 0 and 1.
-fn fold_mul(x: &(Option<f64>, Ex), y: &(Option<f64>, Ex)) -> (Option<f64>, Ex) {
+pub(super) fn fold_mul(x: &Folded, y: &Folded) -> Folded {
     match (x.0, y.0) {
         (Some(a), Some(b)) => number_ex(a * b),
         (Some(0.0), _) | (_, Some(0.0)) => number_ex(0.0),
@@ -4486,6 +4528,76 @@ fn fold_mul(x: &(Option<f64>, Ex), y: &(Option<f64>, Ex)) -> (Option<f64>, Ex) {
                 s: format!("{} * {}", x.1.at(super::P_MUL), y.1.at(super::P_MUL + 1)),
                 prec: super::P_MUL,
             },
+            x.2 && y.2,
         ),
+    }
+}
+
+/// `-x`, folded for a literal.
+pub(super) fn fold_neg(x: &Folded) -> Folded {
+    match x.0 {
+        Some(a) => number_ex(-a),
+        None => (
+            None,
+            Ex {
+                s: format!("-{}", x.1.at(super::P_UNARY + 1)),
+                prec: super::P_UNARY,
+            },
+            x.2,
+        ),
+    }
+}
+
+/// `x - y`, folded for literals and 0.
+pub(super) fn fold_sub(x: &Folded, y: &Folded) -> Folded {
+    match (x.0, y.0) {
+        (Some(a), Some(b)) => number_ex(a - b),
+        (Some(0.0), _) => fold_neg(y),
+        (_, Some(0.0)) => x.clone(),
+        _ => (
+            None,
+            Ex {
+                s: format!("{} - {}", x.1.at(super::P_ADD), y.1.at(super::P_ADD + 1)),
+                prec: super::P_ADD,
+            },
+            x.2 && y.2,
+        ),
+    }
+}
+
+/// `x / y`, folded for literals and 1. The quotient is real, as `divide` is
+/// elsewhere in the emitter: where both operands can be integer-typed, a
+/// literal operand prints as a real literal (`2.0`), and two other operands
+/// take `1.0 * x / y`.
+pub(super) fn fold_div(x: &Folded, y: &Folded) -> Folded {
+    let real = |v: f64| {
+        let s = super::real_literal(v);
+        Ex {
+            prec: if v < 0.0 { super::P_UNARY } else { P_ATOM },
+            s,
+        }
+    };
+    match (x.0, y.0) {
+        (Some(a), Some(b)) if b != 0.0 => number_ex(a / b),
+        (_, Some(1.0)) => x.clone(),
+        _ => {
+            let (l, r) = match (x.2 && y.2, x.0, y.0) {
+                (false, _, _) => (x.1.at(super::P_MUL), y.1.at(super::P_MUL + 1)),
+                (true, _, Some(b)) => (x.1.at(super::P_MUL), real(b).at(super::P_MUL + 1)),
+                (true, Some(a), None) => (real(a).at(super::P_MUL), y.1.at(super::P_MUL + 1)),
+                (true, None, None) => (
+                    format!("1.0 * {}", x.1.at(super::P_MUL)),
+                    y.1.at(super::P_MUL + 1),
+                ),
+            };
+            (
+                None,
+                Ex {
+                    s: format!("{l} / {r}"),
+                    prec: super::P_MUL,
+                },
+                false,
+            )
+        }
     }
 }

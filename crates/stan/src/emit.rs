@@ -19,6 +19,7 @@ mod elementwise;
 mod extents;
 mod filter;
 mod functions;
+mod intensity;
 mod interval;
 mod markovchain;
 mod mixture;
@@ -209,6 +210,9 @@ pub(crate) struct Emitter<'m> {
     /// Set by a `tilde` that printed a truncation without `T[]` (the
     /// interval-mass form), whose line relies on the variate's declared bounds.
     relies_on_bounds: bool,
+    /// Set while the prior statement of a point field is printed: its caller
+    /// tests the whole support and window, so the statement does not.
+    point_statement: bool,
     /// The target is `outputs` of a declared signature (§13).
     abi_target: bool,
     /// Stan name → its declaration.
@@ -216,6 +220,19 @@ pub(crate) struct Emitter<'m> {
     /// Each observed draw → its observed value, the node its data name is
     /// declared from, filled before any observation's statement.
     observed_at: HashMap<Symbol, NodeId>,
+    /// The Stan names of the normal log Φ and interval log mass functions,
+    /// each once emitted (`interval.rs`).
+    lphi_fn: Option<String>,
+    normal_lmass_fn: Option<String>,
+    /// The Stan name of the function that rejects a normalizer of zero mass
+    /// at run time, once emitted (`interval.rs`).
+    nonzero_fn: Option<String>,
+    /// The Stan name of the binned Poisson process counts function, once
+    /// emitted (`intensity.rs`).
+    binned_fn: Option<String>,
+    /// The local that holds a normalized intensity's whole log mass, by the
+    /// measure's node (`intensity.rs`).
+    whole_lmasses: HashMap<NodeId, String>,
     /// Kernel inputs inside the prior, bound by name to prior fields.
     links: Vec<(Symbol, Symbol)>,
     /// Derived prior fields `v = f(x)` of one draw x, by f(x)'s node: the
@@ -448,9 +465,15 @@ impl<'m> Emitter<'m> {
             point_fields: HashSet::new(),
             point_guards: HashMap::new(),
             relies_on_bounds: false,
+            point_statement: false,
             abi_target: false,
             decls: HashMap::new(),
             observed_at: HashMap::new(),
+            lphi_fn: None,
+            normal_lmass_fn: None,
+            nonzero_fn: None,
+            binned_fn: None,
+            whole_lmasses: HashMap::new(),
             links: vec![],
             derived: HashMap::new(),
             functions: vec![],

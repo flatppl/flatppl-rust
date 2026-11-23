@@ -182,6 +182,7 @@ fn written_bin_edges_must_strictly_increase() {
         "bincounts(linspace(2.0, 0.0, 3), x)",
         "bincounts(extlinspace(2.0, 0.0, 3), x)",
         "BinnedPoissonProcess([0.0, 2.0, 1.0], I)",
+        "BinnedPoissonProcess(linspace(2.0, 0.0, 3), I)",
         "BinnedPoissonProcess([1.0, -inf], I)",
     ] {
         assert_refused(&format!("{model}n = {call}\n"), "strictly increasing");

@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+c ~ Normal(3.0, 1.0)
+r ~ Exponential(1.0)
+z ~ normalize(truncate(Gamma(2.0, r), interval(-inf, c)))
+y ~ Normal(z, 1.0)
+L = likelihoodof(kernelof(record(y = y), c = c, r = r, z = z), record(y = 1.4))
+post = bayesupdate(L, lawof(record(c = c, r = r, z = z)))
