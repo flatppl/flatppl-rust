@@ -7,16 +7,8 @@ use flatppl_core::{
     Binding, CallHead, Idx, Inputs, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol,
 };
 
-use crate::{AnalysisError, InputPath, analyze_lowered_query};
+use crate::{AnalysisError, CoordinatePrecision, InputPath, analyze_lowered_query};
 use flatppl_core::Type;
-
-/// Arithmetic precision used to validate a coordinate map. Emit every companion
-/// with this precision. These checks describe a point, not a global float bijection.
-#[derive(Clone, Copy, Debug)]
-pub enum CoordinatePrecision {
-    F32,
-    F64,
-}
 
 /// Ordinary FlatPDL queries. Each returns `(value, valid)` independently of any
 /// backend runtime status. Discard invalid results rather than treating them as

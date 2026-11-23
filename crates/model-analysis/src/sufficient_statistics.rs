@@ -15,6 +15,8 @@ use flatppl_core::{
 
 use flatppl_core::{graph, query};
 
+use crate::RealPrecision;
+
 pub(crate) mod categorical;
 mod circular;
 mod correlation;
@@ -645,6 +647,7 @@ fn per_cell_inner(
 #[derive(Clone)]
 struct Reducer {
     preparing: bool,
+    precision: RealPrecision,
     boundary: HashSet<Symbol>,
     allowed: HashSet<Symbol>,
     summaries: Vec<Symbol>,
@@ -668,9 +671,14 @@ enum DataKey {
 }
 
 impl Reducer {
-    fn new(boundary: HashSet<Symbol>, allowed: HashSet<Symbol>) -> Self {
+    fn new(
+        boundary: HashSet<Symbol>,
+        allowed: HashSet<Symbol>,
+        precision: Option<RealPrecision>,
+    ) -> Self {
         Self {
-            preparing: false,
+            preparing: precision.is_some(),
+            precision: precision.unwrap_or(RealPrecision::F32),
             boundary,
             allowed,
             summaries: Vec::new(),
@@ -1531,7 +1539,7 @@ fn fixed_values(m: &Module, root: NodeId, boundary: &HashSet<Symbol>) -> Option<
 fn reduce(
     m: &mut Module,
     allowed: HashSet<Symbol>,
-    preparing: bool,
+    precision: Option<RealPrecision>,
     report: Option<&mut ReductionReport>,
     enabled: bool,
 ) -> (usize, Vec<Symbol>) {
@@ -1545,8 +1553,7 @@ fn reduce(
             folded = true;
         }
     }
-    let mut reducer = Reducer::new(boundary, allowed);
-    reducer.preparing = preparing;
+    let mut reducer = Reducer::new(boundary, allowed, precision);
     reducer.enabled = enabled;
     reducer.report = report.as_ref().map(|_| ReductionReport::default());
     let bindings: Vec<_> = m
@@ -1595,7 +1602,7 @@ fn sufficient_statistics_inner(m: &mut Module, report: Option<&mut ReductionRepo
                 .is_some_and(|bid| m.binding_phase(bid) == Some(flatppl_core::Phase::Fixed))
         })
         .collect();
-    reduce(m, allowed, false, report, true).0
+    reduce(m, allowed, None, report, true).0
 }
 
 /// Split a FlatPDL query into preparation and scoring without changing ordinary
@@ -1627,12 +1634,12 @@ pub fn prepare_likelihood_with_options(
         node: NodeId::from_usize(0),
         reason: "declare outputs before preparing a likelihood".into(),
     })?;
-    try_prepare_likelihood(m, output, data_inputs, options, report)?.ok_or_else(|| {
-        PreparationError {
+    try_prepare_likelihood(m, output, data_inputs, options, RealPrecision::F32, report)?.ok_or_else(
+        || PreparationError {
             node: output,
             reason: "no supported sufficient-statistic likelihood factor".into(),
-        }
-    })
+        },
+    )
 }
 
 /// Split summaries independent of every declared input, including promoted
@@ -1640,10 +1647,25 @@ pub fn prepare_likelihood_with_options(
 pub fn prepare_fixed_likelihood(
     m: &Module,
 ) -> Result<Option<PreparedLikelihood>, PreparationError> {
+    prepare_fixed_likelihood_for_precision(m, RealPrecision::F32)
+}
+
+/// Split fixed summaries using a layout suitable for the selected arithmetic.
+pub fn prepare_fixed_likelihood_for_precision(
+    m: &Module,
+    precision: RealPrecision,
+) -> Result<Option<PreparedLikelihood>, PreparationError> {
     let Some(output) = binding(m, "outputs") else {
         return Ok(None);
     };
-    try_prepare_likelihood(m, output, &[], &PreparationOptions::default(), None)
+    try_prepare_likelihood(
+        m,
+        output,
+        &[],
+        &PreparationOptions::default(),
+        precision,
+        None,
+    )
 }
 
 fn try_prepare_likelihood(
@@ -1651,6 +1673,7 @@ fn try_prepare_likelihood(
     output: NodeId,
     data_inputs: &[String],
     options: &PreparationOptions,
+    precision: RealPrecision,
     report: Option<&mut ReductionReport>,
 ) -> Result<Option<PreparedLikelihood>, PreparationError> {
     let refuse = |reason: &str| PreparationError {
@@ -1680,7 +1703,7 @@ fn try_prepare_likelihood(
         .into_iter()
         .flat_map(|name| score.alias_chain(name))
         .collect();
-    let (_, added) = reduce(&mut score, allowed.clone(), true, report, true);
+    let (_, added) = reduce(&mut score, allowed.clone(), Some(precision), report, true);
     let boundary = query::promoted_input_names(&score);
     let mut candidates = summary_bindings(&score).peekable();
     if candidates.peek().is_none() {

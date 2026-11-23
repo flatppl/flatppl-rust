@@ -331,7 +331,13 @@ fn match_residual_norm(
     map("mul", [factor, op("rowstack", [vector([weights])])])
 }
 
-fn factor(columns: &[Expr], scales: Expr, observed: NodeId, count: usize, preparing: bool) -> Expr {
+fn factor(
+    columns: &[Expr],
+    scales: Expr,
+    observed: NodeId,
+    count: usize,
+    reducer: &Reducer,
+) -> Expr {
     let dimension = columns.len();
     let normalized = op(
         "colstack",
@@ -353,28 +359,37 @@ fn factor(columns: &[Expr], scales: Expr, observed: NodeId, count: usize, prepar
     if count <= dimension {
         return op("rowstack", [rows]);
     }
-    if preparing
+    if reducer.preparing
         && let Some(blocks) = count.div_ceil(dimension).checked_next_power_of_two()
         && let Some(padded) = blocks.checked_mul(dimension)
         && let Ok(padding) = i64::try_from(padded - count)
     {
-        // Merge pairs of blocks to limit Householder rounding depth to log2(blocks).
-        // A linear scan of fixed rows can lose precision in the residual norm.
+        // Merge short row blocks in a tree. Wider tiles share one QR program
+        // across more rows while keeping its temporary matrices bounded.
         let rows = if padding == 0 {
             rows
         } else {
             let zero = op("fill", [num(0.0), Expr::Integer(dimension as i64)]);
             op("cat", [rows, op("fill", [zero, Expr::Integer(padding)])])
         };
+        // F32 keeps the pairwise tree for near-mode gradient accuracy. For
+        // larger designs the F64 row budget also falls back to pairs.
+        let max_blocks = match reducer.precision {
+            crate::RealPrecision::F32 => 2,
+            crate::RealPrecision::F64 => (256 / dimension).max(2),
+        };
+        let merge_blocks = 1usize << max_blocks.ilog2();
         let shape = vector([
-            Expr::Integer(2 * dimension as i64),
+            Expr::Integer((merge_blocks * dimension) as i64),
             Expr::Integer(dimension as i64),
         ]);
         let mut matrix = op("rowstack", [rows]);
-        for _ in 1..blocks.ilog2() {
-            let pairs = op("splitblocks", [matrix, shape.clone()]);
-            let factors = cells(op("get", [op("qr", [Expr::Local]), Expr::Text("R")]), pairs);
+        let mut remaining = blocks;
+        while remaining > merge_blocks {
+            let tiles = op("splitblocks", [matrix, shape.clone()]);
+            let factors = cells(op("get", [op("qr", [Expr::Local]), Expr::Text("R")]), tiles);
             matrix = op("joinblocks", [factors]);
+            remaining /= merge_blocks;
         }
         return op("get", [op("qr", [matrix]), Expr::Text("R")]);
     }
@@ -489,7 +504,7 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                 initial_scales.clone(),
                 f.observed,
                 count,
-                reducer.preparing,
+                reducer,
             ),
         );
         // Small pivots affect only the reference choice, never the model rank.
@@ -628,13 +643,7 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
     } else {
         "regression_factor"
     };
-    let r = factor(
-        &final_columns,
-        scales.clone(),
-        f.observed,
-        count,
-        reducer.preparing,
-    );
+    let r = factor(&final_columns, scales.clone(), f.observed, count, reducer);
     let r = if reducer.preparing && count > p + 1 {
         match_residual_norm(m, r, final_columns[p].clone(), scales.clone(), count, p)
     } else {
