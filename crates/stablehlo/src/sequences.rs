@@ -6,6 +6,12 @@ use flatppl_core::Call;
 use super::batching::tensor;
 use super::*;
 
+enum SequenceOutputs<'a> {
+    Full,
+    Terminal,
+    Histories(&'a [Symbol]),
+}
+
 #[derive(Clone)]
 pub(super) struct Components {
     pub(super) fields: Option<Vec<Symbol>>,
@@ -487,9 +493,113 @@ impl Emitter<'_> {
         args: &[NodeId],
         reduce: bool,
     ) -> Result<Components, EmitError> {
+        self.lower_sequence_outputs(id, args, reduce, SequenceOutputs::Full)
+    }
+
+    fn in_scan_demand_scope(&self) -> bool {
+        self.scan_demand.is_some()
+            && self.region_depth == 0
+            && self.scoped_inputs.is_empty()
+            && self.broadcast_frame.is_empty()
+            && self.call_frame.is_empty()
+            && !self.host_batch
+            && !self.fold_design_scans
+    }
+
+    fn has_scan_operand(&self, operand: NodeId) -> bool {
+        matches!(
+            self.m.node(self.resolve_ref_one(operand)),
+            Node::Call(call) if matches!(call.head, CallHead::Builtin(head)
+                if self.m.resolve(head) == "scan")
+        )
+    }
+
+    fn scan_output_demand(&self) -> &flatppl_optimise::ScanOutputDemand {
+        self.scan_demand
+            .as_ref()
+            .expect("checked scan demand scope")
+            .get_or_init(|| flatppl_optimise::scan_output_demand_with_rules(self.m, &self.rules))
+    }
+
+    pub(super) fn lower_scan_terminal(
+        &mut self,
+        reader: NodeId,
+        args: &[NodeId],
+    ) -> Option<Result<Value, EmitError>> {
+        if !self.in_scan_demand_scope()
+            || !matches!(args, [operand, _] if self.has_scan_operand(*operand))
+        {
+            return None;
+        }
+        let scan = self.scan_output_demand().terminal_scan(reader)?;
+        if let Some(value) = self.scan_terminals.get(&scan) {
+            return Some(Ok(value.clone()));
+        }
+        // A full buffer produced by another lowering path still uses the
+        // ordinary indexing path; it is never a terminal cache entry.
+        if self.memo.contains_key(&scan) {
+            return None;
+        }
+        let Node::Call(call) = self.m.node(scan) else {
+            unreachable!("terminal scan proof");
+        };
+        Some(
+            self.lower_sequence_outputs(scan, &call.args, false, SequenceOutputs::Terminal)
+                .and_then(|output| output.tensor(scan))
+                .inspect(|value| {
+                    self.scan_terminals.insert(scan, value.clone());
+                }),
+        )
+    }
+
+    pub(super) fn lower_scan_history_map(
+        &mut self,
+        reader: NodeId,
+        args: &[NodeId],
+    ) -> Option<Result<Value, EmitError>> {
+        if !self.in_scan_demand_scope()
+            || !matches!(args, [_, operand] if self.has_scan_operand(*operand))
+        {
+            return None;
+        }
+        let (scan, field) = self.scan_output_demand().history_map(reader)?;
+        let field = self.m.resolve(field).to_owned();
+        Some(
+            self.lower_field(scan, &field)
+                .and_then(|value| match value {
+                    Lowered::Tensor(value) => Ok(value),
+                    Lowered::Record(_) => Err(records::record_in_tensor_position(reader, &field)),
+                }),
+        )
+    }
+
+    pub(super) fn lower_scan_histories(
+        &mut self,
+        scan: NodeId,
+        args: &[NodeId],
+    ) -> Result<Components, EmitError> {
+        if self.in_scan_demand_scope()
+            && let Some(fields) = self
+                .scan_output_demand()
+                .histories(scan)
+                .map(<[Symbol]>::to_vec)
+        {
+            self.lower_sequence_outputs(scan, args, false, SequenceOutputs::Histories(&fields))
+        } else {
+            self.lower_sequence(scan, args, false)
+        }
+    }
+
+    fn lower_sequence_outputs(
+        &mut self,
+        id: NodeId,
+        args: &[NodeId],
+        reduce: bool,
+        outputs: SequenceOutputs<'_>,
+    ) -> Result<Components, EmitError> {
         let frame = self.broadcast_frame.clone();
         let previous = std::mem::replace(&mut self.call_frame, frame);
-        let result = self.lower_sequence_in_frame(id, args, reduce);
+        let result = self.lower_sequence_in_frame(id, args, reduce, outputs);
         self.call_frame = previous;
         result
     }
@@ -499,6 +609,7 @@ impl Emitter<'_> {
         id: NodeId,
         args: &[NodeId],
         reduce: bool,
+        outputs: SequenceOutputs<'_>,
     ) -> Result<Components, EmitError> {
         if let Node::Call(call) = self.m.node(id)
             && !call.named.is_empty()
@@ -684,6 +795,29 @@ impl Emitter<'_> {
         // An rng state rides in the carry with no output buffer: only the state
         // after the last step is kept (spec §07 "Random number generation").
         let keys: Vec<bool> = state.values.iter().map(|v| v.ty == MlirTy::Key).collect();
+        let terminal = matches!(outputs, SequenceOutputs::Terminal);
+        let selected = match outputs {
+            SequenceOutputs::Histories(fields)
+                if state.layout.is_none() && !keys.iter().any(|&key| key) =>
+            {
+                state
+                    .fields
+                    .as_ref()
+                    .filter(|names| names.len() == state.values.len())
+                    .map(|names| (names, fields))
+            }
+            _ => None,
+        };
+        let histories: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &key)| {
+                (!reduce
+                    && !key
+                    && selected.is_none_or(|(names, fields)| fields.contains(&names[i])))
+                .then_some(i)
+            })
+            .collect();
         if keys.iter().any(|&k| k) && (reduce || n == 0 || !self.call_frame.is_empty()) {
             return Err(EmitError::at(
                 id,
@@ -759,14 +893,10 @@ impl Emitter<'_> {
             })
         };
         let mut buffers = Vec::with_capacity(state.values.len());
-        for (value, _) in state
-            .values
-            .iter()
-            .zip(&keys)
-            .filter(|(_, key)| !reduce && computed.is_none() && !**key)
-        {
+        for &i in histories.iter().filter(|_| computed.is_none()) {
+            let value = &state.values[i];
             let mut dims = shape(&value.ty).to_vec();
-            dims.insert(self.batch_rank(value), Some(n));
+            dims.insert(self.batch_rank(value), Some(if terminal { 1 } else { n }));
             let zero = match value.elem {
                 ElemKind::Real => self.scalar(0.0),
                 ElemKind::Complex => {
@@ -786,12 +916,43 @@ impl Emitter<'_> {
         // and reads the item after the counter.
         let first = u64::from(reduce);
         if let Some(values) = computed {
+            debug_assert!(!terminal && selected.is_none());
             buffers = values;
         } else if n > first {
+            let width = if reduce {
+                1
+            } else {
+                self.scan_block_width(body, &state, xs, n)
+            };
+            debug_assert!(!terminal || width == 1);
+            let index_range = if !reduce
+                && !self.target.serial_scans()
+                && !self.host_batch
+                && self.region_depth == 0
+                && self.call_frame.is_empty()
+                && self.runtime_batch_rank == 0
+                && self.rules.enables_ruleset("ordered-scan-index")
+                && xs.fields.is_none()
+                && xs.layout.is_none()
+                && let [value] = xs.values.as_slice()
+            {
+                self.consecutive_scan_index(value, n)
+                    .and_then(|(first, last)| {
+                        flatppl_optimise::plan_ordered_scan_index_with_rules(
+                            first,
+                            last,
+                            n,
+                            width,
+                            &self.rules,
+                        )
+                    })
+            } else {
+                None
+            };
             let counter = self.int_value_const(0);
             let mut inits = vec![counter];
-            for (sequence, _) in seqs.iter().zip(&traversed).filter(|(_, t)| **t) {
-                inits.extend(sequence.values.clone());
+            if index_range.is_none() {
+                inits.extend(xs.values.iter().cloned());
             }
             let start = inits.len();
             inits.extend(state.values.clone());
@@ -801,17 +962,12 @@ impl Emitter<'_> {
                 .iter()
                 .map(|v| v.ty.render(self.dtype, v.elem))
                 .collect::<Vec<_>>();
-            let width = if reduce {
-                1
-            } else {
-                self.scan_block_width(body, &state, xs, n)
-            };
             let advance = |e: &mut Self,
                            args: &[Value],
                            index: &Value|
              -> Result<Vec<Value>, EmitError> {
                 let mut sequence_items = Vec::with_capacity(seqs.len());
-                let mut at = 1;
+                let mut scan_index = None;
                 let item = if reduce {
                     let one = e.int_value_const(1);
                     e.add(index, &one)
@@ -828,12 +984,20 @@ impl Emitter<'_> {
                     } else {
                         item.clone()
                     };
-                    let mut items = Vec::with_capacity(sequence.values.len());
-                    for (value, original) in args[at..].iter().zip(&sequence.values) {
-                        let value = e.axes_view(value, e.axes_of(original));
-                        items.push(e.scan_slice(&value, &index));
+                    if let Some((first, last)) = index_range {
+                        let item = e.scan_index_value(&index, first);
+                        scan_index = Some((item.ssa.clone(), first, last));
+                        sequence_items.push(sequence.with_values(&[item]));
+                        continue;
                     }
-                    at += sequence.values.len();
+                    let items = args[1..start]
+                        .iter()
+                        .zip(&sequence.values)
+                        .map(|(value, original)| {
+                            let value = e.axes_view(value, e.axes_of(original));
+                            e.scan_slice(&value, &index)
+                        })
+                        .collect::<Vec<_>>();
                     sequence_items.push(sequence.with_values(&items));
                 }
                 let mut carries = Vec::with_capacity(state.values.len());
@@ -852,9 +1016,10 @@ impl Emitter<'_> {
                     arguments.push(value.clone());
                     types.push(ty.clone());
                 }
-                let output = e
-                    .call_components(body, &entries, &arguments, &types)?
-                    .align(&state, id)?;
+                let previous_index = std::mem::replace(&mut e.scan_index, scan_index);
+                let output = e.call_components(body, &entries, &arguments, &types);
+                e.scan_index = previous_index;
+                let output = output?.align(&state, id)?;
                 let mut next = Vec::with_capacity(args.len());
                 let one = e.int_value_const(1);
                 next.push(e.add(&args[0], &one));
@@ -891,17 +1056,15 @@ impl Emitter<'_> {
                         e.add(index, &offset)
                     };
                     next = advance(e, &next, &item)?;
-                    let buffered = next[start..out_start]
-                        .iter()
-                        .zip(&keys)
-                        .filter(|(_, key)| !**key);
-                    for (rows, (value, _)) in rows.iter_mut().zip(buffered) {
-                        rows.push(value.clone());
+                    for (rows, &leaf) in rows.iter_mut().zip(&histories) {
+                        rows.push(next[start + leaf].clone());
                     }
                 }
                 for (buffer, rows) in args[out_start..].iter().zip(rows) {
                     let update = if let [row] = rows.as_slice() {
-                        e.scan_update(buffer, row, index)
+                        // A one-row history write retains Enzyme's per-step cotangent paths.
+                        let slot = terminal.then(|| e.int_value_const(0));
+                        e.scan_update(buffer, row, slot.as_ref().unwrap_or(index))
                     } else {
                         let block = e.vector(&rows);
                         e.update_scan_rows(buffer, &block, index, e.batch_rank(&block))
@@ -937,8 +1100,23 @@ impl Emitter<'_> {
                 let tail = self.int_value_const((steps - steps % width) as i64);
                 results = block(self, &results, &tail, steps % width)?;
             }
+            if terminal {
+                let buffer = &results[out_start];
+                let limits: Vec<_> = shape(&buffer.ty).iter().map(|dim| dim.unwrap()).collect();
+                let row = self.slice(
+                    buffer,
+                    &vec![0; limits.len()],
+                    &limits,
+                    &vec![1; limits.len()],
+                );
+                let carry = &state.values[0];
+                let value = self.reshape_axes(&row, carry.ty.clone(), self.axes_of(carry));
+                return Ok(Components::flat(None, vec![value]));
+            }
             buffers = if reduce {
                 results[start..out_start].to_vec()
+            } else if selected.is_some() {
+                results[out_start..].to_vec()
             } else {
                 let mut columns = results[out_start..].iter().cloned();
                 results[start..out_start]
@@ -953,7 +1131,7 @@ impl Emitter<'_> {
                     })
                     .collect()
             };
-            for (last, &key) in buffers.iter().zip(&keys) {
+            for (last, &key) in buffers.iter().zip(&keys).filter(|_| selected.is_none()) {
                 if key {
                     // The next draw after the scan reads its final state.
                     self.set_cur_key(last.clone());
@@ -962,6 +1140,15 @@ impl Emitter<'_> {
             }
         } else if reduce {
             buffers = state.values.clone();
+        }
+        if let Some((names, _)) = selected {
+            state = Components::flat(
+                Some(histories.iter().map(|&index| names[index]).collect()),
+                histories
+                    .iter()
+                    .map(|&index| state.values[index].clone())
+                    .collect(),
+            );
         }
         for (buffer, value) in buffers.iter_mut().zip(&state.values) {
             if value.ty == MlirTy::Key {
@@ -1051,7 +1238,7 @@ impl Emitter<'_> {
             }
         }
         if allow_wide {
-            flatppl_optimise::ordered_scan_width(length, seen.len())
+            flatppl_optimise::ordered_scan_width_with_rules(length, seen.len(), &self.rules)
         } else {
             4
         }
@@ -1136,6 +1323,50 @@ impl Emitter<'_> {
             }
         }
         self.folded_constant(values, xs.ty.clone(), self.axes_of(xs))
+    }
+
+    fn consecutive_scan_index(&self, value: &Value, len: u64) -> Option<(i64, i64)> {
+        if len < 2 || value.elem != ElemKind::Int || shape(&value.ty) != [Some(len)] {
+            return None;
+        }
+        let values = self.constants.get(&value.ssa)?;
+        let len = usize::try_from(len).ok()?;
+        if values.len() != len || len > super::constants::MAX_FOLDED_ELEMENTS {
+            return None;
+        }
+        let Scalar::Int(first) = values[0] else {
+            return None;
+        };
+        let last = first.checked_add(i64::try_from(len - 1).ok()?)?;
+        (self.int_fits(first)
+            && self.int_fits(last)
+            && values
+                .iter()
+                .zip(first..=last)
+                .all(|(value, expect)| matches!(value, Scalar::Int(i) if *i == expect)))
+        .then_some((first, last))
+    }
+
+    fn scan_index_value(&mut self, position: &Value, first: i64) -> Value {
+        let first = self.int_value_const(first);
+        let ty = position.ty.render(self.dtype, ElemKind::Int);
+        // Even a constant tail position must retain the scan's runtime
+        // out-of-bounds behavior when the full index range cannot be proved.
+        let ssa = self.pure(format!(
+            "stablehlo.add {}, {} : {ty}",
+            position.ssa, first.ssa
+        ));
+        Value {
+            ssa,
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Int,
+        }
+    }
+
+    pub(crate) fn scan_index_in_bounds(&self, index: &Value, base: i64, upper: u64) -> bool {
+        self.scan_index.as_ref().is_some_and(|(ssa, first, last)| {
+            ssa == &index.ssa && *first >= base && u64::try_from(*last).is_ok_and(|i| i <= upper)
+        })
     }
 
     pub(super) fn scan_slice(&mut self, input: &Value, index: &Value) -> Value {

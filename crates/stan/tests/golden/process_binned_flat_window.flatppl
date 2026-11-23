@@ -1,0 +1,8 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+s = elementof(posreals)
+flat = Uniform(interval(0.0, 6.0))
+window = Lebesgue(support = interval(0.5, 5.0))
+lp = logdensityof(BinnedPoissonProcess([0.0, 1.0, 3.0, 6.0], superpose(weighted(s, flat), weighted(0.3, window))), [2, 7, 4])
+inputs = s
+outputs = lp

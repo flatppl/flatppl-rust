@@ -11,6 +11,10 @@ use flatppl_core::{
 use crate::project::Cuts;
 use crate::{Dtype, Profile};
 
+#[path = "scan_demand.rs"]
+mod scan;
+pub use scan::{ScanOutputDemand, scan_output_demand, scan_output_demand_with_rules};
+
 const MAX_DEMAND_NODES: usize = 65_536;
 const MAX_PROOF_DEPTH: usize = 64;
 

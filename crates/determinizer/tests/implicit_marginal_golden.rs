@@ -469,7 +469,7 @@ y2 = draw(Normal(mu = z, sigma = 1.0))
     ] {
         let lp = pir_binding(&pir(&format!("{model_a}{query}")), "lp");
         assert!(
-            lp.contains("(mul -0.5 ") && lp.contains("3.6757541328186907"),
+            lp.contains("(mul (neg 0.5) ") && lp.contains("3.6757541328186907"),
             "−½ over the flat sum, opening with 2·log 2π:\n{lp}"
         );
         assert_eq!(

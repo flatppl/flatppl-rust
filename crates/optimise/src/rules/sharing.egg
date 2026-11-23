@@ -16,7 +16,7 @@
        (>= lo 0) (< hi n))
       ((fixed-gather gather head x selector n k id)
        (real-vector gather k))
-  :ruleset selector-facts)
+  :ruleset selector-facts :name "selector-facts.fixed-gather")
 
 ; Reuse the representative without merging cotangents from two gather sites.
 (rule ((fixed-gather gather head x selector n k id)
@@ -24,13 +24,13 @@
        (fixed-selector head selector k lo hi id true identity)
        (selector-representative id canonical rows))
       ((union gather (B canonical x rows)))
-  :ruleset sharing)
+  :ruleset sharing :name "sharing.canonical-selector")
 
 (rule ((fixed-gather gather head x selector n n id)
        (exclusive-gather-source head x selector)
        (fixed-selector head selector n lo hi id true true))
       ((union gather x))
-  :ruleset sharing)
+  :ruleset sharing :name "sharing.identity-selector")
 
 ; The inner gather has no other consumers and the final rows are injective.
 ; Repeats would change the grouping of scatter-adds in the pullback.
@@ -41,4 +41,4 @@
        (fixed-selector head rows k lo hi id true identity)
        (>= lo 0) (< hi n))
       ((union outer (B head x rows)))
-  :ruleset sharing)
+  :ruleset sharing :name "sharing.compose-selectors")

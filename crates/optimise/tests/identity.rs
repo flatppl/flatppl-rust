@@ -1,5 +1,5 @@
 use flatppl_core::Module;
-use flatppl_optimise::{Dtype, Profile, Target, optimise};
+use flatppl_optimise::{Dtype, Profile, RulePolicy, Target, optimise, optimise_with_rules};
 
 const HOIST_ALIAS: &str = "\
 x = external(cartpow(reals, 8))
@@ -51,4 +51,29 @@ c = get0(r.x, [5, 2])
 outputs = (sum(b .* wb) + sum(a .* wa)) + sum(c .* wc)
 ";
     assert!(optimise_output(model).is_none());
+}
+
+#[test]
+fn alternating_rule_policies_only_affect_the_current_optimisation() {
+    let mut model =
+        flatppl_syntax::parse("x = external(reals)\ninputs = x\noutputs = identity(x)\n").unwrap();
+    assert!(flatppl_infer::infer(&mut model).is_empty());
+    let outputs = [model.intern("outputs")];
+    let default = RulePolicy::default();
+    let keep_identity = RulePolicy::new(&["portable.identity"], &[]).unwrap();
+    let keep_negation = RulePolicy::new(&["portable.double-negation"], &[]).unwrap();
+    for (rules, removes_identity) in [
+        (&default, true),
+        (&keep_identity, false),
+        (&keep_negation, true),
+        (&keep_identity, false),
+        (&default, true),
+    ] {
+        let result = optimise_with_rules(&model, Some(&outputs), Profile::Portable, rules);
+        let graph = result.as_ref().unwrap_or(&model);
+        assert_eq!(
+            flatppl_flatpir::write(graph).contains("(identity "),
+            !removes_identity
+        );
+    }
 }

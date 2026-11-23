@@ -25,6 +25,7 @@
 //! the same for its predicate operand.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 
 use flatppl_core::{
     CallHead, Inputs, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type, ValueSet,
@@ -185,6 +186,7 @@ pub struct Emitter<'m> {
     fold_design_scans: bool,
     integration: Option<crate::IntegrationOptions>,
     target: crate::Target,
+    rules: crate::RulePolicy,
     /// The program is replayed over host batch axes after lowering.
     host_batch: bool,
     runtime_batch_rank: usize,
@@ -241,6 +243,12 @@ pub struct Emitter<'m> {
     /// It stands for the scan's rng-state column, of which only the last row
     /// is kept.
     pub(crate) final_scan_keys: HashMap<String, u64>,
+    /// Proven output demand for top-level scans in this query.
+    scan_demand: Option<OnceLock<flatppl_optimise::ScanOutputDemand>>,
+    /// Terminal values are not interchangeable with full scan histories.
+    scan_terminals: HashMap<NodeId, Value>,
+    /// The scalar item and its inclusive bounds during a scan callback.
+    scan_index: Option<(String, i64, i64)>,
     /// The fan-out batch shape, set by [`crate::registry::lower_sample`] around
     /// a batched `builtin_sample(rng, ctor, input, n)` (spec §07 size dims).
     /// When `Some`, [`Emitter::rng`] OVERRIDES the per-element `out_ty` the
@@ -270,6 +278,7 @@ impl<'m> Emitter<'m> {
             fold_design_scans: false,
             integration: None,
             target: crate::Target::Cpu,
+            rules: crate::RulePolicy::default(),
             host_batch: false,
             runtime_batch_rank: 0,
             runtime_status: None,
@@ -296,18 +305,50 @@ impl<'m> Emitter<'m> {
             cur_key: None,
             sample_keys: HashMap::new(),
             final_scan_keys: HashMap::new(),
+            scan_demand: None,
+            scan_terminals: HashMap::new(),
+            scan_index: None,
             batch_shape: None,
             columns: HashMap::new(),
         }
     }
 
     pub fn with_options(m: &'m Module, opts: &crate::EmitOptions) -> Self {
+        Self::with_options_and_rules(m, opts, &crate::RulePolicy::default())
+    }
+
+    /// Create an emitter using a caller-selected egglog rule policy.
+    pub fn with_options_and_rules(
+        m: &'m Module,
+        opts: &crate::EmitOptions,
+        rules: &crate::RulePolicy,
+    ) -> Self {
         let mut emitter = Self::new(m, opts.dtype);
         emitter.restrict_enzyme_compatible = opts.restrict_enzyme_compatible;
         emitter.check_parameters = opts.check_parameters;
         emitter.sufficient_statistics = opts.sufficient_statistics;
         emitter.integration = opts.integration;
         emitter.target = opts.target;
+        emitter.rules = rules.clone();
+        emitter
+    }
+
+    /// Create an emitter for the validated `inputs` and `outputs` ABI. The
+    /// caller must bind those inputs and lower only leaves of those outputs.
+    #[doc(hidden)]
+    pub fn for_query(m: &'m Module, opts: &crate::EmitOptions) -> Self {
+        Self::for_query_with_rules(m, opts, &crate::RulePolicy::default())
+    }
+
+    #[doc(hidden)]
+    pub fn for_query_with_rules(
+        m: &'m Module,
+        opts: &crate::EmitOptions,
+        rules: &crate::RulePolicy,
+    ) -> Self {
+        let mut emitter = Self::with_options_and_rules(m, opts, rules);
+        emitter.scan_demand = (opts.target.serial_scans() && rules.enables_ruleset("scan-demand"))
+            .then(OnceLock::new);
         emitter
     }
 
@@ -319,6 +360,7 @@ impl<'m> Emitter<'m> {
         emitter.sufficient_statistics = self.sufficient_statistics;
         emitter.integration = self.integration;
         emitter.target = self.target;
+        emitter.rules = self.rules.clone();
         emitter.host_batch = self.host_batch;
         emitter.runtime_batch_rank = self.runtime_batch_rank;
         emitter.region_depth = self.region_depth + 1;
@@ -4850,6 +4892,9 @@ impl<'m> Emitter<'m> {
         id: NodeId,
         args: &[NodeId],
     ) -> Result<Value, EmitError> {
+        if let Some(value) = self.lower_scan_history_map(id, args) {
+            return value;
+        }
         let f = *args
             .first()
             .ok_or_else(|| EmitError::at(id, "broadcast: missing callable"))?;
@@ -5271,6 +5316,9 @@ impl<'m> Emitter<'m> {
                         // bypasses this dispatch, so they keep broadcasting.
                         crate::ops::lower_bare_arith(self, id, &name, &call.args)
                     } else if matches!(name.as_str(), "get0" | "get") {
+                        if let Some(value) = self.lower_scan_terminal(id, &call.args) {
+                            return value;
+                        }
                         // `get0(builtin_sample(...), k)` / `get((%ref self
                         // <shared-latent>), k)`: a projection of a sampled
                         // `(value, new_rngstate)` pair (slot 0 = drawn value,

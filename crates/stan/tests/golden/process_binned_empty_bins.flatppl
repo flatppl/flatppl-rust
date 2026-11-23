@@ -1,0 +1,8 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+mu = elementof(reals)
+a = elementof(reals)
+intensity = truncate(Normal(mu, 1.0), interval(a, a + 1))
+lp = logdensityof(BinnedPoissonProcess([-2, -1, 0, 1], intensity), [0, 0, 2])
+inputs = (mu, a)
+outputs = lp

@@ -108,14 +108,19 @@ fn output_nodes(m: &Module, mut visit: impl FnMut(NodeId, Symbol, bool)) {
 
 /// One source can produce several distinct native laws when a reified function
 /// is called with different arguments. Preserve the instantiated proof for each.
-#[derive(Default)]
-pub(crate) struct PosteriorTrace {
+pub(crate) struct PosteriorTrace<'a> {
+    rules: &'a crate::RulePolicy,
     sources: Vec<Vec<PosteriorUpdate>>,
     by_node: HashMap<NodeId, usize>,
     draws: HashMap<NodeId, (usize, Vec<PosteriorUpdate>)>,
 }
 
-fn describe(m: &mut Module, node: Option<NodeId>, binding: String) -> Vec<PosteriorUpdate> {
+fn describe(
+    m: &mut Module,
+    node: Option<NodeId>,
+    binding: String,
+    rules: &crate::RulePolicy,
+) -> Vec<PosteriorUpdate> {
     let product = node.and_then(|node| flatppl_determinizer::conjugate_product(m, node));
     let update = PosteriorUpdate {
         binding,
@@ -153,18 +158,20 @@ fn describe(m: &mut Module, node: Option<NodeId>, binding: String) -> Vec<Poster
                     .iter()
                     .map(|&f| m.resolve(f).into())
                     .collect();
-                field.parameters = flatppl_stablehlo::Emitter::fixed_distribution_parameters(
-                    m,
-                    law.valid,
-                    &distribution.args,
-                );
+                field.parameters =
+                    flatppl_stablehlo::Emitter::fixed_distribution_parameters_with_rules(
+                        m,
+                        law.valid,
+                        &distribution.args,
+                        rules,
+                    );
             }
             field
         })
         .collect()
 }
 
-impl flatppl_determinizer::SamplingObserver for PosteriorTrace {
+impl flatppl_determinizer::SamplingObserver for PosteriorTrace<'_> {
     fn source_measures(&mut self, m: &Module) -> Vec<NodeId> {
         let mut candidates = Vec::new();
         output_nodes(m, |node, owner, reified| {
@@ -192,6 +199,7 @@ impl flatppl_determinizer::SamplingObserver for PosteriorTrace {
                     &mut scratch,
                     (!reified).then_some(node),
                     m.resolve(owner).into(),
+                    self.rules,
                 ));
                 node
             })
@@ -206,7 +214,7 @@ impl flatppl_determinizer::SamplingObserver for PosteriorTrace {
             let name = entry
                 .map(|i| self.sources[i][0].binding.clone())
                 .unwrap_or_else(|| m.resolve(owner).into());
-            let mut actual = describe(&mut scratch, Some(node), name);
+            let mut actual = describe(&mut scratch, Some(node), name, self.rules);
             let i = entry.unwrap_or_else(|| {
                 let index = self.sources.len();
                 self.by_node.insert(source, index);
@@ -221,7 +229,16 @@ impl flatppl_determinizer::SamplingObserver for PosteriorTrace {
     }
 }
 
-impl PosteriorTrace {
+impl<'a> PosteriorTrace<'a> {
+    pub(crate) fn new(rules: &'a crate::RulePolicy) -> Self {
+        Self {
+            rules,
+            sources: Vec::new(),
+            by_node: HashMap::new(),
+            draws: HashMap::new(),
+        }
+    }
+
     pub(crate) fn finish(mut self, lowered: Option<&Module>) -> Vec<PosteriorUpdate> {
         let Some(m) = lowered else {
             for update in self.sources.iter_mut().flatten() {

@@ -230,6 +230,7 @@ mod types;
 
 pub use call_batch::BatchSpec;
 pub use emitter::Emitter;
+pub use flatppl_optimise::{RulePolicy, RuleSelector};
 pub use mlir::{ElemKind, Lowered, MlirTy, Value};
 pub use modes::check_query_inputs;
 pub use refuse::EmitError;
@@ -345,13 +346,22 @@ impl Default for EmitOptions {
 /// Optimise a validated query for the selected backend. The returned node is
 /// the updated `outputs` binding's RHS. Sampling retains its authored RNG walk.
 pub fn optimise_query(m: &Module, opts: &EmitOptions) -> Option<(Module, NodeId)> {
+    optimise_query_with_rules(m, opts, &RulePolicy::default())
+}
+
+/// Optimise a validated query using the caller's egglog rules.
+pub fn optimise_query_with_rules(
+    m: &Module,
+    opts: &EmitOptions,
+    rules: &RulePolicy,
+) -> Option<(Module, NodeId)> {
     use flatppl_optimise::{Dtype as Precision, Target as Backend};
 
     let (outputs, binding) = m.bindings().find(|(_, b)| m.resolve(b.name) == "outputs")?;
     if modes::reaches_sample(m, binding.rhs) {
         return None;
     }
-    let mut optimised = flatppl_optimise::optimise_stablehlo(
+    let mut optimised = flatppl_optimise::optimise_stablehlo_with_rules(
         m,
         Some(&[binding.name]),
         match opts.target {
@@ -363,6 +373,7 @@ pub fn optimise_query(m: &Module, opts: &EmitOptions) -> Option<(Module, NodeId)
             Dtype::F64 => Precision::F64,
         },
         opts.sufficient_statistics,
+        rules,
     )?;
     if flatppl_determinizer::has_alias_chains(&optimised) {
         flatppl_determinizer::resolve_alias_chains(&mut optimised);
@@ -414,6 +425,17 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
 /// last-public-binding/source-order query heuristic has been removed, so there
 /// is no fallback.
 pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitError> {
+    emit_with_rules(m, mode, opts, &RulePolicy::default())
+}
+
+/// Emit a determinized query using the caller's egglog rules. Use the same
+/// policy during determinization to control its portable rewrites as well.
+pub fn emit_with_rules(
+    m: &Module,
+    mode: Mode,
+    opts: &EmitOptions,
+    rules: &RulePolicy,
+) -> Result<String, EmitError> {
     flatppl_determinizer::is_flatpdl_with_options(m, &opts.lowering_options())
         .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;
     // The emitter reads fixed operands through one ref hop (`Emitter::resolve_ref_one`).
@@ -428,8 +450,8 @@ pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitEr
     };
     match modes::read_abi(m)? {
         Some(abi) => match mode {
-            Mode::LogDensity => modes::emit_logdensity_abi(m, &abi, opts),
-            Mode::Sample => modes::emit_sample_abi(m, &abi, opts),
+            Mode::LogDensity => modes::emit_logdensity_abi(m, &abi, opts, rules),
+            Mode::Sample => modes::emit_sample_abi(m, &abi, opts, rules),
         },
         None => Err(EmitError::whole(
             "no inputs/outputs ABI declared; the last-public-binding query \

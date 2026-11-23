@@ -47,7 +47,7 @@ fmtlint = ["dep:flatppl-lint"]
 # `infer` too: before lowering it assembles the cross-module bundle (resolve
 # `load_module` refs from the cache) and runs the type/shape trace so a
 # mistyped model refuses loudly instead of being lowered blind.
-determinize = ["dep:flatppl-determinizer", "dep:flatppl-host", "infer"]
+determinize = ["dep:flatppl-determinizer", "dep:flatppl-host", "dep:flatppl-optimise", "infer"]
 # Source AD is opt-in and runs before FlatPDL optimization.
 autodiff = ["determinize", "dep:flatppl-autodiff"]
 # `mathdoc` renders a model as mathematics: `convert model.flatppl model.html`.
@@ -57,11 +57,11 @@ mathdoc = ["dep:flatppl-mathdoc", "infer"]
 # `stablehlo` prints textual StableHLO from post-`determinize` FlatPDL; it
 # always determinizes first, so it pulls in the determiniser and (like
 # `determinize`) `infer` for cross-module bundle assembly too.
-stablehlo = ["dep:flatppl-stablehlo", "dep:flatppl-determinizer", "dep:flatppl-host", "infer"]
+stablehlo = ["dep:flatppl-stablehlo", "dep:flatppl-determinizer", "dep:flatppl-host", "dep:flatppl-optimise", "infer"]
 # `stan` writes a Stan program for one target of an inferred model. It needs
 # `infer` for types and the cross-module bundle, and `flatppl-host` to read
 # `load_data` sources into the data JSON.
-stan = ["dep:flatppl-stan", "dep:flatppl-host", "infer"]
+stan = ["dep:flatppl-stan", "dep:flatppl-host", "dep:flatppl-optimise", "infer"]
 
 [dependencies]
 flatppl-core = { path = "../core" }

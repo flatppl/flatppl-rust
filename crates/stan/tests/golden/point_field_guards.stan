@@ -1,13 +1,21 @@
 functions {
   real gamma_interval_lmass(real lo, real hi, real p1, real p2) {
-    real a = fmax(lo, 0);
-    real b = fmax(hi, 0);
-    // Above the median the survival pair keeps the precision that the lcdf pair loses.
-    real la = gamma_lccdf(a | p1, p2);
-    if (la < log(0.5)) {
-      return log_diff_exp(la, gamma_lccdf(b | p1, p2));
+    // No CDF is evaluated at or beyond a support end, where Stan's value or partial is not finite.
+    if (lo >= hi) {
+      return negative_infinity();
     }
-    return log_diff_exp(gamma_lcdf(b | p1, p2), gamma_lcdf(a | p1, p2));
+    if (hi <= 0) {
+      return negative_infinity();
+    }
+    if (lo <= 0) {
+      return gamma_lcdf(hi | p1, p2);
+    }
+    // Above the median the survival pair keeps the precision that the lcdf pair loses.
+    real la = gamma_lccdf(lo | p1, p2);
+    if (la < log(0.5)) {
+      return log_diff_exp(la, gamma_lccdf(hi | p1, p2));
+    }
+    return log_diff_exp(gamma_lcdf(hi | p1, p2), gamma_lcdf(lo | p1, p2));
   }
 }
 data {

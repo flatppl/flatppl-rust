@@ -13,17 +13,30 @@ use flatppl_flatpir::{from_json, read, to_json, write};
 use serde_json::json;
 
 #[test]
-fn nonfinite_ir_values_roundtrip_as_expressions() {
+fn computed_numeric_values_roundtrip_as_expressions() {
     use flatppl_core::{Node, Scalar};
 
     for (value, expected) in [
-        (f64::NAN, json!(["divide", {"real": 0.0}, {"real": 0.0}])),
-        (f64::INFINITY, json!({"const": "inf"})),
-        (f64::NEG_INFINITY, json!(["neg", {"const": "inf"}])),
+        (
+            Scalar::Real(f64::NAN),
+            json!(["divide", {"real": 0.0}, {"real": 0.0}]),
+        ),
+        (Scalar::Real(f64::INFINITY), json!({"const": "inf"})),
+        (
+            Scalar::Real(f64::NEG_INFINITY),
+            json!(["neg", {"const": "inf"}]),
+        ),
+        (Scalar::Real(-0.0), json!(["neg", {"real": 0.0}])),
+        (Scalar::Real(-1.5), json!(["neg", {"real": 1.5}])),
+        (Scalar::Int(-4), json!(["neg", {"int": 4}])),
+        (
+            Scalar::Int(i64::MIN),
+            json!(["sub", ["neg", {"int": i64::MAX}], {"int": 1}]),
+        ),
     ] {
         let mut module = read("(%module (%public x) (%bind x 0.0))").unwrap();
         let binding = module.bindings().next().unwrap().0;
-        let value = module.alloc(Node::Lit(Scalar::Real(value)));
+        let value = module.alloc(Node::Lit(value));
         module.set_binding_rhs(binding, value);
         let text = write(&module);
         let encoded = to_json(&module);

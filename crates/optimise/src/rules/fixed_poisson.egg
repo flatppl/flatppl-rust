@@ -10,4 +10,4 @@
        (> retained 0)
        (>= rows (* 4 retained)))
       ((union original (B "poisson.grouped-score" source plan)))
-  :ruleset fixed-poisson)
+  :ruleset fixed-poisson :name "fixed-poisson.partition-sum")

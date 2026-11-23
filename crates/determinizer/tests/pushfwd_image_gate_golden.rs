@@ -171,12 +171,12 @@ fn each_registry_image_gates_on_its_own_set() {
         (
             "expm1",
             "Normal(mu = 0.0, sigma = 1.0)",
-            vec!["(gt 0.5 -1.0)"],
+            vec!["(gt 0.5 (neg 1.0))"],
         ),
         (
             "tanh",
             "Normal(mu = 0.0, sigma = 1.0)",
-            vec!["(land ", "(gt 0.5 -1.0)", "(lt 0.5 1.0)"],
+            vec!["(land ", "(gt 0.5 (neg 1.0))", "(lt 0.5 1.0)"],
         ),
         (
             "atan",

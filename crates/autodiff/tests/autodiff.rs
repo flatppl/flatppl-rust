@@ -21,7 +21,7 @@ fn takes_the_gradient_before_optimization() {
     let source = "
 x = elementof(reals)
 offset = 2.0 * 3.0
-y = x + offset
+y = identity(x + offset)
 inputs = x
 outputs = y
 ";
@@ -29,6 +29,7 @@ outputs = y
     let differentiated = gradient(&module, &["x"]).unwrap();
     let text = flatppl_syntax::print(&differentiated);
     assert!(text.contains("offset = 2.0 * 3.0"), "{text}");
+    assert!(text.contains("y = identity(x + offset)"), "{text}");
     assert!(text.contains("outputs = (y, d_x)"), "{text}");
     assert!(text.contains("d_x = 1.0"), "{text}");
     assert!(!flatppl_syntax::print(&module).contains("d_x"));

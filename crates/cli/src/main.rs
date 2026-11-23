@@ -68,6 +68,13 @@ use flatppl_cli::write_module;
 use flatppl_cli::{run_fmt, run_lint};
 #[cfg(any(feature = "infer", feature = "prepare"))]
 use flatppl_fileaccess::Location;
+#[cfg(any(
+    feature = "optimise",
+    feature = "determinize",
+    feature = "stablehlo",
+    feature = "stan"
+))]
+use flatppl_optimise::{RulePolicy, RuleSelector};
 
 #[derive(Parser)]
 #[command(name = "flatppl", version, about = "FlatPPL toolchain driver")]
@@ -194,7 +201,17 @@ enum Command {
         /// Output form: FlatPPL source or annotated FlatPIR.
         #[arg(long, value_enum, default_value_t = EmitForm::Flatppl)]
         emit: EmitForm,
+        #[command(flatten)]
+        egglog: EgglogArgs,
     },
+    /// List selectors for `--disable-egglog`.
+    #[cfg(any(
+        feature = "optimise",
+        feature = "determinize",
+        feature = "stablehlo",
+        feature = "stan"
+    ))]
+    EgglogRules,
     /// Prepare a model for offline use: fetch its remote dependencies into the cache.
     ///
     /// Walks each input model's transitive `load_module` (and `load_data`)
@@ -247,6 +264,8 @@ enum Command {
         /// Explain likelihood reductions and fallbacks on stderr.
         #[arg(long)]
         explain_reductions: bool,
+        #[command(flatten)]
+        egglog: EgglogArgs,
     },
     /// Emit FlatPPL source that returns query values and their derivatives.
     #[cfg(feature = "autodiff")]
@@ -341,6 +360,8 @@ enum Command {
         /// Output file (`.mlir`); stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        #[command(flatten)]
+        egglog: EgglogArgs,
     },
     /// Write a Stan program for one target of a FlatPPL model.
     ///
@@ -373,6 +394,8 @@ enum Command {
         /// Output file (`.stan`); stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        #[command(flatten)]
+        egglog: EgglogArgs,
     },
     /// Print a shell completion script to stdout.
     ///
@@ -393,6 +416,32 @@ enum Command {
     /// Lint FlatPPL files: report style/hygiene/correctness issues.
     #[cfg(feature = "fmtlint")]
     Lint(flatppl_cli::LintArgs),
+}
+
+#[cfg(any(
+    feature = "optimise",
+    feature = "determinize",
+    feature = "stablehlo",
+    feature = "stan"
+))]
+#[derive(clap::Args)]
+struct EgglogArgs {
+    /// Disable an egglog rule or ruleset. Repeat for multiple selectors.
+    /// Use `all`, `rule:<id>`, or `ruleset:<id>` from `flatppl egglog-rules`.
+    #[arg(long, value_name = "SELECTOR")]
+    disable_egglog: Vec<RuleSelector>,
+}
+
+#[cfg(any(
+    feature = "optimise",
+    feature = "determinize",
+    feature = "stablehlo",
+    feature = "stan"
+))]
+impl EgglogArgs {
+    fn into_policy(self) -> RulePolicy {
+        RulePolicy::from_selectors(self.disable_egglog)
+    }
 }
 
 /// CLI mirror of [`flatppl_infer::Level`] (the library stays clap-free).
@@ -551,7 +600,24 @@ fn main() -> ExitCode {
             input,
             output,
             emit,
-        } => optimise_cmd(&input, output.as_deref(), emit),
+            egglog,
+        } => optimise_cmd(&input, output.as_deref(), emit, &egglog.into_policy()),
+        #[cfg(any(
+            feature = "optimise",
+            feature = "determinize",
+            feature = "stablehlo",
+            feature = "stan"
+        ))]
+        Command::EgglogRules => {
+            println!("all");
+            for ruleset in flatppl_optimise::available_rulesets() {
+                println!("ruleset:{ruleset}");
+            }
+            for rule in flatppl_optimise::available_rules() {
+                println!("rule:{}\truleset:{}", rule.name, rule.ruleset);
+            }
+            Ok(())
+        }
         #[cfg(feature = "prepare")]
         Command::Prepare { files, update } => prepare_cmd(&files, update),
         #[cfg(feature = "determinize")]
@@ -565,6 +631,7 @@ fn main() -> ExitCode {
             emit,
             sufficient_statistics,
             explain_reductions,
+            egglog,
         } => determinize_cmd(
             &input,
             output.as_deref(),
@@ -578,6 +645,7 @@ fn main() -> ExitCode {
                 explain_reductions,
                 pack_summaries,
             },
+            &egglog.into_policy(),
         ),
         #[cfg(feature = "autodiff")]
         Command::Autodiff {
@@ -616,6 +684,7 @@ fn main() -> ExitCode {
             #[cfg(feature = "autodiff")]
             ad_mode,
             output,
+            egglog,
         } => stablehlo_cmd(
             &input,
             &mode,
@@ -649,6 +718,7 @@ fn main() -> ExitCode {
             },
             #[cfg(feature = "autodiff")]
             (&ad_wrt, ad_mode),
+            &egglog.into_policy(),
         ),
         #[cfg(feature = "stan")]
         Command::Stan {
@@ -659,6 +729,7 @@ fn main() -> ExitCode {
             data,
             manifest,
             output,
+            egglog,
         } => stan_cmd(
             &input,
             flatppl_stan::EmitOptions {
@@ -671,6 +742,7 @@ fn main() -> ExitCode {
             data.as_deref(),
             manifest.as_deref(),
             output.as_deref(),
+            &egglog.into_policy(),
         ),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -1131,7 +1203,12 @@ fn infer_cmd(
 }
 
 #[cfg(feature = "optimise")]
-fn optimise_cmd(input: &Path, output: Option<&Path>, emit: EmitForm) -> Result<(), Failure> {
+fn optimise_cmd(
+    input: &Path,
+    output: Option<&Path>,
+    emit: EmitForm,
+    rules: &RulePolicy,
+) -> Result<(), Failure> {
     let resolver = CliResolver::cache_only();
     let in_loc = resolver.model_location(&Location::Local(input.to_path_buf()))?;
     let from = resolver.model_format(&in_loc)?;
@@ -1159,11 +1236,12 @@ fn optimise_cmd(input: &Path, output: Option<&Path>, emit: EmitForm) -> Result<(
         &resolver,
         flatppl_infer::Level::Shape,
     )?;
-    let optimised = flatppl_optimise::optimise_with_bundle(
+    let optimised = flatppl_optimise::optimise_with_bundle_and_rules(
         &module,
         None,
         flatppl_optimise::Profile::Portable,
         &bundle,
+        rules,
     );
     let rendered = if preserve_source {
         match optimised.as_ref() {
@@ -1413,6 +1491,7 @@ fn determinize_cmd(
     emit: EmitForm,
     sufficient_statistics: bool,
     likelihood: LikelihoodOutput<'_>,
+    rules: &RulePolicy,
 ) -> Result<(), Failure> {
     let LikelihoodOutput {
         preparation,
@@ -1433,15 +1512,18 @@ fn determinize_cmd(
     };
     let mut report = flatppl_determinizer::ReductionReport::default();
     let lowered = if explain_reductions && preparation.is_none() {
-        flatppl_determinizer::determinize_with_options_and_report(
+        flatppl_determinizer::determinize_with_options_report_and_rules(
             &module,
             &bundle,
             roots,
             &lowering,
             &mut report,
+            rules,
         )
     } else {
-        flatppl_determinizer::determinize_with_options(&module, &bundle, roots, &lowering)
+        flatppl_determinizer::determinize_with_options_and_rules(
+            &module, &bundle, roots, &lowering, rules,
+        )
     };
     if explain_reductions && preparation.is_none() {
         print_reductions("lowering", &report);
@@ -1572,6 +1654,7 @@ fn stablehlo_cmd(
     output: Option<&Path>,
     likelihood: LikelihoodOutput<'_>,
     #[cfg(feature = "autodiff")] ad: (&[String], AdMode),
+    rules: &RulePolicy,
 ) -> Result<(), Failure> {
     let LikelihoodOutput {
         preparation,
@@ -1637,19 +1720,21 @@ fn stablehlo_cmd(
     };
     let mut report = flatppl_determinizer::ReductionReport::default();
     let lowered = if explain_reductions && preparation.is_none() {
-        flatppl_determinizer::determinize_with_options_and_report(
+        flatppl_determinizer::determinize_with_options_report_and_rules(
             &module,
             &bundle,
             roots.as_deref(),
             &lowering,
             &mut report,
+            rules,
         )
     } else {
-        flatppl_determinizer::determinize_with_options(
+        flatppl_determinizer::determinize_with_options_and_rules(
             &module,
             &bundle,
             roots.as_deref(),
             &lowering,
+            rules,
         )
     };
     if explain_reductions && preparation.is_none() {
@@ -1680,10 +1765,11 @@ fn stablehlo_cmd(
             print_reductions("preparation", &report);
         }
         let prepared = prepared.map_err(|e| Failure::Refuse(e.reason))?;
-        let rendered = flatppl_stablehlo::emit(
+        let rendered = flatppl_stablehlo::emit_with_rules(
             &prepared.preparation,
             flatppl_stablehlo::Mode::LogDensity,
             opts,
+            rules,
         )
         .map_err(|e| Failure::Refuse(e.to_string()))?;
         fs::write(path, rendered)
@@ -1698,7 +1784,7 @@ fn stablehlo_cmd(
             flatppl_determinizer::sufficient_statistics(&mut lowered);
         }
     }
-    let rendered = flatppl_stablehlo::emit(&lowered, mode, opts)
+    let rendered = flatppl_stablehlo::emit_with_rules(&lowered, mode, opts, rules)
         .map_err(|e| Failure::Refuse(e.to_string()))?;
     match output {
         Some(path) => fs::write(path, rendered).map_err(|e| {
@@ -1722,6 +1808,7 @@ fn stan_cmd(
     data: Option<&Path>,
     manifest: Option<&Path>,
     output: Option<&Path>,
+    rules: &RulePolicy,
 ) -> Result<(), Failure> {
     let resolver = CliResolver::cache_only();
     let (module, bundle, source) = load_and_infer(input, &resolver)?;
@@ -1741,7 +1828,8 @@ fn stan_cmd(
         }
         Failure::Refuse(format!("stan: {e}{site}"))
     };
-    let mut program = flatppl_stan::emit_with_bundle(&module, &bundle, &opts).map_err(refuse)?;
+    let mut program =
+        flatppl_stan::emit_with_bundle_and_rules(&module, &bundle, &opts, rules).map_err(refuse)?;
     let write = |path: &Path, text: String| {
         fs::write(path, text).map_err(|e| {
             Failure::Plain(format!(

@@ -539,7 +539,7 @@ impl<'m> Emitter<'m> {
     /// A negative numeric literal weight (`-0.5`) refuses: §06 `weighted`
     /// takes "a non-negative weight", and its `log(w)` would be NaN. A
     /// computed weight is the model's own.
-    fn nonnegative_weight(&self, w: NodeId) -> Result<()> {
+    pub(super) fn nonnegative_weight(&self, w: NodeId) -> Result<()> {
         let lit = |n: NodeId| match self.m.node(self.resolve(n)) {
             Node::Lit(flatppl_core::Scalar::Int(k)) => Some(*k as f64),
             Node::Lit(flatppl_core::Scalar::Real(x)) => Some(*x),
@@ -881,7 +881,7 @@ impl<'m> Emitter<'m> {
                         None => None,
                     };
                     Ok(match (lw, m) {
-                        (Some(lw), Some(m)) => format!("{lw} + {m}"),
+                        (Some(lw), Some(m)) => super::interval::add_printed(self, &lw, m),
                         (Some(lw), None) => lw,
                         (None, Some(m)) => m.clone(),
                         (None, None) => "0".to_string(),
@@ -1248,6 +1248,7 @@ impl<'m> Emitter<'m> {
         let lp = match &law.trunc {
             Some((lo, hi)) => {
                 let mass = self.interval_lmass(law, lo.as_deref(), hi.as_deref());
+                let mass = self.nonzero_normalizer(mass);
                 let mass = match index {
                     Some(i) => mass.replace(super::structure::LOOP, i),
                     None => mass,
@@ -1470,6 +1471,7 @@ impl<'m> Emitter<'m> {
             return Ok(lp);
         };
         let mass = self.interval_lmass(l, lo.as_deref(), hi.as_deref());
+        let mass = self.nonzero_normalizer(mass);
         let mass = if !mass.contains(loop_) {
             format!("({n} - {count}) * {mass}")
         } else if lo.is_some() && hi.is_some() {

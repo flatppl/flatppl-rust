@@ -7,8 +7,8 @@ use flatppl_core::{
     Call, CallHead, Dim, Idx, Module, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
 };
 use flatppl_stablehlo::{
-    BatchSpec, Dtype, ElemKind, EmitError, EmitOptions, Emitter, Lowered, MlirTy, Value,
-    check_query_inputs, mlir_type_of, optimise_query,
+    BatchSpec, Dtype, ElemKind, EmitError, EmitOptions, Emitter, Lowered, MlirTy, RulePolicy,
+    Value, check_query_inputs, mlir_type_of, optimise_query_with_rules,
 };
 use serde::Serialize;
 
@@ -82,6 +82,7 @@ pub fn emit_query(
     source: Option<&Module>,
     options: &EmitOptions,
     batch: Option<&BatchSpec>,
+    rules: &RulePolicy,
 ) -> Result<Export, EmitError> {
     let dtype = options.dtype;
     flatppl_determinizer::is_flatpdl_with_options(&module, &options.lowering_options()).map_err(
@@ -150,7 +151,7 @@ pub fn emit_query(
             _ => None,
         })
         .collect();
-    if let Some((optimised, rhs)) = optimise_query(&module, options) {
+    if let Some((optimised, rhs)) = optimise_query_with_rules(&module, options, rules) {
         module = optimised;
         output_node = rhs;
     }
@@ -201,10 +202,13 @@ pub fn emit_query(
         args.push((value.ssa.clone(), value.ty.clone(), value.elem));
         values.insert(path, value);
     }
-    let mut emitter = Emitter::with_options(&module, options);
-    if batch.is_some_and(|batch| !batch.shape.is_empty()) {
+    let mut emitter = if batch.is_some_and(|batch| !batch.shape.is_empty()) {
+        let mut emitter = Emitter::with_options_and_rules(&module, options, rules);
         emitter.lower_for_host_batch();
-    }
+        emitter
+    } else {
+        Emitter::for_query_with_rules(&module, options, rules)
+    };
     bind_inputs(
         &mut emitter,
         &module,
@@ -246,7 +250,7 @@ pub fn emit_query(
         let tensorized = if primitives.is_some() {
             primitives
         } else if tensorize && !batch.shape.is_empty() {
-            let mut e = Emitter::with_options(&module, options);
+            let mut e = Emitter::with_options_and_rules(&module, options, rules);
             e.lower_for_host_batch();
             e.set_runtime_batch_rank(batch.shape.len());
             let mut physical = Vec::new();
@@ -317,8 +321,9 @@ pub(crate) fn emit_prepared(
     source: &Module,
     options: &EmitOptions,
     batch: Option<&BatchSpec>,
+    rules: &RulePolicy,
 ) -> Result<Export, EmitError> {
-    let preparation = emit_query(prepared.preparation, None, options, None)?;
+    let preparation = emit_query(prepared.preparation, None, options, None, rules)?;
     let outputs = match &preparation.output {
         Schema::Tuple { items } => items.as_slice(),
         single => std::slice::from_ref(single),
@@ -327,7 +332,7 @@ pub(crate) fn emit_prepared(
     if !preparation.inputs.is_empty() || outputs.len() != summaries.len() {
         return Err(EmitError::whole("invalid fixed-data preparation signature"));
     }
-    let mut score = emit_query(prepared.score, Some(source), options, batch)?;
+    let mut score = emit_query(prepared.score, Some(source), options, batch, rules)?;
     let declared = score
         .inputs
         .len()

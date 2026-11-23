@@ -1,7 +1,7 @@
 //! Demand just the paired cells of a matrix selected by two fixed one-hot tables.
 
 use flatppl_core::Idx;
-use flatppl_optimise::{MatrixProjectionFact, plan_matrix_projection};
+use flatppl_optimise::{MatrixProjectionFact, plan_matrix_projection_with_rules};
 
 use super::*;
 
@@ -24,6 +24,7 @@ impl Emitter<'_> {
             || self.region_depth != 0
             || !self.broadcast_frame.is_empty()
             || self.host_batch
+            || !self.rules.enables_ruleset("matrix-projection")
         {
             return None;
         }
@@ -94,7 +95,7 @@ impl Emitter<'_> {
             SumTree(matrix, padded as i64, i64::from(levels)),
             Ones(weights, *weight_count as i64),
         ];
-        let plan = plan_matrix_projection(output, &facts)?;
+        let plan = plan_matrix_projection_with_rules(output, &facts, &self.rules)?;
         if plan.matrix != matrix
             || plan.row_selector != row
             || plan.column_selector != col

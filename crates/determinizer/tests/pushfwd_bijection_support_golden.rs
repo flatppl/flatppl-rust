@@ -214,7 +214,7 @@ fn pushfwd_sqrt_over_continuous_nonnegative_support_lowers_with_its_volume_term(
         "a continuous base keeps the change of variables:\n{p}"
     );
     assert!(
-        p.contains("(abs 0.5)") && p.contains("(mul -1.0"),
+        p.contains("(abs 0.5)") && p.contains("(mul (neg 1.0) "),
         "the `pow` log-volume log|½| + ((½−1)/½)·log y is emitted:\n{p}"
     );
 }

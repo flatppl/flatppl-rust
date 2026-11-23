@@ -1,4 +1,4 @@
-use flatppl_host::{BatchSpec, Context, EmitOptions};
+use flatppl_host::{BatchSpec, Context, EmitOptions, RulePolicy};
 use serde_json::json;
 
 #[test]
@@ -342,6 +342,53 @@ fn batched_scan_keeps_one_time_loop() -> Result<(), Box<dyn std::error::Error>> 
         assert!(!exported.stablehlo.contains("main_cell"));
         assert!(exported.stablehlo.contains("tensor<3x8xf32>"));
     }
+    Ok(())
+}
+
+#[test]
+fn a_batched_terminal_scan_keeps_the_mapped_history() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "seed = external(reals)\nxs = external(cartpow(reals, 5))\n\
+         history = scan((s,x) -> tanh(s+x), seed, xs)\n\
+         inputs = (seed,xs)\noutputs = history[5]",
+        None,
+        None,
+    )?;
+    let options = EmitOptions::default();
+    let unbatched = query.compile(&options)?.stablehlo;
+    let batched = query
+        .compile_batched(
+            &options,
+            &BatchSpec {
+                shape: vec![3],
+                input_axes: vec![vec![Some(0)], vec![None]],
+            },
+        )?
+        .stablehlo;
+    assert_eq!(unbatched.matches("stablehlo.while").count(), 1);
+    let scan = unbatched
+        .lines()
+        .find(|line| line.contains("stablehlo.while"))
+        .unwrap();
+    assert!(scan.contains("tensor<1xf32>"), "{scan}");
+    assert_eq!(
+        unbatched.matches("stablehlo.dynamic_update_slice").count(),
+        1
+    );
+    let rules = RulePolicy::new(&["scan-demand.terminal-choice"], &[])?;
+    let masked = query.compile_with_rules(&options, &rules)?.stablehlo;
+    let scan = masked
+        .lines()
+        .find(|line| line.contains("stablehlo.while"))
+        .expect("scan loop");
+    assert!(scan.contains("tensor<5xf32>"), "{scan}");
+    assert_eq!(query.compile(&options)?.stablehlo, unbatched);
+    assert_eq!(batched.matches("stablehlo.while").count(), 1);
+    assert!(
+        batched.contains("stablehlo.dynamic_update_slice"),
+        "{batched}"
+    );
+    assert!(batched.contains("tensor<3x5xf32>"), "{batched}");
     Ok(())
 }
 
