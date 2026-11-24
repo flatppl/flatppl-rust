@@ -77,7 +77,7 @@
 //! branch pair) — it is a limit of what the boundary can express. A host that
 //! needs the distinction must carry it out of band.
 //!
-//! ## Records flatten depth-first at the function boundary
+//! ## Aggregate results flatten depth-first at the function boundary
 //!
 //! Inside the emitter a record is an ordered map of field name to value, in
 //! declared field order, and a field may itself be a record (spec §03
@@ -94,12 +94,16 @@
 //! place. Field access (`data.y`, `p.inner.v`) resolves to that leaf's
 //! argument. Argument numbering is positional over the flattened list, so an
 //! entry after a destructured one shifts by its leaf count.
+//! A promoted fixed tuple input follows the same depth-first convention in
+//! positional order. Its projections read the corresponding runtime arguments.
 //!
 //! An output whose value is a record — a `record(...)`, a §07 table reduction,
 //! a table row `t[i]`, a record-valued `ifelse` or broadcast — contributes one
 //! result per leaf in the same order. The CLI writes no metadata, so this
 //! order is the ABI; `flatppl-host`'s query `Schema` records the field path of
 //! each leaf.
+//! A tuple output contributes its components in positional order, recursively
+//! flattening tuple and record components into the same tensor result list.
 //!
 //! `inputs` is authoritative and exhaustive: every `elementof` parameter in
 //! the module must be listed, or emission refuses. Each `outputs` entry is a

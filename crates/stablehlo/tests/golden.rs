@@ -9733,6 +9733,53 @@ outputs = (v1, v2, s3)
     );
 }
 
+#[test]
+fn emit_sample_abi_keeps_both_fields_of_an_authored_tuple() {
+    let src = "\
+s = external(rngstates)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+v, s2 = rand(lawof(x), s)
+pair = (v, v .* [1.0, 2.0])
+inputs = s
+outputs = pair
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_sample(&d);
+    assert!(
+        out.contains("-> (tensor<f32>, tensor<2xf32>, tensor<2xui64>)"),
+        "{out}"
+    );
+}
+
+#[test]
+fn emit_logdensity_promotes_tuple_components_in_positional_order() {
+    let src = "\
+shared = 9.0
+pair = (shared, (shared, record(v = [1.0, 2.0])))
+alias = pair
+inputs = (alias, shared)
+outputs = (pair[2][2].v, pair[2][1], pair[1], shared)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(out.contains("return %arg2, %arg1, %arg0, %arg3"), "{out}");
+}
+
+#[test]
+fn emit_logdensity_projects_a_nested_tuple_constructed_at_the_call() {
+    let src = "\
+score(p) = ifelse(p[2][1], p[2][2], 0.0) + real(p[1])
+code = external(integers)
+gate = external(booleans)
+weight = elementof(reals)
+inputs = (code, gate, weight)
+outputs = score((code, (gate, weight)))
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(out.contains("stablehlo.select %arg1, %arg2"), "{out}");
+}
+
 /// A sample query needs at least one output.
 #[test]
 fn emit_sample_abi_refuses_empty_outputs() {

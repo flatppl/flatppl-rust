@@ -75,7 +75,7 @@ use flatppl_core::{
     CallHead, Inputs, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
 };
 
-use crate::emitter::Emitter;
+use crate::emitter::{BoundTuple, Emitter};
 use crate::mlir::{ElemKind, Lowered, MlirTy, Value};
 use crate::refuse::EmitError;
 use crate::types::{mlir_type_of, mlir_type_of_ty};
@@ -306,11 +306,7 @@ pub(crate) fn emit_logdensity_abi(
     let mut rets_vals: Vec<Value> = Vec::with_capacity(outputs.len());
     for &node in outputs {
         let before = rets_vals.len();
-        if let Some(indices) = crate::indices::outputs(&mut e, node) {
-            rets_vals.extend(indices?);
-        } else {
-            lower_output(&mut e, node, &mut rets_vals)?;
-        }
+        lower_output(&mut e, node, &mut rets_vals)?;
         // A drawn successor state is threaded by `@sample` (spec §07 rng ABI,
         // §13 output reduction). A key computed from a seed is an ordinary value.
         if rets_vals[before..].iter().any(|v| v.ty == MlirTy::Key) && reaches_sample(m, node) {
@@ -607,9 +603,27 @@ fn lower_sample_output(
     lower_output(e, resolved, out)
 }
 
-/// Append the result(s) of one output: one per tensor leaf, depth-first in
-/// declared field order, so a record output becomes one result per field.
+/// Append the tensor leaves of an output, depth-first in tuple or field order.
 fn lower_output(e: &mut Emitter, node: NodeId, out: &mut Vec<Value>) -> Result<(), EmitError> {
+    if matches!(e.type_of(node), Some(Type::Tuple(_))) {
+        if let Some(input) = e.tuple_input(node) {
+            input.leaves(out);
+            return Ok(());
+        }
+        let resolved = e.resolve_tuple_projections(node);
+        if let Some(indices) = crate::indices::outputs(e, resolved) {
+            out.extend(indices?);
+            return Ok(());
+        }
+        if let Node::Call(call) = e.node(resolved)
+            && matches!(call.head, CallHead::Builtin(head) if e.resolve(head) == "tuple")
+        {
+            for item in call.args.clone() {
+                lower_output(e, item, out)?;
+            }
+            return Ok(());
+        }
+    }
     let start = out.len();
     e.lower_value(node)?.leaves(out);
     if out.len() == start {
@@ -627,7 +641,8 @@ fn lower_output(e: &mut Emitter, node: NodeId, out: &mut Vec<Value>) -> Result<(
 /// `value` slot; every other query shape (a value-terminal `get0(sample, 0)`,
 /// a `record(...)`, a bare ref) is already the value and is returned unchanged.
 fn query_value_component(m: &Module, query_rhs: NodeId) -> NodeId {
-    if let Node::Call(c) = m.node(query_rhs)
+    if m.is_sample_result(query_rhs)
+        && let Node::Call(c) = m.node(query_rhs)
         && let CallHead::Builtin(sym) = c.head
         && m.resolve(sym) == "tuple"
         && c.args.len() == 2
@@ -874,6 +889,12 @@ fn bind_input(
         ));
     }
 
+    if let Some(ty @ Type::Tuple(_)) = m.type_of(rhs) {
+        let mut path = vec![m.resolve(sym).to_owned()];
+        let value = bind_tuple_leaves(m, e, rhs, ty, &mut path, opts, args, next_arg)?;
+        e.bind_tuple_input(rhs, value);
+        return Ok(());
+    }
     if let Some(columns) = aggregate_columns(m, rhs) {
         // An aggregate with no columns would contribute no argument at all and
         // shrink the emitted arity below the declared one — refuse instead.
@@ -912,6 +933,31 @@ fn bind_input(
     );
     args.push((ssa, ty, elem));
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_tuple_leaves(
+    m: &Module,
+    e: &mut Emitter,
+    rhs: NodeId,
+    ty: &Type,
+    path: &mut Vec<String>,
+    opts: &EmitOptions,
+    args: &mut Vec<(String, MlirTy, ElemKind)>,
+    next_arg: &mut usize,
+) -> Result<BoundTuple, EmitError> {
+    let Type::Tuple(items) = ty else {
+        return bind_leaves(m, e, rhs, ty, path, opts, args, next_arg).map(BoundTuple::Value);
+    };
+    let mut values = Vec::with_capacity(items.len());
+    for (index, ty) in items.iter().enumerate() {
+        path.push((index + 1).to_string());
+        values.push(bind_tuple_leaves(
+            m, e, rhs, ty, path, opts, args, next_arg,
+        )?);
+        path.pop();
+    }
+    Ok(BoundTuple::Items(values))
 }
 
 /// Allocate one argument per tensor leaf of `ty`, depth-first in declared field

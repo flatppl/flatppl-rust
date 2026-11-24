@@ -171,6 +171,21 @@ impl AxisReduce {
     }
 }
 
+#[derive(Clone)]
+pub(crate) enum BoundTuple {
+    Items(Vec<Self>),
+    Value(Lowered),
+}
+
+impl BoundTuple {
+    pub(crate) fn leaves(&self, out: &mut Vec<Value>) {
+        match self {
+            Self::Items(items) => items.iter().for_each(|item| item.leaves(out)),
+            Self::Value(value) => value.clone().leaves(out),
+        }
+    }
+}
+
 /// Emits textual StableHLO into an internal buffer while assigning fresh SSA
 /// names and tracking which FlatPDL [`NodeId`]s have already been lowered.
 #[derive(Clone)]
@@ -267,6 +282,7 @@ pub struct Emitter<'m> {
     /// `memo`; a field access reaching it resolves here instead
     /// ([`Emitter::lower_field`]).
     columns: HashMap<(NodeId, String), Lowered>,
+    tuple_inputs: HashMap<NodeId, BoundTuple>,
 }
 
 impl<'m> Emitter<'m> {
@@ -312,6 +328,7 @@ impl<'m> Emitter<'m> {
             scan_index: None,
             batch_shape: None,
             columns: HashMap::new(),
+            tuple_inputs: HashMap::new(),
         }
     }
 
@@ -4565,7 +4582,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// If `args` is `get`/`get0`'s `[container, index]` pair and `container`
-    /// resolves (one `(%ref self x)` hop, [`Emitter::resolve_ref_one`]) to a
+    /// resolves through refs and nested projections to a
     /// literal `tuple(...)` call with a literal-integer `index`, return the
     /// projected element's [`NodeId`]. The determiniser builds a
     /// `tuple(value, advanced_rng)` for a DESTRUCTURED `rand` (spec §07's full
@@ -4577,8 +4594,19 @@ impl<'m> Emitter<'m> {
     /// when `container` is not a tuple literal (the caller then tries
     /// [`Emitter::sample_tuple_slot`], else the ordinary tensor `get`).
     fn tuple_projection(&self, args: &[NodeId], base: i64) -> Option<NodeId> {
+        self.tuple_projection_at(args, base, 0)
+    }
+
+    fn tuple_projection_at(&self, args: &[NodeId], base: i64, depth: usize) -> Option<NodeId> {
         let [container, index] = <[NodeId; 2]>::try_from(args).ok()?;
-        let resolved = self.resolve_ref_one(container);
+        let resolved = if matches!(self.type_of(container), Some(Type::Tuple(_))) {
+            self.resolve_tuple_projections_at(container, depth + 1)
+        } else {
+            self.resolve_ref_one(container)
+        };
+        if self.memo.contains_key(&resolved) || self.tuple_input(resolved).is_some() {
+            return None;
+        }
         let elems = match self.m.node(resolved) {
             Node::Call(c) => match c.head {
                 CallHead::Builtin(sym) if self.m.resolve(sym) == "tuple" => &c.args,
@@ -4590,19 +4618,23 @@ impl<'m> Emitter<'m> {
             Node::Lit(Scalar::Int(i)) => *i,
             _ => return None,
         };
-        let idx = selector - base;
-        if idx < 0 || idx as usize >= elems.len() {
-            return None;
-        }
-        Some(elems[idx as usize])
+        let idx = usize::try_from(selector.checked_sub(base)?).ok()?;
+        elems.get(idx).copied()
     }
 
     /// Resolve refs and literal tuple projections before inspecting a record.
     /// Destructured `rand` values reach their record through `get(tuple, 1)`;
     /// lowering that projection as a tensor would lose the record's fields.
-    pub(crate) fn resolve_tuple_projections(&self, mut id: NodeId) -> NodeId {
+    pub(crate) fn resolve_tuple_projections(&self, id: NodeId) -> NodeId {
+        self.resolve_tuple_projections_at(id, 0)
+    }
+
+    fn resolve_tuple_projections_at(&self, mut id: NodeId, depth: usize) -> NodeId {
+        if depth >= flatppl_core::DEFAULT_MAX_DEPTH {
+            return id;
+        }
         let mut seen = HashSet::new();
-        while seen.insert(id) && !self.memo.contains_key(&id) {
+        while seen.insert(id) && !self.memo.contains_key(&id) && self.tuple_input(id).is_none() {
             let resolved = self.resolve_ref_one(id);
             if resolved != id {
                 id = resolved;
@@ -4616,7 +4648,7 @@ impl<'m> Emitter<'m> {
                 CallHead::Builtin(sym) if self.m.resolve(sym) == "get0" => 0,
                 _ => break,
             };
-            let Some(projected) = self.tuple_projection(&call.args, base) else {
+            let Some(projected) = self.tuple_projection_at(&call.args, base, depth) else {
                 break;
             };
             id = projected;
@@ -4638,6 +4670,47 @@ impl<'m> Emitter<'m> {
     pub fn bind_field(&mut self, container: NodeId, name: String, value: Lowered) {
         let container = self.column_container(container);
         self.columns.insert((container, name), value);
+    }
+
+    pub(crate) fn bind_tuple_input(&mut self, rhs: NodeId, value: BoundTuple) {
+        self.tuple_inputs.insert(rhs, value);
+    }
+
+    pub(crate) fn tuple_input(&self, mut node: NodeId) -> Option<&BoundTuple> {
+        if self.tuple_inputs.is_empty() {
+            return None;
+        }
+        let mut path = Vec::new();
+        loop {
+            let resolved = self.resolve_ref_one(node);
+            if let Some(input) = self.tuple_inputs.get(&resolved) {
+                return path.into_iter().rev().try_fold(input, |part, index| {
+                    let BoundTuple::Items(items) = part else {
+                        return None;
+                    };
+                    items.get(index)
+                });
+            }
+            let Node::Call(call) = self.m.node(resolved) else {
+                return None;
+            };
+            let base = match call.head {
+                CallHead::Builtin(head) if self.m.resolve(head) == "get" => 1,
+                CallHead::Builtin(head) if self.m.resolve(head) == "get0" => 0,
+                _ => return None,
+            };
+            let &[container, selector] = call.args.as_ref() else {
+                return None;
+            };
+            if !matches!(self.type_of(container), Some(Type::Tuple(_))) {
+                return None;
+            }
+            let Node::Lit(Scalar::Int(index)) = self.m.node(selector) else {
+                return None;
+            };
+            path.push(usize::try_from(index.checked_sub(base)?).ok()?);
+            node = container;
+        }
     }
 
     /// Resolve `id` through at most one level of `(%ref self x)` indirection
@@ -5340,6 +5413,11 @@ impl<'m> Emitter<'m> {
                         // ordinary case) falls through to `ops::lower_builtin`'s
                         // generic rank-1-tensor `get`/`get0`.
                         let base = if name == "get0" { 0 } else { 1 };
+                        if let Some(BoundTuple::Value(Lowered::Tensor(value))) =
+                            self.tuple_input(id)
+                        {
+                            return Ok(value.clone());
+                        }
                         if let Some((container, field)) = self.record_projection(&call.args) {
                             return match self.lower_field(container, &field)? {
                                 Lowered::Tensor(value) => Ok(value),
