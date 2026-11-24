@@ -25,8 +25,8 @@ use std::fmt;
 
 use flatppl_core::graph::{build_call, expect_builtin_call};
 use flatppl_core::{
-    Binding, BindingId, CallHead, DEFAULT_MAX_DEPTH, Dim, Module, Node, NodeId, Ref, RefNs, Scalar,
-    ScalarType, Symbol, Type,
+    Binding, BindingId, Call, CallHead, DEFAULT_MAX_DEPTH, Dim, Module, Node, NodeId, Ref, RefNs,
+    Scalar, ScalarType, Symbol, Type,
 };
 
 use flatppl_determinizer::LoweringOptions;
@@ -978,6 +978,7 @@ impl<'a> Plan<'a> {
         let (op, args, broadcast) = if let Some((rule, args)) =
             density_args(self.module, self.query, node)
                 .or_else(|| transforms::args(self.module, self.query, call, op))
+                .or_else(|| real_bessel_j_args(self.module, self.query, call, op))
         {
             (rule, args, op == "broadcast")
         } else if let Some((rule, arg)) =
@@ -1138,6 +1139,55 @@ fn special_op(module: &Module, callee: NodeId) -> Option<&'static str> {
         "polygamma" => Some("polygamma"),
         _ => None,
     }
+}
+
+// Keep the principal-branch projection in the derivative. The StableHLO
+// backend consumes Bessel J through its supported complex projections.
+fn real_bessel_j_args(
+    module: &Module,
+    query: &Query<'_>,
+    call: &Call,
+    op: &str,
+) -> Option<(&'static str, Vec<NodeId>)> {
+    let [argument] = call.args.as_ref() else {
+        return None;
+    };
+    if op != "real" {
+        return None;
+    }
+    let Key::Node(value) = query.key(module, *argument).ok()? else {
+        return None;
+    };
+    let Node::Call(Call {
+        head: CallHead::User(callee),
+        args,
+        ..
+    }) = module.node(value)
+    else {
+        return None;
+    };
+    let (namespace, member) = flatppl_determinizer::standard_function(module, *callee)?;
+    if namespace != "special-functions" || member != "bessel_j" {
+        return None;
+    }
+    let &[order, argument] = args.as_ref() else {
+        return None;
+    };
+    let in_range = |node, lower, upper| {
+        use flatppl_core::ValueSet;
+        match module.valueset_of(node) {
+            Some(ValueSet::Interval(lo, hi)) => lower <= *lo && *lo <= *hi && *hi <= upper,
+            Some(ValueSet::UnitInterval) => lower <= 0.0 && 1.0 <= upper,
+            _ => false,
+        }
+    };
+    let bounded = in_range(order, 0.0, 16.0) && in_range(argument, 0.125, 4.0);
+    let op = if bounded {
+        "bounded real Bessel J"
+    } else {
+        "real Bessel J"
+    };
+    Some((op, args.to_vec()))
 }
 
 fn density_args(
@@ -1490,6 +1540,12 @@ impl<'a> Step<'a> {
         slot: usize,
     ) -> Result<&'r rules::Template, Error> {
         rules.get(self.rule_key(mode, slot)).ok_or_else(|| {
+            if self.op == "real Bessel J" && slot == 0 {
+                return Error::new(
+                    Some(self.node),
+                    "source AD differentiates bessel_j with respect to its order only when the order is proven in [0, 16] and the argument in [0.125, 4]",
+                );
+            }
             if self.op == "Poisson log density" && slot == 1 {
                 return Error::new(
                     Some(self.node),

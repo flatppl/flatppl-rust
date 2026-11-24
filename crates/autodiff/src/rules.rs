@@ -245,6 +245,11 @@ impl Template {
                 let (&primal, selectors) = values.step.args.split_first()?;
                 tensor::scatter(emitter, bar, primal, selectors, self.int(*base)?)?
             }
+            ("BesselOrder", [order, argument]) => {
+                let order = self.emit(*order, emitter, values)?;
+                let argument = self.emit(*argument, emitter, values)?;
+                bessel_order(&mut emitter.module, order, argument)
+            }
             ("CumulativeExtreme" | "CumulativeExtremeForward", [maximum]) => {
                 let [input] = *values.step.args.as_slice() else {
                     return None;
@@ -479,4 +484,54 @@ fn special_call(
         named: Vec::new().into(),
         inputs: None,
     }))
+}
+
+// DLMF 10.15.1. For 0 <= ν <= 16 and 1/8 <= x <= 4 the first
+// omitted derivative term is bounded by 2^16 (4^32/(32!)^2)
+// (log(16) + log(49)). Subsequent bounds have ratio below 0.004.
+fn bessel_order(module: &mut Module, order: NodeId, argument: NodeId) -> NodeId {
+    use crate::callbacks::{callback_input, reify};
+
+    let mut parameters = Vec::new();
+    let k = callback_input(module, "term", &mut parameters);
+    let nu = callback_input(module, "order", &mut parameters);
+    let log_half = callback_input(module, "loghalf", &mut parameters);
+    let zero = tensor::int(module, 0);
+    let one = tensor::int(module, 1);
+    let two = tensor::int(module, 2);
+    let one_real = real(module, 1.0);
+    let minus_one = real(module, -1.0);
+    let parity = build_call(module, "mod", &[k, two]);
+    let even = build_call(module, "equal", &[parity, zero]);
+    let sign = build_call(module, "ifelse", &[even, one_real, minus_one]);
+    let kp1 = build_call(module, "add", &[k, one]);
+    let gamma_arg = build_call(module, "add", &[nu, kp1]);
+    let log_k_factorial = build_call(module, "loggamma", &[kp1]);
+    let log_gamma = build_call(module, "loggamma", &[gamma_arg]);
+    let twice_k = build_call(module, "mul", &[two, k]);
+    let power = build_call(module, "add", &[nu, twice_k]);
+    let log_power = build_call(module, "mul", &[power, log_half]);
+    let exponent = build_call(module, "sub", &[log_power, log_k_factorial]);
+    let exponent = build_call(module, "sub", &[exponent, log_gamma]);
+    let magnitude = build_call(module, "exp", &[exponent]);
+    let coefficient = build_call(module, "mul", &[sign, magnitude]);
+    let digamma = special_call(module, "digamma", vec![gamma_arg], false);
+    let factor = build_call(module, "sub", &[log_half, digamma]);
+    let term = build_call(module, "mul", &[coefficient, factor]);
+    let function = reify(module, term, parameters);
+
+    let terms = tensor::int(module, 32);
+    let zeros = build_call(module, "zeros", &[terms]);
+    let indices = build_call(module, "indicesof0", &[zeros]);
+    let log_x = build_call(module, "log", &[argument]);
+    let log_two = real(module, std::f64::consts::LN_2);
+    let log_half = build_call(module, "sub", &[log_x, log_two]);
+    let held_order = build_call(module, "vector", &[order]);
+    let held_log_half = build_call(module, "vector", &[log_half]);
+    let terms = build_call(
+        module,
+        "broadcast",
+        &[function, indices, held_order, held_log_half],
+    );
+    build_call(module, "sum", &[terms])
 }

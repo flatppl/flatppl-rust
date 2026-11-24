@@ -23,6 +23,7 @@
   (DropAxes Expr)
   (ArrayPullback Expr)
   (Scatter Expr i64)
+  (BesselOrder Expr Expr)
   (ForwardCall String i64)
   (Insert i64)
   (Int i64)
@@ -129,6 +130,19 @@
 (rewrite (Pullback "polygamma" 2 1)
   (Binary "mul" (Bar) (SpecialBinary "polygamma" (Binary "add" (Arg 0) (Int 1)) (Arg 1)))
   :ruleset pullbacks)
+
+; DLMF 10.6.1. Project the principal branch after shifting the order so
+; the same formula also differentiates the real projection along z < 0.
+(rewrite (Pullback "real Bessel J" 2 1)
+  (Binary "mul" (Bar) (Binary "mul" (Real 0.5)
+    (Binary "sub"
+      (Unary "real" (SpecialBinary "bessel_j" (Binary "sub" (Arg 0) (Real 1.0)) (Arg 1)))
+      (Unary "real" (SpecialBinary "bessel_j" (Binary "add" (Arg 0) (Real 1.0)) (Arg 1)))))) :ruleset pullbacks)
+
+(rewrite (Pullback "bounded real Bessel J" 2 0)
+  (Binary "mul" (Bar) (BesselOrder (Arg 0) (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "bounded real Bessel J" 2 1)
+  (Pullback "real Bessel J" 2 1) :ruleset pullbacks)
 
 ; Normal log density argument order is (mu, sigma, observation).
 ; R is an internal template term for the standardized residual.
