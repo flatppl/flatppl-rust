@@ -120,10 +120,40 @@ reported = identity(reading)
     }
 }
 
+#[cfg(feature = "optimise")]
+#[test]
+fn disabling_all_rules_also_keeps_cell_reads() {
+    let source = r#"reading = external(reals)
+_settings = record(scale = 2.0, unused = exp(3.0))
+scaled = reading * get(_settings, "scale")
+"#;
+    let scratch = Scratch::new("demand-prune-mask");
+    let lesson = model(&scratch, "lesson.flatppl", source);
+    assert_eq!(
+        success(run(&["optimise"], &[&lesson])),
+        source.replace(r#"get(_settings, "scale")"#, "2.0")
+    );
+    for selection in ["pass:demand-prune", "all"] {
+        assert_eq!(
+            success(run(
+                &["optimise", "--disable-egglog", selection],
+                &[&lesson]
+            )),
+            source,
+            "{selection}"
+        );
+    }
+}
+
 #[test]
 fn rule_names_are_discoverable_and_invalid_names_are_rejected() {
     let catalogue = success(run(&["egglog-rules"], &[]));
-    for selector in ["all", "rule:portable.double-negation", "ruleset:portable"] {
+    for selector in [
+        "all",
+        "rule:portable.double-negation",
+        "ruleset:portable",
+        "pass:demand-prune",
+    ] {
         assert!(
             catalogue.split_whitespace().any(|word| word == selector),
             "missing {selector} in:\n{catalogue}"
@@ -146,7 +176,11 @@ fn rule_names_are_discoverable_and_invalid_names_are_rejected() {
         #[cfg(feature = "stan")]
         "stan",
     ] {
-        for selector in ["rule:not-a-flatppl-rule", "ruleset:not-a-flatppl-ruleset"] {
+        for selector in [
+            "rule:not-a-flatppl-rule",
+            "ruleset:not-a-flatppl-ruleset",
+            "pass:not-a-flatppl-pass",
+        ] {
             let output = run(&[verb, "--disable-egglog", selector], &[&input]);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!output.status.success(), "{verb} accepted {selector}");

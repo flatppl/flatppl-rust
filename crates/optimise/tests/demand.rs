@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use flatppl_core::{Module, Node, NodeId, Scalar};
-use flatppl_optimise::{Dtype, Profile, Target, optimise};
+use flatppl_optimise::{Dtype, Profile, RulePolicy, Target, optimise, optimise_with_rules};
 
 fn infer(source: &str) -> Module {
     let mut module = flatppl_syntax::parse(source).unwrap();
@@ -141,4 +141,34 @@ fn portable_demand_keeps_nonselected_runtime_ancestry() {
         references(&out, rhs(&out, "outputs")),
         HashSet::from(["x", "y"])
     );
+}
+
+#[test]
+fn a_disabled_demand_pass_keeps_cell_reads() {
+    let m = infer(QUERY);
+    let pass = RulePolicy::from_selectors(["pass:demand-prune".parse().unwrap()]);
+    for rules in [pass, RulePolicy::all_disabled()] {
+        let out =
+            optimise_with_rules(&m, None, Profile::Portable, &rules).unwrap_or_else(|| m.clone());
+        assert!(references(&out, rhs(&out, "left")).contains("_bundle"));
+        assert!(references(&out, rhs(&out, "chosen")).contains("_payload"));
+    }
+}
+
+#[test]
+fn stan_reads_of_a_fixed_record_keep_their_binding() {
+    let mut m = infer(
+        "
+        a = elementof(cartpow(reals, 3))
+        s = elementof(posreals)
+        d = (g = [3, 1, 2, 1, 3], y = [0.4, 1.0, 1.3, 2.0, 0.3])
+        inputs = (a, s)
+        outputs = logdensityof(Normal.(a[d.g], s), d.y)
+    ",
+    );
+    let outputs = m.intern("outputs");
+    let out = optimise(&m, Some(&[outputs]), Profile::Stan).unwrap_or_else(|| m.clone());
+    assert!(references(&out, rhs(&out, "outputs")).contains("d"));
+    let portable = optimise(&m, Some(&[outputs]), Profile::Portable).expect("demand pruning");
+    assert!(!references(&portable, rhs(&portable, "outputs")).contains("d"));
 }

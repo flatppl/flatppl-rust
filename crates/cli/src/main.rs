@@ -426,8 +426,8 @@ enum Command {
 ))]
 #[derive(clap::Args)]
 struct EgglogArgs {
-    /// Disable an egglog rule or ruleset. Repeat for multiple selectors.
-    /// Use `all`, `rule:<id>`, or `ruleset:<id>` from `flatppl egglog-rules`.
+    /// Disable an egglog rule, ruleset or optimiser pass. Repeat for multiple selectors.
+    /// Use `all`, `rule:<id>`, `ruleset:<id>`, or `pass:<id>` from `flatppl egglog-rules`.
     #[arg(long, value_name = "SELECTOR")]
     disable_egglog: Vec<RuleSelector>,
 }
@@ -615,6 +615,9 @@ fn main() -> ExitCode {
             }
             for rule in flatppl_optimise::available_rules() {
                 println!("rule:{}\truleset:{}", rule.name, rule.ruleset);
+            }
+            for pass in flatppl_optimise::available_passes() {
+                println!("pass:{pass}");
             }
             Ok(())
         }
