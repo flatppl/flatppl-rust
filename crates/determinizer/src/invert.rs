@@ -480,8 +480,17 @@ fn derive_uniform_affine(
     ) else {
         return Err(refuse_lower_dimensional(f, m));
     };
+    refuse_zero_scale_step(m, &steps)?;
+    Ok(Some(uniform_affine_bijection(m, &steps, domain, deficit)))
+}
+
+/// A fixed zero scale collapses a uniform affine map onto a hyperplane.
+fn refuse_zero_scale_step(
+    m: &Module,
+    steps: &[flatppl_infer::AffineStep],
+) -> Result<(), RefuseError> {
     use flatppl_infer::AffineStep;
-    for step in &steps {
+    for step in steps {
         if let AffineStep::Mul(a) | AffineStep::Div(a) = step
             && has_static_zero(m, *a)
         {
@@ -493,7 +502,21 @@ fn derive_uniform_affine(
             ));
         }
     }
-    // The inverse undoes the steps outermost first, cell by cell.
+    Ok(())
+}
+
+/// The change of variables of the uniform affine map `steps` (outermost first) of
+/// a law whose support lacks `deficit` dimensions: the inverse undoes the steps
+/// cell by cell, and each of the cells − deficit free coordinates scales by the
+/// product of the scales. Shared by the written map ([`derive_uniform_affine`])
+/// and `locscale` with a scalar scale ([`derive_locscale`]).
+fn uniform_affine_bijection(
+    m: &mut Module,
+    steps: &[flatppl_infer::AffineStep],
+    domain: &Type,
+    deficit: u64,
+) -> Bijection {
+    use flatppl_infer::AffineStep;
     let f_inv = lambda(m, |m, y| {
         steps.iter().fold(y, |acc, step| {
             let (op, args) = match *step {
@@ -553,7 +576,7 @@ fn derive_uniform_affine(
             None => real_lit(m, 0.0),
         }),
     };
-    Ok(Some(Bijection { f_inv, logvol }))
+    Bijection { f_inv, logvol }
 }
 
 /// An elementwise location-scale map `x .* a .+ b` over a vector has the diagonal
@@ -2761,14 +2784,18 @@ fn derive_matrix_affine(
 ///   log|scale|` (constant; a scalar affine map's forward derivative is
 ///   `scale`). Cross-check: `locscale(Normal(0,1), s, c)` emits
 ///   `logdensityof(Normal(0,1), (y−s)/c) − log|c|` = `log N(y; s, c)`.
-/// * **Vector variate** — the MvNormal Cholesky case: `scale` must be a square
+/// * **Vector variate, scalar scale** — the uniform affine map of the chart rule
+///   ([`uniform_affine_bijection`]): `f_inv(y) = (y .- shift) ./ scale`, `logvol =
+///   (n − deficit)·log|scale|`, where `deficit` is the dimensions the base's support
+///   lacks (0 off a `stdsimplex`/`zerosum` support). The same emission as the
+///   written map `scale .* x .+ shift` over that support.
+/// * **Vector variate, matrix scale** — the MvNormal Cholesky case: `scale` must be a square
 ///   matrix `L`, `f_inv(y) = linsolve(L, y − shift)`, `logvol = logabsdet(L)`
 ///   (constant; §07). Identical emission to [`derive_matrix_affine`].
 ///
 /// Refuse (never mislower) when: the base variate domain is neither confirmed
-/// scalar nor a vector; a vector variate is paired with a non-matrix `scale`
-/// (a scalar scale over an n-vector has forward log-volume `n·log|scale|`, not
-/// `log|scale|` — the same danger [`derive_bijection`]'s vector guard closes);
+/// scalar nor a vector; a vector variate is paired with a `scale` that is neither
+/// a scalar nor a matrix; a fixed scalar `scale` over a vector is zero;
 /// the matrix `scale` is a CONFIRMED non-square matrix; a vector variate is paired
 /// with a `shift` of CONFIRMED disagreeing shape ([`shift_confirmed_shape_mismatch`]);
 /// or a scalar variate is paired with a CONFIRMED non-scalar `shift` or `scale`. The
@@ -2784,21 +2811,30 @@ fn derive_matrix_affine(
 /// shares `mu`/`L`.
 pub(crate) fn derive_locscale(
     m: &mut Module,
+    node: NodeId,
     shift: NodeId,
     scale: NodeId,
     domain: &Type,
+    deficit: u64,
 ) -> Result<Bijection, RefuseError> {
     if domain_is_vector(domain) {
-        // Matrix-affine (MvNormal construction): scale is a square matrix L.
-        if !type_is_matrix(m, scale) {
+        // §07 `mul` scales every cell by a scalar, so a scalar scale is the uniform
+        // affine map of the chart rule. Otherwise the MvNormal construction: a square
+        // matrix L.
+        let scalar_scale = matches!(m.node(resolve_ref(m, scale).0), Node::Lit(_))
+            || matches!(m.type_of(scale), Some(Type::Scalar(_)));
+        if !scalar_scale && deficit > 0 {
+            return Err(refuse_lower_dimensional(node, m));
+        }
+        if !scalar_scale && !type_is_matrix(m, scale) {
             return Err(refuse(
                 scale,
                 m,
-                "locscale over a vector variate requires a matrix scale; a scalar scale would give \
-                 the wrong forward log-volume (n·log|scale|, not log|scale|) — refuse rather than mislower",
+                "locscale over a vector variate requires a scalar or a square matrix scale — \
+                 refuse rather than mislower",
             ));
         }
-        if matrix_confirmed_non_square(m, scale) {
+        if !scalar_scale && matrix_confirmed_non_square(m, scale) {
             return Err(refuse(
                 scale,
                 m,
@@ -2825,6 +2861,15 @@ pub(crate) fn derive_locscale(
                      Refuse rather than mislower"
                 ),
             ));
+        }
+        if scalar_scale {
+            // x ↦ scale·x + shift, outermost step first: (cells − deficit)·log|scale|.
+            let steps = [
+                flatppl_infer::AffineStep::Add(shift),
+                flatppl_infer::AffineStep::Mul(scale),
+            ];
+            refuse_zero_scale_step(m, &steps)?;
+            return Ok(uniform_affine_bijection(m, &steps, domain, deficit));
         }
         // f_inv(y) = linsolve(scale, y − shift); logvol(_) = logabsdet(scale).
         let f_inv = lambda(m, |m, y| {

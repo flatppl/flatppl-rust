@@ -5679,27 +5679,34 @@ fn lower_locscale(
         (c.args[0], c.args[1], c.args[2])
     };
     let (domain, support) = measure_domain_and_support(m, m_inner);
-    // A vector `locscale` takes a matrix scale, which §06 gives no density over a
-    // lower-dimensional support (see `crate::invert::Carrier`).
-    match crate::invert::carrier(m, m_inner, &support) {
-        crate::invert::Carrier::Full => {}
+    // Over a lower-dimensional support only a scalar scale has a density (see
+    // `crate::invert::Carrier`); `derive_locscale` refuses a matrix one there.
+    let deficit = match crate::invert::carrier(m, m_inner, &support) {
+        crate::invert::Carrier::Full => 0,
         crate::invert::Carrier::PointMass
             if point_mass_atom(m, m_inner).is_some()
-                || reference_measure(&domain) != Some(Reference::Lebesgue) => {}
+                || reference_measure(&domain) != Some(Reference::Lebesgue) =>
+        {
+            0
+        }
         crate::invert::Carrier::PointMass => return Err(refuse_unwritten_point_mass(node, m)),
         crate::invert::Carrier::PointMassMix
-            if reference_measure(&domain) != Some(Reference::Lebesgue) => {}
+            if reference_measure(&domain) != Some(Reference::Lebesgue) =>
+        {
+            0
+        }
         crate::invert::Carrier::PointMassMix => {
             return Err(crate::invert::refuse_point_mass_mix(node, m));
         }
         crate::invert::Carrier::MixedDimension => {
             return Err(crate::invert::refuse_mixed_dimension(node, m));
         }
-        crate::invert::Carrier::Chart { .. } | crate::invert::Carrier::Unreferenced => {
+        crate::invert::Carrier::Chart { deficit } => deficit,
+        crate::invert::Carrier::Unreferenced => {
             return Err(crate::invert::refuse_lower_dimensional(node, m));
         }
-    }
-    let bij = crate::invert::derive_locscale(m, shift, scale, &domain)?;
+    };
+    let bij = crate::invert::derive_locscale(m, node, shift, scale, &domain, deficit)?;
     // §06 change-of-variables: logdensityof(m, f_inv(v)) − logvol(f_inv(v)). Both
     // applications go through the same reduce-or-refuse check as [`lower_pushfwd`]'s
     // tail — this shares that tail's shape, so it shares its residual-`%call` risk.
