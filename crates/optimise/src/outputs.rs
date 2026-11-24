@@ -19,6 +19,7 @@ pub(super) struct Outputs {
     nodes: Vec<Output>,
     by_source: HashMap<NodeId, usize>,
     bindings: Vec<(BindingId, usize)>,
+    draws: bool,
 }
 
 impl Outputs {
@@ -26,9 +27,13 @@ impl Outputs {
         m: &Module,
         cuts: &Cuts,
         follow_names: bool,
+        draws: bool,
         bindings: &[(BindingId, NodeId)],
     ) -> Option<Self> {
-        let mut outputs = Self::default();
+        let mut outputs = Self {
+            draws,
+            ..Self::default()
+        };
         for &(binding, id) in bindings {
             let index = outputs.visit(m, cuts, follow_names, id, 0)?;
             outputs.bindings.push((binding, index));
@@ -58,6 +63,11 @@ impl Outputs {
         {
             let fields = self.visit(m, cuts, follow_names, rhs, depth + 1)?;
             Output::Named(id, binding, fields)
+        } else if self.draws
+            && let Some(law) = sampled_law(m, cuts, id)
+        {
+            let field = self.visit(m, cuts, follow_names, law, depth + 1)?;
+            Output::Fields(id, vec![field])
         } else if aggregate(m, cuts, id) {
             let fields = m
                 .node(id)
@@ -101,6 +111,35 @@ impl Outputs {
             m.set_binding_rhs(binding, rebuilt[index]);
         }
     }
+}
+
+/// The law of a `~` statement that a Stan GLM rule can replace. Its draw
+/// keeps one node, so a rewritten law still gives one sampled value. Other
+/// laws stay opaque, as the measure rules were not checked against them.
+fn sampled_law(m: &Module, cuts: &Cuts, id: NodeId) -> Option<NodeId> {
+    let builtin = |id: NodeId, name: &str| match m.node(id) {
+        Node::Call(c) => {
+            matches!(c.head, CallHead::Builtin(h) if m.resolve(h) == name)
+                && c.named.is_empty()
+                && c.inputs.is_none()
+        }
+        _ => false,
+    };
+    let Node::Call(c) = m.node(id) else {
+        return None;
+    };
+    let [law] = *c.args else {
+        return None;
+    };
+    let glm_family = builtin(law, "broadcast")
+        && matches!(m.node(law), Node::Call(b) if matches!(b.args.first().map(|&op| m.node(op)),
+            Some(Node::Const(op)) if matches!(m.resolve(*op), "Normal" | "Bernoulli" | "Poisson")));
+    (builtin(id, "draw")
+        && glm_family
+        && !cuts.blocked(m, id)
+        && !m.is_sample_result(id)
+        && m.sample_origin(id).is_none())
+    .then_some(law)
 }
 
 fn aggregate(m: &Module, cuts: &Cuts, id: NodeId) -> bool {

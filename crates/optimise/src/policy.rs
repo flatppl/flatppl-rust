@@ -17,6 +17,7 @@ const PROGRAMS: &[(&str, &str)] = &[
     ("conjugacy.egg", include_str!("rules/conjugacy.egg")),
     ("fixed_poisson.egg", include_str!("rules/fixed_poisson.egg")),
     ("gaussian.egg", include_str!("rules/gaussian.egg")),
+    ("glm.egg", include_str!("rules/glm.egg")),
     ("hoisting.egg", include_str!("rules/hoisting.egg")),
     ("mathematical.egg", include_str!("rules/mathematical.egg")),
     (

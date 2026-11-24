@@ -6,7 +6,8 @@
   (Real i64)
   (U String Expr)
   (B String Expr Expr)
-  (T String Expr Expr Expr))
+  (T String Expr Expr Expr)
+  (Q String Expr Expr Expr Expr))
 
 ; A type id denotes the complete concrete FlatPPL type, including orientation
 ; and array layers. Erasing an expression must preserve errors and pullbacks.

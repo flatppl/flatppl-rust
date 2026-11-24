@@ -81,6 +81,7 @@ fn trigger(m: &Module, profile: Profile) -> bool {
                 | "logsumexp",
             )
             | None => matches!(profile, Profile::StableHlo { .. }),
+            Some("draw") => profile == Profile::Stan,
             _ => false,
         }
     })
@@ -99,6 +100,39 @@ fn stan_matrix_reader(m: &Module, id: NodeId, profile: Profile) -> bool {
             Node::Call(c) => matches!(builtin(m, c), Some("mul" | "adjoint" | "transpose")),
             _ => false,
         }
+}
+
+// Stan names a draw once and scores its law in the model block, also inside
+// a kernel. The GLM rules read the law of such a draw and its linear
+// predictor, whatever the phase of their parameters.
+fn stan_glm_node(m: &Module, id: NodeId, profile: Profile) -> bool {
+    if profile != Profile::Stan {
+        return false;
+    }
+    let Node::Call(c) = m.node(id) else {
+        return false;
+    };
+    if !c.named.is_empty() || c.inputs.is_some() || m.is_sample_result(id) {
+        return false;
+    }
+    let operation = |head: NodeId, names: &[&str]| matches!(m.node(head), Node::Const(op) if names.contains(&m.resolve(*op)));
+    match (builtin(m, c), c.args.as_ref()) {
+        (Some("draw"), [law]) => matches!(m.node(*law), Node::Call(l)
+            if builtin(m, l) == Some("broadcast")
+                && l.args.first().is_some_and(|&op| operation(op, &["Normal", "Bernoulli", "Poisson"]))),
+        (Some("broadcast"), [op, ..]) => operation(
+            *op,
+            &["Normal", "Bernoulli", "Poisson", "invlogit", "exp", "add"],
+        ),
+        (Some("mul"), [x, b]) => {
+            let rank = |id: NodeId| match m.type_of(id) {
+                Some(Type::Array { shape, .. }) => shape.len(),
+                _ => 0,
+            };
+            rank(*x) == 2 && rank(*b) == 1
+        }
+        _ => false,
+    }
 }
 
 /// Reified arguments and promoted ABI values replace their original expressions.
@@ -169,7 +203,7 @@ impl Cuts {
         let mut scoped_nodes = HashSet::new();
         while let Some(node) = scoped.pop() {
             if !nodes.contains(&node) && visited.insert(node) {
-                if !stan_matrix_reader(m, node, profile) {
+                if !stan_matrix_reader(m, node, profile) && !stan_glm_node(m, node, profile) {
                     scoped_nodes.insert(node);
                 }
                 m.for_each_child(node, |child| scoped.push(child));
@@ -323,6 +357,7 @@ struct Project<'a> {
     concats: Vec<(usize, concat::Witness, Vec<usize>)>,
     poisson: Vec<(usize, usize, Partition)>,
     fixed_poisson: bool,
+    glm_operands: HashSet<NodeId>,
 }
 
 impl<'a> Project<'a> {
@@ -341,6 +376,11 @@ impl<'a> Project<'a> {
             selectors: Selectors::default(),
             concats: vec![],
             poisson: vec![],
+            glm_operands: (0..m.node_count())
+                .map(NodeId::from_usize)
+                .filter(|&id| stan_glm_node(m, id, profile))
+                .flat_map(|id| m.node(id).children())
+                .collect(),
             fixed_poisson: sufficient_statistics
                 && matches!(
                     profile,
@@ -354,6 +394,27 @@ impl<'a> Project<'a> {
 
     fn hlo(&self) -> bool {
         matches!(self.profile, Profile::StableHlo { .. })
+    }
+
+    /// A read of a named data value or of one of its record fields by name.
+    /// Both are data in a target that reads named data.
+    fn reads_data_boundary(&self, id: NodeId) -> bool {
+        let m = self.m;
+        let named = |id: NodeId| match m.node(id) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => m
+                .binding_by_name(r.name)
+                .is_some_and(|binding| crate::boundary::data_boundary(m, self.profile, binding)),
+            _ => false,
+        };
+        match m.node(id) {
+            Node::Call(c) if matches!(builtin(m, c), Some("get" | "get_field")) => {
+                c.named.is_empty()
+                    && c.inputs.is_none()
+                    && matches!(*c.args, [record, key]
+                        if named(record) && matches!(m.node(key), Node::Lit(Scalar::Str(_))))
+            }
+            _ => named(id),
+        }
     }
 
     fn transposed_cells(&self) -> Vec<[usize; 3]> {
@@ -479,6 +540,19 @@ impl<'a> Project<'a> {
                         .then(|| "logsumexp.pair".to_owned());
                     }
                 }
+                // Stan reads a broadcast law or link by its name. The operation
+                // is part of the head, so rules can match it.
+                "broadcast"
+                    if self.profile == Profile::Stan
+                        && let Some(&op) = c.args.first()
+                        && let Node::Const(op) = m.node(op)
+                        && matches!(
+                            m.resolve(*op),
+                            "add" | "Normal" | "Bernoulli" | "Poisson" | "invlogit" | "exp"
+                        ) =>
+                {
+                    return Some(format!("broadcast.{}", m.resolve(*op)));
+                }
                 // Scoped calls and target callbacks have their own lane and status contracts.
                 "broadcast"
                     if c.args.first().is_some_and(|&a| {
@@ -553,6 +627,7 @@ impl<'a> Project<'a> {
         let sampled = m.is_sample_result(id) || m.sample_origin(id).is_some();
         let stochastic = m.phase_of(id) == Some(Phase::Stochastic) || sampled;
         let stan_matrix = stan_matrix_reader(m, id, self.profile);
+        let stan_glm = stan_glm_node(m, id, self.profile);
         if let Node::Ref(r) = m.node(id)
             && r.ns == RefNs::SelfMod
         {
@@ -572,7 +647,7 @@ impl<'a> Project<'a> {
                 return Some(i);
             }
         }
-        let allowed = !boundary && (!stochastic || stan_matrix);
+        let allowed = !boundary && (!stochastic || stan_matrix || stan_glm);
         let term = match m.node(id) {
             Node::Lit(Scalar::Bool(b)) if allowed => Term::Boolean(*b),
             Node::Lit(Scalar::Real(x)) if allowed => Term::Real(x.to_bits() as i64),
@@ -592,8 +667,8 @@ impl<'a> Project<'a> {
                 Term::Real(f64::INFINITY.to_bits() as i64)
             }
             Node::Call(c) if allowed && let Some(head) = self.call_name(c) => {
-                let args = c
-                    .args
+                let named_operation = usize::from(head.starts_with("broadcast."));
+                let args = c.args[named_operation..]
                     .iter()
                     .map(|&a| self.project(a, depth + 1))
                     .collect::<Option<_>>()?;
@@ -621,6 +696,24 @@ impl<'a> Project<'a> {
             && r.ns == RefNs::SelfMod
         {
             self.refs.insert(r.name, i);
+        }
+        if self.reads_data_boundary(id) {
+            self.facts.push(fact("data-boundary", i, []));
+        }
+        if (stan_glm || self.glm_operands.contains(&id))
+            && let Some(ty) = m.type_of(id)
+        {
+            match ty {
+                Type::Scalar(ScalarType::Real) => self.facts.push(fact("shape-real", i, [])),
+                Type::Array { shape, elem }
+                    if **elem == Type::Scalar(ScalarType::Real)
+                        && let [Dim::Static(n)] = **shape =>
+                {
+                    self.facts
+                        .push(fact("shape-real-vector", i, [FactArg::Int(i64::from(n))]));
+                }
+                _ => {}
+            }
         }
         let term = &self.terms[i];
         let input = self.cuts.abi_input(m, id);
@@ -823,6 +916,32 @@ impl<'a> Project<'a> {
                             }))
                         }
                         "logsumexp.pair" => build_call(m, "logsumexp", &args),
+                        head if let Some(member) = head.strip_prefix("regression.") => {
+                            let module = flatppl_core::graph::standard_module_alias(
+                                m,
+                                "regression",
+                                "0.1",
+                                "__regression",
+                            );
+                            let name = m.intern(member);
+                            let fun = m.alloc(Node::Ref(flatppl_core::Ref {
+                                ns: RefNs::Module(module),
+                                name,
+                            }));
+                            m.alloc(Node::Call(Call {
+                                head: CallHead::User(fun),
+                                args: args.into(),
+                                named: Box::new([]),
+                                inputs: None,
+                            }))
+                        }
+                        head if let Some(op) = head.strip_prefix("broadcast.") => {
+                            let op = m.intern(op);
+                            let op = m.alloc(Node::Const(op));
+                            let mut operands = vec![op];
+                            operands.extend(args);
+                            build_call(m, "broadcast", &operands)
+                        }
                         head => build_call(m, head, &args),
                     }
                 }
@@ -898,7 +1017,13 @@ pub(super) fn optimise(
         })
         .map(|(bid, b)| (bid, b.rhs))
         .collect();
-    let outputs = crate::outputs::Outputs::collect(m, &project.cuts, project.hlo(), &bindings)?;
+    let outputs = crate::outputs::Outputs::collect(
+        m,
+        &project.cuts,
+        project.hlo(),
+        profile == Profile::Stan,
+        &bindings,
+    )?;
     let roots: Vec<_> = outputs
         .slots
         .iter()

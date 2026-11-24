@@ -152,6 +152,7 @@ fn rule_names_are_discoverable_and_invalid_names_are_rejected() {
         "all",
         "rule:portable.double-negation",
         "ruleset:portable",
+        "ruleset:glm",
         "pass:demand-prune",
     ] {
         assert!(

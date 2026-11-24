@@ -26,5 +26,5 @@ model {
   alpha ~ std_normal();
   beta ~ std_normal();
   sigma ~ exponential(1.0);
-  y ~ normal(alpha + X * beta, sigma);
+  y ~ normal_id_glm(X, alpha, beta, sigma);
 }
