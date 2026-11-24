@@ -1,0 +1,11 @@
+flatppl_compat = "0.1"
+a = elementof(posreals)
+hi = elementof(posreals)
+xx = elementof(reals)
+yy = elementof(reals)
+w(v, p) = p * v.x + 2.0 * v.y
+S = cartprod(y = interval(-1.0, 0.5), x = interval(0.0, hi))
+M = normalize(logweighted(w, Lebesgue(S), a))
+score = logdensityof(M, record(x = xx, y = yy))
+inputs = (a, hi, xx, yy)
+outputs = score

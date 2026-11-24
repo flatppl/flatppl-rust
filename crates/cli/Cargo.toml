@@ -48,6 +48,8 @@ fmtlint = ["dep:flatppl-lint"]
 # `load_module` refs from the cache) and runs the type/shape trace so a
 # mistyped model refuses loudly instead of being lowered blind.
 determinize = ["dep:flatppl-determinizer", "dep:flatppl-host", "dep:flatppl-optimise", "infer"]
+# Source AD is opt-in and runs before FlatPDL optimization.
+autodiff = ["determinize", "dep:flatppl-autodiff"]
 # `mathdoc` renders a model as mathematics: `convert model.flatppl model.html`.
 # It needs `infer` for the typed module (index ranges, kernel inputs) and the
 # cross-module bundle, like the other verbs that read a model's meaning.
@@ -72,6 +74,7 @@ flatppl-hs3 = { path = "../hs3", optional = true }
 flatppl-formula = { path = "../formula", optional = true }
 flatppl-lint = { path = "../lint", optional = true }
 flatppl-determinizer = { path = "../determinizer", optional = true }
+flatppl-autodiff = { path = "../autodiff", optional = true }
 flatppl-stablehlo = { path = "../stablehlo", optional = true }
 flatppl-stan = { path = "../stan", optional = true }
 flatppl-host = { path = "../host", optional = true }

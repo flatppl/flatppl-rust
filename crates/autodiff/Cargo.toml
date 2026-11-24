@@ -1,0 +1,17 @@
+[package]
+name = "flatppl-autodiff"
+description = "Source-to-source differentiation for deterministic FlatPPL queries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egglog = { version = "3.0", default-features = false }
+flatppl-core = { path = "../core" }
+flatppl-determinizer = { path = "../determinizer" }
+flatppl-infer = { path = "../infer" }
+
+[dev-dependencies]
+flatppl-syntax = { path = "../syntax" }

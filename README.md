@@ -17,6 +17,7 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-infer`](crates/infer) — type, shape, and phase inference
 * [`flatppl-optimise`](crates/optimise) — output-driven pruning and egglog rewrites for the typed model DAG
 * [`flatppl-model-analysis`](crates/model-analysis) — dependency analysis, scalar conjugacy, sufficient statistics, incremental scores and Normal coordinate maps
+* [`flatppl-autodiff`](crates/autodiff) — source-to-source AD with egglog rules
 * [`flatppl-hs3`](crates/hs3) — HS3 / pyhf → FlatPPL importer
 * [`flatppl-formula`](crates/formula) — Gaussian regression formulas → FlatPPL, with reusable data recipes
 * [`flatppl-convert`](crates/convert) — shared IR construction helpers for converters
@@ -56,6 +57,59 @@ flatppl stablehlo query.flatppl --dtype f64 -o query.mlir # float64 compilation;
 StableHLO queries must declare `inputs` and `outputs` to define their compiled ABI.
 The f32 dtype uses i32 integer arithmetic and f64 uses i64: an integer literal
 outside that width refuses, and a computed integer beyond it wraps.
+
+### Source differentiation
+
+Build the CLI with `--features autodiff` and request the derivative explicitly.
+
+```sh
+flatppl autodiff query.flatppl --wrt theta -o gradient.flatppl
+```
+
+The query declares `inputs` and one real scalar output. Repeat `--wrt` for each
+real scalar, fixed-shape array, or nonempty record with real leaves. The result
+lists the original value followed by gradients in the requested order. Each
+gradient has the shape of its input.
+Use `--empty-wrt` for an empty selection, including queries with only discrete
+inputs. The gradient query then returns the primal alone.
+
+Use `--mode jvp` or `--mode vjp` for real scalar and fixed-shape array outputs.
+JVP adds one tangent argument per selected input and returns one tangent per
+output. VJP adds one cotangent argument per output and returns one cotangent
+per selected input. The original values precede the derivative results.
+
+AD runs after determinization and before optimization. Egglog rules cover
+pointwise arithmetic and conditionals, scalar broadcast callbacks, reductions,
+indexing and stacking, matrix operations, selected distribution transports,
+and log densities including Beta, Gamma, StudentT, Dirichlet, and MvNormal.
+The transform also handles fixed record and array scans, log-space Markov
+updates, and fixed-grid solver steps with active initial states and parameters.
+Active operations without a rule produce an error. Derivatives apply on the
+smooth, finite domain of the query.
+
+Rust callers can use `flatppl_autodiff::determinize_query` followed by
+`gradient`, `jvp`, or `vjp`. The result is one FlatPDL module with the primal
+and derivative outputs. To print standalone FlatPPL, call
+`flatppl_autodiff::prepare_source` before `flatppl_syntax::print`.
+
+Use `--numerical-integrals` to differentiate an integral and print the
+result as FlatPPL. The generated query uses weighted integrals and requires
+the same opt-in when compiled.
+
+```sh
+flatppl autodiff query.flatppl --numerical-integrals --wrt theta -o gradient.flatppl
+flatppl stablehlo gradient.flatppl --numerical-integrals
+```
+
+Numerical AD integrates the derivative of the integrand and adds terms for
+moving bounds and supported scalar cutoffs. Reverse differentiation supports
+scalar, fixed-vector, fixed-matrix, and nested record captures. The Rust
+`*_with_options` entry points accept `NUMERICAL_SOURCE_OPTIONS`.
+Call `prepare_source_with_options` before printing. To compile the
+derivative directly to StableHLO, add `--ad-wrt` to the `stablehlo` command
+and optionally select `--ad-mode jvp` or `--ad-mode vjp`.
+
+### Lowering and emission
 
 The Rust determinizer lowers affine log weights to closed distribution laws for
 Normal, MvNormal, Gamma, Exponential, ChiSquared, Bernoulli, Binomial, Poisson,

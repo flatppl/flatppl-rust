@@ -1,0 +1,189 @@
+; Location-scale transports use the order (location, scale, variate).
+(constructor TransportDiff () Expr :unextractable)
+(rewrite (TransportDiff) (Binary "sub" (Arg 2) (Arg 0)) :ruleset pullbacks)
+(constructor TransportZ () Expr :unextractable)
+(rewrite (TransportZ) (Binary "divide" (TransportDiff) (Arg 1)) :ruleset pullbacks)
+
+; The CDF derivatives at infinite endpoints are zero. Evaluate the Normal
+; slope in log space so tiny scales can offset a small standard Normal density.
+(constructor NormalCDFSlope () Expr :unextractable)
+(rewrite (NormalCDFSlope) (Unary "exp" (Binary "sub"
+  (Binary "sub" (Binary "mul" (Real -0.5) (Unary "abs2" (TransportZ)))
+    (Real 0.9189385332046727))
+  (Unary "log" (Arg 1)))) :ruleset pullbacks)
+(rewrite (Pullback "Normal CDF" 3 0)
+  (Unary "neg" (Binary "mul" (Bar) (NormalCDFSlope))) :ruleset pullbacks)
+(rewrite (Pullback "Normal CDF" 3 1)
+  (Ternary "ifelse" (Unary "isinf" (TransportZ)) (Real 0.0)
+    (Unary "neg" (Binary "mul" (Bar) (Binary "mul" (TransportZ) (NormalCDFSlope)))))
+  :ruleset pullbacks)
+(rewrite (Pullback "Normal CDF" 3 2)
+  (Binary "mul" (Bar) (NormalCDFSlope)) :ruleset pullbacks)
+
+; Normalize scale and displacement before squaring, so either can be large.
+(constructor CauchyCDFMagnitude () Expr :unextractable)
+(rewrite (CauchyCDFMagnitude)
+  (Binary "max" (Arg 1) (Unary "abs" (Binary "sub" (Arg 2) (Arg 0)))) :ruleset pullbacks)
+(constructor CauchyCDFFactor (Expr) Expr :unextractable)
+(rewrite (CauchyCDFFactor numerator)
+  (Ternary "ifelse" (Unary "isinf" (Binary "sub" (Arg 2) (Arg 0))) (Real 0.0)
+    (Binary "mul" (Bar) (Binary "divide"
+      (Binary "divide" (Binary "mul" (Real 0.3183098861837907)
+        (Binary "divide" numerator (CauchyCDFMagnitude)))
+        (Binary "add"
+          (Unary "abs2" (Binary "divide" (Arg 1) (CauchyCDFMagnitude)))
+          (Unary "abs2" (Binary "divide" (Binary "sub" (Arg 2) (Arg 0)) (CauchyCDFMagnitude)))))
+      (CauchyCDFMagnitude)))) :ruleset pullbacks)
+(rewrite (Pullback "Cauchy CDF" 3 0)
+  (Unary "neg" (CauchyCDFFactor (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "Cauchy CDF" 3 1)
+  (Unary "neg" (CauchyCDFFactor (TransportDiff))) :ruleset pullbacks)
+(rewrite (Pullback "Cauchy CDF" 3 2) (CauchyCDFFactor (Arg 1)) :ruleset pullbacks)
+
+(rewrite (Pullback "Normal to normal" 3 0)
+  (Unary "neg" (Binary "divide" (Bar) (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "Normal to normal" 3 1)
+  (Unary "neg" (Binary "mul" (Binary "divide" (Bar) (Arg 1)) (Out))) :ruleset pullbacks)
+(rewrite (Pullback "Normal to normal" 3 2)
+  (Binary "divide" (Bar) (Arg 1)) :ruleset pullbacks)
+(rewrite (Pullback "Normal from normal" 3 0) (Bar) :ruleset pullbacks)
+(rewrite (Pullback "Normal from normal" 3 1)
+  (Binary "mul" (Bar) (Arg 2)) :ruleset pullbacks)
+(rewrite (Pullback "Normal from normal" 3 2)
+  (Binary "mul" (Bar) (Arg 1)) :ruleset pullbacks)
+
+(rewrite (Pullback "Exponential quantile" 2 0)
+  (Unary "neg" (Binary "mul" (Bar) (Binary "divide" (Out) (Arg 0)))) :ruleset pullbacks)
+(rewrite (Pullback "Exponential quantile" 2 1)
+  (Binary "divide" (Binary "divide" (Bar) (Binary "sub" (Real 1.0) (Arg 1))) (Arg 0))
+  :ruleset pullbacks)
+(rewrite (Pullback "Logistic quantile" 3 0) (Bar) :ruleset pullbacks)
+(rewrite (Pullback "Logistic quantile" 3 1)
+  (Binary "mul" (Bar) (Unary "logit" (Arg 2))) :ruleset pullbacks)
+(rewrite (Pullback "Logistic quantile" 3 2)
+  (Binary "divide" (Binary "divide" (Binary "mul" (Bar) (Arg 1)) (Arg 2))
+    (Binary "sub" (Real 1.0) (Arg 2))) :ruleset pullbacks)
+
+; The reflected angle keeps the near-zero and near-one tail derivatives
+; accurate. Computing the scale derivative from Out - location loses it
+; when the primal rounds to location.
+(constructor CauchyLowerTail () Expr :unextractable)
+(rewrite (CauchyLowerTail) (Binary "lt" (Arg 2) (Real 0.5)) :ruleset pullbacks)
+(constructor CauchyTailAngle () Expr :unextractable)
+(rewrite (CauchyTailAngle)
+  (Binary "mul" (Real 3.141592653589793)
+    (Ternary "ifelse" (CauchyLowerTail) (Arg 2) (Binary "sub" (Real 1.0) (Arg 2))))
+  :ruleset pullbacks)
+(rewrite (Pullback "Cauchy quantile" 3 0) (Bar) :ruleset pullbacks)
+(rewrite (Pullback "Cauchy quantile" 3 1)
+  (Binary "mul" (Bar) (Binary "divide"
+    (Ternary "ifelse" (CauchyLowerTail)
+      (Unary "neg" (Unary "cos" (CauchyTailAngle)))
+      (Unary "cos" (CauchyTailAngle)))
+    (Unary "sin" (CauchyTailAngle)))) :ruleset pullbacks)
+(rewrite (Pullback "Cauchy quantile" 3 2)
+  (Binary "mul" (Bar) (Binary "divide"
+    (Binary "mul" (Real 3.141592653589793)
+      (Binary "divide" (Arg 1) (Unary "sin" (CauchyTailAngle))))
+    (Unary "sin" (CauchyTailAngle)))) :ruleset pullbacks)
+
+; The standard Normal log density shares the CDF/probit slope.
+(constructor StandardNormalLogPdf (Expr) Expr :unextractable)
+(rewrite (StandardNormalLogPdf x)
+  (Binary "sub" (Binary "mul" (Real -0.5) (Unary "abs2" x)) (Real 0.9189385332046727))
+  :ruleset pullbacks)
+(rewrite (Pullback "invprobit" 1 0)
+  (Binary "mul" (Bar) (Unary "exp" (StandardNormalLogPdf (Arg 0)))) :ruleset pullbacks)
+(rewrite (Pullback "probit" 1 0)
+  (Binary "mul" (Bar) (Unary "exp" (Unary "neg" (StandardNormalLogPdf (Out)))))
+  :ruleset pullbacks)
+
+; The lower-tail ratio phi(x)/Phi(x) simplifies to a reciprocal scaled
+; complementary error function. Subtracting the two log terms there loses
+; the slope to cancellation once both are dominated by -x^2/2. Infinite
+; CDF endpoints are fixed, matching the backend's endpoint tangent convention.
+(rewrite (Pullback "log_ndtr" 1 0)
+  (Ternary "ifelse" (Unary "isinf" (Arg 0)) (Real 0.0)
+    (Binary "mul" (Bar) (Ternary "ifelse" (Binary "lt" (Arg 0) (Real 0.0))
+      (Binary "divide" (Real 0.7978845608028654)
+        (SpecialUnary "erfcx" (Binary "mul" (Real 0.7071067811865476) (Unary "abs" (Arg 0)))))
+      (Unary "exp" (Binary "sub" (StandardNormalLogPdf (Arg 0)) (Out))))))
+  :ruleset pullbacks)
+
+; expm1 retains the interval width near coincident endpoints. Define a zero
+; contribution on the empty branch, including two equal infinite endpoints.
+(constructor LogCdfDelta () Expr :unextractable)
+(rewrite (LogCdfDelta) (Binary "sub" (Arg 1) (Arg 0)) :ruleset pullbacks)
+(constructor LogCdfNonempty () Expr :unextractable)
+(rewrite (LogCdfNonempty) (Binary "lt" (LogCdfDelta) (Real 0.0)) :ruleset pullbacks)
+(constructor LogCdfSafeDelta () Expr :unextractable)
+(rewrite (LogCdfSafeDelta)
+  (Ternary "ifelse" (LogCdfNonempty) (LogCdfDelta) (Real -1.0)) :ruleset pullbacks)
+(rewrite (Pullback "%log_cdf_difference" 2 0)
+  (Ternary "ifelse" (LogCdfNonempty)
+    (Unary "neg" (Binary "divide" (Bar) (Unary "expm1" (LogCdfSafeDelta))))
+    (Real 0.0)) :ruleset pullbacks)
+(rewrite (Pullback "%log_cdf_difference" 2 1)
+  (Ternary "ifelse" (LogCdfNonempty)
+    (Binary "divide" (Binary "mul" (Bar) (Unary "exp" (LogCdfSafeDelta)))
+      (Unary "expm1" (LogCdfSafeDelta))) (Real 0.0)) :ruleset pullbacks)
+
+; Differentiate regularized tails with respect to their integration limit.
+; Shape derivatives do not follow from the density at the integration limit.
+(constructor LogKernelPower (Expr Expr) Expr :unextractable)
+(rewrite (LogKernelPower exponent log_x)
+  (Ternary "ifelse" (Unary "iszero" exponent) (Real 0.0) (Binary "mul" exponent log_x))
+  :ruleset pullbacks)
+(constructor TailContribution (Expr Expr) Expr :unextractable)
+(rewrite (TailContribution log_pdf log_probability)
+  (Binary "mul" (Bar) (Unary "exp" (Binary "sub" log_pdf log_probability)))
+  :ruleset pullbacks)
+
+(constructor GammaLogPdf () Expr :unextractable)
+(rewrite (GammaLogPdf)
+  (Ternary "ifelse" (Unary "isinf" (Arg 1)) (Unary "log" (Real 0.0))
+    (Binary "sub"
+      (Binary "sub"
+        (LogKernelPower (Binary "sub" (Arg 0) (Real 1.0)) (Unary "log" (Arg 1)))
+        (Arg 1))
+      (Unary "loggamma" (Arg 0)))) :ruleset pullbacks)
+(rewrite (Pullback "gammainc" 2 1) (TailContribution (GammaLogPdf) (Real 0.0)) :ruleset pullbacks)
+(rewrite (Pullback "gammaincc" 2 1)
+  (Unary "neg" (TailContribution (GammaLogPdf) (Real 0.0))) :ruleset pullbacks)
+(rewrite (Pullback "log_gammainc" 2 1) (TailContribution (GammaLogPdf) (Out)) :ruleset pullbacks)
+(rewrite (Pullback "log_gammaincc" 2 1)
+  (Ternary "ifelse" (Unary "isinf" (Arg 1)) (Real 0.0)
+    (Unary "neg" (TailContribution (GammaLogPdf) (Out)))) :ruleset pullbacks)
+
+(constructor BetaLogPdf () Expr :unextractable)
+(rewrite (BetaLogPdf)
+  (Binary "sub"
+    (Binary "add"
+      (LogKernelPower (Binary "sub" (Arg 0) (Real 1.0)) (Unary "log" (Arg 2)))
+      (LogKernelPower (Binary "sub" (Arg 1) (Real 1.0))
+        (Unary "log1p" (Unary "neg" (Arg 2)))))
+    (SpecialBinary "logbeta" (Arg 0) (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "betainc" 3 2) (TailContribution (BetaLogPdf) (Real 0.0)) :ruleset pullbacks)
+(rewrite (Pullback "betaincc" 3 2)
+  (Unary "neg" (TailContribution (BetaLogPdf) (Real 0.0))) :ruleset pullbacks)
+(rewrite (Pullback "log_betainc" 3 2) (TailContribution (BetaLogPdf) (Out)) :ruleset pullbacks)
+(rewrite (Pullback "log_betaincc" 3 2)
+  (Unary "neg" (TailContribution (BetaLogPdf) (Out))) :ruleset pullbacks)
+
+; The normalizing constants use the same digamma difference as Beta density.
+(rewrite (Pullback "loggamma" 1 0)
+  (Binary "mul" (Bar) (SpecialUnary "digamma" (Arg 0))) :ruleset pullbacks)
+(rewrite (Pullback "logbeta" 2 0)
+  (Unary "neg" (Binary "mul" (Bar) (DigammaDifference (Arg 0) (Arg 1)))) :ruleset pullbacks)
+(rewrite (Pullback "logbeta" 2 1)
+  (Unary "neg" (Binary "mul" (Bar) (DigammaDifference (Arg 1) (Arg 0)))) :ruleset pullbacks)
+(rewrite (Pullback "beta" 2 0)
+  (Unary "neg" (Binary "mul" (Binary "mul" (Bar) (Out)) (DigammaDifference (Arg 0) (Arg 1))))
+  :ruleset pullbacks)
+(rewrite (Pullback "beta" 2 1)
+  (Unary "neg" (Binary "mul" (Binary "mul" (Bar) (Out)) (DigammaDifference (Arg 1) (Arg 0))))
+  :ruleset pullbacks)
+
+(rewrite (Pullback "gamma" 1 0)
+  (Binary "mul" (Bar) (Binary "mul" (Out) (SpecialUnary "digamma" (Arg 0))))
+  :ruleset pullbacks)

@@ -1365,3 +1365,87 @@ fn set_constructor_presets_carry_their_set() {
         "interval preset value-set should be the denoted interval, got:\n{out}"
     );
 }
+
+#[test]
+fn fixed_filter_counts_baked_matrix_cells_in_dimension_order() {
+    let out = ir(
+        "data = record(grade = array([1, -1, -1, -1, 1, -1], [2, 3], [2, 1]))\n\
+         kept = filter(c -> data.grade[div(c - 1, 3) + 1, mod(c - 1, 3) + 1] != -1, indicesof(zeros(3)))\n\
+         y = elementof(cartpow(reals, lengthof(kept)))\n",
+    );
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (2) (%scalar integer))"),
+        "{out}"
+    );
+    assert!(
+        out.contains("(%bind y (%meta ((%array 1 (2) (%scalar real))"),
+        "{out}"
+    );
+}
+
+#[test]
+fn filter_over_a_promoted_alias_uses_runtime_contents() {
+    let out = ir(
+        "data = [1, 2, 3]\npromoted = data\ninputs = promoted\nkept = filter(c -> c > 1, data)\n",
+    );
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (%dynamic) (%scalar integer))"),
+        "{out}"
+    );
+}
+
+#[test]
+fn fixed_filter_counts_broadcast_mask_cells() {
+    let source = "days = indicesof(zeros(4))\n\
+        starts = [2, 1]\n\
+        ends = [3, 1]\n\
+        window = ifelse.(land.(addaxes(days, 0, 1) .>= addaxes(starts, 1, 0),\n\
+            addaxes(days, 0, 1) .<= addaxes(ends, 1, 0)), 1.0, 0.0)\n\
+        kept = filter(i -> window[mod(i - 1, 4) + 1, div(i - 1, 4) + 1] > 0.0,\n\
+            indicesof(zeros(4)))\n";
+    let fixed = ir(source);
+    assert!(
+        fixed.contains("(%bind kept (%meta ((%array 1 (2) (%scalar integer))"),
+        "{fixed}"
+    );
+    let runtime = ir(&format!("{source}\ninputs = ends\n"));
+    assert!(
+        runtime.contains("(%bind kept (%meta ((%array 1 (%dynamic) (%scalar integer))"),
+        "{runtime}"
+    );
+}
+
+#[test]
+fn fixed_filter_leaves_precision_dependent_lengths_dynamic() {
+    let source = "a = [1.0, 1.00000001, 1.0000001]\n\
+        kept = filter(i -> a[i] > 1.0, [1, 2, 3])\n";
+    let out = ir(source);
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (%dynamic) (%scalar integer))"),
+        "{out}"
+    );
+
+    let out = ir(&source.replace("1.00000001, 1.0000001", "1.25, 1.5"));
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (2) (%scalar integer))"),
+        "{out}"
+    );
+}
+
+#[test]
+fn fixed_filter_leaves_precision_dependent_interval_membership_dynamic() {
+    let out = ir("kept = filter(x -> x in interval(1.0, 2.0), [0.99999999, 1.5, 3.0])");
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (%dynamic) (%scalar real))"),
+        "{out}"
+    );
+}
+
+#[test]
+fn fixed_filter_does_not_prove_masks_with_narrow_integer_overflow() {
+    let out = ir("kept = filter(i -> i * 1073741824 > 0, [1, 2, 3])");
+    assert!(
+        out.contains("(%bind kept (%meta ((%array 1 (%dynamic) (%scalar integer))"),
+        "{out}"
+    );
+}

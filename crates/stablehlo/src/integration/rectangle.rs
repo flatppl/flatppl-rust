@@ -12,6 +12,7 @@ struct Integrand2 {
     kind: IntegralKind,
     origins: [Value; 2],
     widths: [Value; 2],
+    log_shift: Option<LogShift>,
 }
 
 struct TensorRule {
@@ -99,12 +100,14 @@ impl Emitter<'_> {
             ));
         }
         let [(x, dx), (y, dy)] = bounds.try_into().unwrap_or_else(|_| unreachable!());
+        let log_shift = self.quadrature_log_shift(kind, args[0], points)?;
         let integrand = Integrand2 {
             body: args[0],
             points,
             kind,
             origins: [x, y],
             widths: [dx, dy],
+            log_shift,
         };
         let rule = TensorRule::new(self);
         let unit = [zero.clone(), one.clone(), zero.clone(), one.clone()];
@@ -141,7 +144,7 @@ impl Emitter<'_> {
             .map(|v| v.ty.render(self.dtype, v.elem))
             .collect::<Vec<_>>();
         let log_rtol = self.scalar(options.rtol.ln());
-        let log_atol = self.scalar(options.atol.ln());
+        let log_atol = self.quadrature_log_atol(options.atol, integrand.log_shift.as_ref());
         let result = self.try_while_loop(
             &initial,
             &types,
@@ -239,21 +242,14 @@ impl Emitter<'_> {
         let tolerance = self.max(&relative, &log_atol);
         let converged = self.compare("LE", &result[9], &tolerance);
         let valid = self.and(&result[10], &converged);
-        let empty_value = self.scalar(if kind == IntegralKind::Mass {
-            0.0
-        } else {
-            f64::NEG_INFINITY
-        });
+        let linear = kind != IntegralKind::Log;
+        let empty_value = self.scalar(if linear { 0.0 } else { f64::NEG_INFINITY });
         // The mesh carries only dyadic coordinates. Apply the physical bounds
         // again outside the adaptive loop so AD sees their derivatives.
-        let value = if self.restrict_enzyme_compatible || kind == IntegralKind::Mass {
+        let value = if self.restrict_enzyme_compatible || linear {
             let edges = [1, 2, 3, 4].map(|i| self.rectangle_panel_axis(&result[i]));
             let panel = self.rectangle_panel(&integrand, &rule, &edges)?;
-            let masses = if kind == IntegralKind::Mass {
-                panel.linear
-            } else {
-                panel.log_mass
-            };
+            let masses = if linear { panel.linear } else { panel.log_mass };
             let masses = self.axes_view(
                 &masses,
                 Axes {
@@ -264,7 +260,7 @@ impl Emitter<'_> {
             let indices = self.axis_indices(&masses, 0);
             let used = self.compare("LT", &indices, &result[0]);
             let masses = self.select(&used, &masses, &empty_value);
-            if kind == IntegralKind::Mass {
+            if linear {
                 self.reduce_sum(&masses)
             } else {
                 self.integral_logsum(&masses)
@@ -272,10 +268,64 @@ impl Emitter<'_> {
         } else {
             result[8].clone()
         };
+        let value = self.restore_log_shift(value, integrand.log_shift.as_ref());
         let nan = self.scalar(f64::NAN);
         let value = self.select(&valid, &value, &nan);
         let empty = self.and(&valid_bounds, &empty);
         Ok(self.select(&empty, &empty_value, &value))
+    }
+
+    fn evaluate_signed_panel(
+        &mut self,
+        score: Value,
+        points: [(NodeId, Value); 2],
+        weight: Option<(NodeId, NodeId)>,
+        [jacobian, log_radius, kronrod]: [&Value; 3],
+    ) -> Result<(Value, Value, Value, Value), EmitError> {
+        let zero = self.scalar(0.0);
+        let one = self.scalar(1.0);
+        let infinity = self.scalar(f64::INFINITY);
+        let neg_inf = self.scalar(f64::NEG_INFINITY);
+        let magnitude = self.abs(&score);
+        let score_finite = self.compare("LT", &magnitude, &infinity);
+        let (score, valid, log_weight) = if let Some((log_density, normalizer)) = weight {
+            let density = self.quadrature_body(log_density, points)?;
+            let normalizer = self.lower_node(normalizer)?;
+            let magnitude = self.abs(&density);
+            let outside = self.compare("EQ", &magnitude, &infinity);
+            let density_valid = self.compare("LE", &magnitude, &infinity);
+            let valid = self.or(&outside, &score_finite);
+            let valid = self.and(&density_valid, &valid);
+            // Dividing finite mass by an infinite normaliser gives zero.
+            // Score and density validity are checked before that scaling.
+            let normalizer_valid = self.compare("GT", &normalizer, &neg_inf);
+            let valid = self.and(&valid, &normalizer_valid);
+            let log_weight = self.sub(&density, &normalizer);
+            let log_weight = self.select(&outside, &neg_inf, &log_weight);
+            let score = self.select(&outside, &zero, &score);
+            (score, valid, Some(log_weight))
+        } else {
+            (score, score_finite, None)
+        };
+        let magnitude = self.abs(&score);
+        let nonzero = self.compare("GT", &magnitude, &zero);
+        let safe = self.select(&nonzero, &magnitude, &one);
+        let log_magnitude = self.log(&safe);
+        let scale = self.floor(&log_magnitude);
+        let log = log_weight.as_ref().map_or_else(
+            || log_magnitude.clone(),
+            |weight| self.add(&log_magnitude, weight),
+        );
+        let log = self.select(&nonzero, &log, &neg_inf);
+        let negative = self.compare("LT", &score, &zero);
+
+        let linear = self.quadrature_linear_mass(
+            &score,
+            &scale,
+            log_weight.as_ref(),
+            [jacobian, log_radius, kronrod],
+        );
+        Ok((log, valid, linear, negative))
     }
 
     fn rectangle_panel_axis(&mut self, value: &Value) -> Value {
@@ -327,16 +377,32 @@ impl Emitter<'_> {
             panel_widths.push(width);
             points.push((integrand.points[axis], physical));
         }
-        let body = self.quadrature_body::<2>(
-            integrand.body,
-            points.try_into().unwrap_or_else(|_| unreachable!()),
-        )?;
-        let (log, raw_valid, linear) = if integrand.kind == IntegralKind::Mass {
-            let (log, valid, linear) =
-                self.quadrature_raw_mass(&body, &jacobian, &log_radius, &rule.kronrod);
-            (log, Some(valid), linear)
-        } else {
-            (body, None, zero.clone())
+        let points: [(NodeId, Value); 2] = points.try_into().unwrap_or_else(|_| unreachable!());
+        let (log, raw_valid, linear, negative) = match integrand.kind {
+            IntegralKind::Signed { score, log_weight } => {
+                let score = self.quadrature_body(score, points.clone())?;
+                let (log, valid, linear, negative) = self.evaluate_signed_panel(
+                    score,
+                    points,
+                    log_weight,
+                    [&jacobian, &log_radius, &rule.kronrod],
+                )?;
+                (log, Some(valid), linear, Some(negative))
+            }
+            IntegralKind::Mass => {
+                let body = self.quadrature_body(integrand.body, points)?;
+                let (log, valid, linear) =
+                    self.quadrature_raw_mass(&body, &jacobian, &log_radius, &rule.kronrod);
+                (log, Some(valid), linear, None)
+            }
+            IntegralKind::Log => {
+                let body = self.quadrature_shifted_body(
+                    integrand.body,
+                    points,
+                    integrand.log_shift.as_ref(),
+                )?;
+                (body, None, zero.clone(), None)
+            }
         };
         let finite = self.compare("LT", &log, &infinity);
         let valid = self.and(&finite, &interior);
@@ -350,9 +416,20 @@ impl Emitter<'_> {
         let rounded = self.floor(&max);
         let shift = self.select(&nonzero, &rounded, &zero);
         let shifted = self.sub(&logs, &shift);
-        let values = self.exp(&shifted);
-        let weighted = self.mul(&values, &rule.kronrod);
-        let k = self.reduce_sum(&weighted);
+        let magnitude = self.exp(&shifted);
+        let weighted = self.mul(&magnitude, &rule.kronrod);
+        let absolute_mass = self.reduce_sum(&weighted);
+        // Use signed samples for estimates of error and variation. The
+        // absolute mass still sets the conditioning scale and roundoff floor.
+        let (values, k) = if let Some(negative) = negative {
+            let negative_value = self.neg(&magnitude);
+            let values = self.select(&negative, &negative_value, &magnitude);
+            let weighted = self.mul(&values, &rule.kronrod);
+            let k = self.reduce_sum(&weighted);
+            (values, k)
+        } else {
+            (magnitude, absolute_mass.clone())
+        };
         let discrepancy = |e: &mut Self, weights: &Value| {
             let weighted = e.mul(&values, weights);
             let reduced = e.reduce_sum(&weighted);
@@ -370,10 +447,10 @@ impl Emitter<'_> {
         let deviation = self.abs(&deviation);
         let deviation = self.mul(&deviation, &rule.kronrod);
         let variation = self.reduce_sum(&deviation);
-        let error = self.quadrature_error(&difference, &variation, &k);
+        let error = self.quadrature_error(&difference, &variation, &absolute_mass);
         let scale = self.add(&shift, &jacobian);
         let scale = self.add(&scale, &log_radius);
-        let mass = self.select(&nonzero, &k, &one);
+        let mass = self.select(&nonzero, &absolute_mass, &one);
         let mass = self.log(&mass);
         let mass = self.add(&scale, &mass);
         let error = self.select(&nonzero, &error, &one);

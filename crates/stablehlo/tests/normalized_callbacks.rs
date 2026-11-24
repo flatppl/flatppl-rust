@@ -387,3 +387,79 @@ fn rectangle_normalization_shares_the_mesh_across_iid_observations() {
     let hlo = emit_with_integrals(source, &Mode::LogDensity, true);
     assert_eq!(hlo.matches("stablehlo.while").count(), 1);
 }
+
+#[test]
+fn complementary_rectangle_masses_share_one_signed_mesh() {
+    let source = "
+        support = cartprod(interval(0.0, 1.0), interval(0.0, 1.0))
+        reference = Lebesgue(support)
+        score(x) = x[1] + x[2] - 1.0
+        positive = weighted(x -> max(score(x), 0.0), reference)
+        negative = weighted(x -> max(-score(x), 0.0), reference)
+        outputs = totalmass(positive) - totalmass(negative)
+    ";
+    let cases = [
+        (source.to_string(), 1),
+        (
+            source.replace("max(-score(x), 0.0)", "max(-score(x) - 0.25, 0.0)"),
+            2,
+        ),
+        (
+            source.replace(
+                "max(-score(x), 0.0), reference",
+                "max(-score(x), 0.0), Lebesgue(cartprod(interval(0.0, 1.0), interval(0.0, 0.5)))",
+            ),
+            2,
+        ),
+    ];
+    for (source, meshes) in cases {
+        let hlo = emit_with_integrals(&source, &Mode::LogDensity, true);
+        assert_eq!(hlo.matches("stablehlo.while").count(), meshes, "{source}");
+    }
+}
+
+#[test]
+fn log_shift_rescales_the_absolute_tolerance_in_one_and_two_dimensions() {
+    for (support, coordinate) in [
+        ("interval(0.0, 2.0)", "x"),
+        (
+            "cartprod(interval(0.0, 2.0), interval(0.0, 1.0))",
+            "x[1] + x[2]",
+        ),
+    ] {
+        let source = format!(
+            "
+            shift = external(reals)
+            slope = external(reals)
+            w(x, p) = p.shift + p.slope * ({coordinate})
+            support = {support}
+            m = logweighted(w, Lebesgue(support), record(shift = shift, slope = slope))
+            inputs = (shift, slope)
+            outputs = log(totalmass(m))
+            "
+        );
+        let hlo = emit_with_integrals(&source, &Mode::LogDensity, true);
+        let (preamble, mesh) = hlo.split_once("stablehlo.while").unwrap();
+        let safe_shift = preamble
+            .lines()
+            .find(|line| line.contains("stablehlo.select") && line.contains(", %arg0,"))
+            .and_then(|line| line.trim().split_once(" = "))
+            .map(|(name, _)| name)
+            .expect("finite additive shift");
+        assert!(preamble.lines().any(|line| {
+            line.contains("stablehlo.subtract") && line.contains(&format!(", {safe_shift} :"))
+        }));
+        assert!(mesh.lines().any(|line| {
+            line.contains("stablehlo.add") && line.contains(&format!(", {safe_shift} :"))
+        }));
+
+        let varying = source.replace("p.shift +", &format!("p.shift * ({coordinate}) +"));
+        let hlo = emit_with_integrals(&varying, &Mode::LogDensity, true);
+        let (preamble, _) = hlo.split_once("stablehlo.while").unwrap();
+        assert!(
+            !preamble
+                .lines()
+                .any(|line| line.contains("stablehlo.select") && line.contains(", %arg0,"))
+        );
+    }
+}

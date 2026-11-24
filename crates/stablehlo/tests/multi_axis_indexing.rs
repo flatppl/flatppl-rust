@@ -183,16 +183,37 @@ fn literal_only_and_all_slice_and_collapse_axes() {
 }
 
 #[test]
-fn unsupported_advanced_selectors_refuse() {
-    let multiple = emit(
-        "flatppl_compat = \"0.1\"\n\
-         matrix = elementof(cartpow(reals, [4, 3]))\n\
-         selected = get(matrix, [1, 2], [2, 1])\n\
-         inputs = (matrix)\noutputs = (selected)\n",
-    )
-    .expect_err("multiple vector selectors remain outside this lowering");
-    assert!(multiple.msg.contains("multiple integer-vector selectors"));
+fn independent_vector_selectors_form_a_cartesian_selection() {
+    let base = "matrix = elementof(cartpow(reals, [4, 3]))
+inputs = matrix
+";
+    let implicit = emit(&format!(
+        "{base}outputs = get(matrix, [3, 1, 3])
+"
+    ))
+    .unwrap();
+    let explicit = emit(&format!(
+        "{base}outputs = get(matrix, [3, 1, 3], all)
+"
+    ))
+    .unwrap();
+    assert_eq!(implicit, explicit);
 
+    let selected = emit(&format!(
+        "{base}outputs = get(matrix, [3, 1, 3], [3, 1, 1, 2])
+"
+    ))
+    .expect("row and column selectors take their Cartesian product");
+    assert!(selected.contains("-> tensor<3x4xf32>"), "{selected}");
+    assert_eq!(
+        selected.matches(r#""stablehlo.gather""#).count(),
+        2,
+        "{selected}"
+    );
+}
+
+#[test]
+fn unsupported_advanced_selectors_refuse() {
     let non_numeric = emit(
         "flatppl_compat = \"0.1\"\n\
          matrix = elementof(cartpow(booleans, [4, 3]))\n\
@@ -217,7 +238,7 @@ fn unsupported_advanced_selectors_refuse() {
          inputs = (a)\noutputs = (selected)\n",
     )
     .expect_err("nested array cells are not flat matrices");
-    assert!(nested.msg.contains("every cell axis must be selected"));
+    assert!(nested.msg.contains("too many selectors"));
 
     let batch_varying = emit(
         "flatppl_compat = \"0.1\"\n\
@@ -232,4 +253,53 @@ fn unsupported_advanced_selectors_refuse() {
             .msg
             .contains("one shared rank-1 integer vector")
     );
+}
+
+#[test]
+fn aggregate_of_position_matched_update_rows_lowers_to_scatter() {
+    let source = "x = external(cartpow(reals, [4, 2]))\n\
+                  row = external(cartpow(integers, 3))\n\
+                  updates = external(cartpow(reals, [3, 2]))\n\
+                  inputs = (x, row, updates)\n\
+                  d = aggregate(sum, [.r, .c], ifelse(indicesof(x)[1][.r] == row[.i], updates[.i, .c], 0.0))\n\
+                  outputs = d\n";
+    let ir = emit(source).unwrap();
+    assert!(ir.contains(r#""stablehlo.scatter""#), "{ir}");
+    assert!(ir.contains("update_window_dims = [1]"), "{ir}");
+    assert!(!ir.contains("tensor<4x2x3x"), "{ir}");
+
+    let nonzero = emit(&source.replace(", 0.0))", ", -1.0))")).unwrap();
+    assert!(!nonzero.contains(r#""stablehlo.scatter""#), "{nonzero}");
+    assert!(nonzero.contains("stablehlo.reduce"), "{nonzero}");
+}
+
+#[test]
+fn masked_row_quotient_scatters_one_update_per_pair() {
+    let source = "
+matrix = external(cartpow(reals, [4, 3]))
+docs = external(cartpow(integers, 6))
+words = external(cartpow(integers, 6))
+seed = external(cartpow(reals, 6))
+row(i, m) = m[i, :]
+source = row.(indicesof(zeros(4)), [matrix])
+denominator = rowstack(source[docs])
+word_match = addaxes(words, 0, 1) .== addaxes(indicesof(denominator[1]), 1, 0)
+numerator = addaxes(seed, 0, 1)
+weighted = ifelse.(word_match, ifelse.(iszero.(numerator), 0.0, numerator ./ denominator), 0.0)
+updates = row.(indicesof(zeros(6)), [weighted])
+out = aggregate(sum, [.doc, .word], ifelse(indicesof(matrix)[1][.doc] == docs[.item], rowstack(updates)[.item, .word], 0.0))
+inputs = (matrix, docs, words, seed)
+outputs = out
+";
+    let ir = emit(source).unwrap();
+    assert!(ir.contains(r#""stablehlo.scatter""#), "{ir}");
+    assert!(ir.contains("tensor<12xf32>"), "{ir}");
+    assert!(!ir.contains("tensor<6x3x"), "{ir}");
+
+    let unmasked = emit(&source.replace(
+        "numerator ./ denominator), 0.0)",
+        "numerator ./ denominator), 1.0)",
+    ))
+    .unwrap();
+    assert!(unmasked.contains("tensor<6x3x"), "{unmasked}");
 }

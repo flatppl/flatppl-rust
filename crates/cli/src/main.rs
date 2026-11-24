@@ -267,6 +267,27 @@ enum Command {
         #[command(flatten)]
         egglog: EgglogArgs,
     },
+    /// Emit FlatPPL source that returns query values and their derivatives.
+    #[cfg(feature = "autodiff")]
+    Autodiff {
+        /// FlatPPL model with declared inputs and outputs.
+        input: PathBuf,
+        /// Real scalar, fixed-shape real array, or record of these to differentiate (repeatable).
+        #[arg(long, required_unless_present = "empty_wrt")]
+        wrt: Vec<String>,
+        /// Differentiate with an explicitly empty selection of inputs.
+        #[arg(long, conflicts_with = "wrt")]
+        empty_wrt: bool,
+        /// Derivative transform to emit.
+        #[arg(long, value_enum, default_value_t = AdMode::Gradient)]
+        mode: AdMode,
+        /// Permit numerical integrals in the generated source.
+        #[arg(long)]
+        numerical_integrals: bool,
+        /// Output file. Write to stdout if omitted.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Emit textual StableHLO for a FlatPPL model.
     ///
     /// Always determinizes first (eliminate the measure layer), then prints
@@ -293,6 +314,14 @@ enum Command {
         /// Floating-point precision for emitted tensors.
         #[arg(long, default_value = "f32", value_parser = ["f32", "f64"])]
         dtype: String,
+        /// Differentiate this input before emitting StableHLO (repeatable).
+        #[cfg(feature = "autodiff")]
+        #[arg(long, conflicts_with = "prepare_data")]
+        ad_wrt: Vec<String>,
+        /// Source derivative transform.
+        #[cfg(feature = "autodiff")]
+        #[arg(long, value_enum, default_value_t = AdMode::Gradient, requires = "ad_wrt")]
+        ad_mode: AdMode,
         /// Lowering profile for the executing backend; the output runs on any backend.
         #[arg(long, default_value = "cpu", value_parser = ["cpu", "gpu"])]
         target: String,
@@ -448,6 +477,17 @@ enum EmitForm {
     Flatppl,
     /// FlatPIR S-expressions.
     Flatpir,
+}
+
+#[cfg(feature = "autodiff")]
+#[derive(Clone, Copy, ValueEnum)]
+enum AdMode {
+    /// Gradient of one real scalar output.
+    Gradient,
+    /// Jacobian-vector product with an appended tangent for each selected input.
+    Jvp,
+    /// Vector-Jacobian product with an appended cotangent for each output.
+    Vjp,
 }
 
 /// A reduction family for `--reduce`. It names no emitter type, so other verbs
@@ -607,6 +647,21 @@ fn main() -> ExitCode {
             },
             &egglog.into_policy(),
         ),
+        #[cfg(feature = "autodiff")]
+        Command::Autodiff {
+            input,
+            wrt,
+            empty_wrt,
+            mode,
+            numerical_integrals,
+            output,
+        } => autodiff_cmd(
+            &input,
+            if empty_wrt { &[] } else { &wrt },
+            mode,
+            numerical_integrals,
+            output.as_deref(),
+        ),
         #[cfg(feature = "stablehlo")]
         Command::Stablehlo {
             prepare_data,
@@ -624,6 +679,10 @@ fn main() -> ExitCode {
             integration_rtol,
             integration_atol,
             integration_max_intervals,
+            #[cfg(feature = "autodiff")]
+            ad_wrt,
+            #[cfg(feature = "autodiff")]
+            ad_mode,
             output,
             egglog,
         } => stablehlo_cmd(
@@ -657,6 +716,8 @@ fn main() -> ExitCode {
                 explain_reductions,
                 pack_summaries,
             },
+            #[cfg(feature = "autodiff")]
+            (&ad_wrt, ad_mode),
             &egglog.into_policy(),
         ),
         #[cfg(feature = "stan")]
@@ -1357,12 +1418,16 @@ fn refuse_message(
 /// a node the determiniser synthesized (in no source binding).
 #[cfg(any(feature = "determinize", feature = "stablehlo", feature = "stan"))]
 fn enclosing_binding(module: &flatppl_core::Module, node: flatppl_core::NodeId) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
     for (_, binding) in module.bindings() {
         let mut queue = vec![binding.rhs];
         let mut qi = 0;
         while qi < queue.len() {
             let id = queue[qi];
             qi += 1;
+            if !seen.insert(id) {
+                continue;
+            }
             if id == node {
                 return Some(module.resolve(binding.name).to_string());
             }
@@ -1518,6 +1583,63 @@ fn determinize_cmd(
     Ok(())
 }
 
+#[cfg(feature = "autodiff")]
+fn autodiff_cmd(
+    input: &Path,
+    wrt: &[String],
+    mode: AdMode,
+    numerical_integrals: bool,
+    output: Option<&Path>,
+) -> Result<(), Failure> {
+    let resolver = CliResolver::cache_only();
+    let (surface, bundle, source) = load_and_infer(input, &resolver)?;
+    let options = if numerical_integrals {
+        flatppl_autodiff::NUMERICAL_SOURCE_OPTIONS
+    } else {
+        Default::default()
+    };
+    let mut lowered = flatppl_autodiff::determinize_query_with_options(&surface, &bundle, &options)
+        .map_err(|e| Failure::Refuse(refuse_message(input, &source, &surface, &e)))?;
+    load_fixed_data(&mut lowered, &resolver, input, &source, &surface)?;
+    let mut derivative = differentiate(&lowered, wrt, mode, &options)?;
+    flatppl_autodiff::prepare_source_with_options(&mut derivative, &options)
+        .map_err(|error| Failure::Refuse(error.reason))?;
+    let rendered = flatppl_syntax::print(&derivative);
+    match output {
+        Some(path) => fs::write(path, rendered).map_err(|e| {
+            Failure::Plain(format!(
+                "writing `{}`: {e}",
+                flatppl_cli::terminal_path(path)
+            ))
+        })?,
+        None => print!("{rendered}"),
+    }
+    Ok(())
+}
+
+#[cfg(feature = "autodiff")]
+fn differentiate(
+    module: &flatppl_core::Module,
+    wrt: &[String],
+    mode: AdMode,
+    options: &flatppl_determinizer::LoweringOptions<'_>,
+) -> Result<flatppl_core::Module, Failure> {
+    let wrt: Vec<_> = wrt.iter().map(String::as_str).collect();
+    let transform = match mode {
+        AdMode::Gradient => flatppl_autodiff::gradient_with_options,
+        AdMode::Jvp => flatppl_autodiff::jvp_with_options,
+        AdMode::Vjp => flatppl_autodiff::vjp_with_options,
+    };
+    transform(module, &wrt, options).map_err(|error| {
+        let site = error
+            .node
+            .and_then(|node| enclosing_binding(module, node))
+            .map(|name| format!(" in `{name}`"))
+            .unwrap_or_default();
+        Failure::Refuse(format!("autodiff: refuse{site}: {error}"))
+    })
+}
+
 /// `flatppl stablehlo <in.flatppl> [--mode logdensity|sample] [-o out]` —
 /// determinize a FlatPPL model to FlatPDL, then emit textual StableHLO for
 /// `mode`, printing to `output`/stdout. An unrecognized `--mode` exits 2
@@ -1531,6 +1653,7 @@ fn stablehlo_cmd(
     opts: &flatppl_stablehlo::EmitOptions,
     output: Option<&Path>,
     likelihood: LikelihoodOutput<'_>,
+    #[cfg(feature = "autodiff")] ad: (&[String], AdMode),
     rules: &RulePolicy,
 ) -> Result<(), Failure> {
     let LikelihoodOutput {
@@ -1580,9 +1703,19 @@ fn stablehlo_cmd(
         ));
     }
     let roots = Some(abi_syms);
+    #[cfg(feature = "autodiff")]
+    let source_ad = !ad.0.is_empty();
+    #[cfg(not(feature = "autodiff"))]
+    let source_ad = false;
+    if source_ad && !matches!(mode, flatppl_stablehlo::Mode::LogDensity) {
+        return Err(Failure::Usage("--ad-wrt requires logdensity mode".into()));
+    }
 
     let lowering = flatppl_determinizer::LoweringOptions {
-        disable_sufficient_statistics: !opts.sufficient_statistics || preparation.is_some(),
+        disable_optimizations: source_ad,
+        disable_sufficient_statistics: source_ad
+            || !opts.sufficient_statistics
+            || preparation.is_some(),
         ..opts.lowering_options()
     };
     let mut report = flatppl_determinizer::ReductionReport::default();
@@ -1610,6 +1743,11 @@ fn stablehlo_cmd(
     let mut lowered =
         lowered.map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
     load_fixed_data(&mut lowered, &resolver, input, &source, &module)?;
+    #[cfg(feature = "autodiff")]
+    if source_ad {
+        lowered = differentiate(&lowered, ad.0, ad.1, &lowering)?;
+        flatppl_determinizer::prepare_serialization(&mut lowered, None);
+    }
     if let Some((path, data_inputs)) = preparation {
         if !opts.sufficient_statistics || !matches!(mode, flatppl_stablehlo::Mode::LogDensity) {
             return Err(Failure::Usage(

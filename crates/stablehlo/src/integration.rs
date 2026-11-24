@@ -6,24 +6,42 @@
 //! The primal error estimate does not bound AD error.
 //! All panels and totals stay in log space, including the error estimates.
 
+use flatppl_core::graph::expect_builtin_call;
+use flatppl_core::{ScalarType, Type};
+
 use super::*;
 
 use crate::IntegrationOptions;
 
 #[path = "integration/rectangle.rs"]
 mod rectangle;
+#[path = "integration/signed_pair.rs"]
+mod signed_pair;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IntegralKind {
     Log,
     Mass,
+    Signed {
+        score: NodeId,
+        /// Unnormalised log density and its scalar log normaliser.
+        log_weight: Option<(NodeId, NodeId)>,
+    },
 }
 
 #[derive(Clone, Copy)]
-struct Integrand {
+struct Integrand<'a> {
     body: NodeId,
     point: NodeId,
     kind: IntegralKind,
+    log_shift: Option<&'a LogShift>,
+}
+
+struct LogShift {
+    remainder: NodeId,
+    offset: Value,
+    finite: Value,
+    safe_offset: Value,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -98,6 +116,12 @@ impl Emitter<'_> {
                 "numerical integration requires a non-nested integral with one or two coordinates",
             ));
         }
+        if args.len() != 7 && matches!(kind, IntegralKind::Signed { .. }) {
+            return Err(EmitError::at(
+                id,
+                "signed quadrature requires two coordinates",
+            ));
+        }
         let inputs = self.integral_inputs(args);
         if !inputs.is_empty() {
             return self.lower_batched_integral(id, args, &inputs, kind);
@@ -155,6 +179,13 @@ impl Emitter<'_> {
         let lo = self.convert(&lo, ElemKind::Real);
         let hi = self.convert(&hi, ElemKind::Real);
         let cuts = self.integral_breakpoints(args[0], args[1], true)?;
+        let log_shift = self.quadrature_log_shift(kind, args[0], [args[1]])?;
+        let integrand = Integrand {
+            body: args[0],
+            point: args[1],
+            kind,
+            log_shift: log_shift.as_ref(),
+        };
         let mut bounds = vec![lo.clone()];
         let mut seen = HashSet::from([lo.ssa.clone(), hi.ssa.clone()]);
         for cut in cuts {
@@ -206,17 +237,8 @@ impl Emitter<'_> {
         let one = self.scalar(1.0);
         for segment in 0..segments {
             let index = self.int_value_const(segment as i64);
-            let (mass, error, panel_valid, _) = self.quadrature_panel(
-                Integrand {
-                    body: args[0],
-                    point: args[1],
-                    kind,
-                },
-                &bounds,
-                &index,
-                &zero,
-                &one,
-            )?;
+            let (mass, error, panel_valid, _) =
+                self.quadrature_panel(integrand, &bounds, &index, &zero, &one)?;
             segment_ids = self.scan_update(&segment_ids, &index, &index);
             masses = self.scan_update(&masses, &mass, &index);
             errors = self.scan_update(&errors, &error, &index);
@@ -225,7 +247,7 @@ impl Emitter<'_> {
         let total = self.integral_logsum(&masses);
         let error = self.integral_logsum(&errors);
         let log_rtol = self.scalar(options.rtol.ln());
-        let log_atol = self.scalar(options.atol.ln());
+        let log_atol = self.quadrature_log_atol(options.atol, integrand.log_shift);
         let initial = vec![
             self.int_value_const(segments as i64),
             left,
@@ -281,17 +303,8 @@ impl Emitter<'_> {
                 // A fixed two-panel rule is emitted directly; quadrature nodes are
                 // batched. Only the adaptive worklist needs a runtime loop.
                 for (child_a, child_b, target) in [(&a, &middle, &index), (&middle, &b, &s[0])] {
-                    let (mass, error, panel_valid, _) = e.quadrature_panel(
-                        Integrand {
-                            body: args[0],
-                            point: args[1],
-                            kind,
-                        },
-                        &bounds,
-                        &segment,
-                        child_a,
-                        child_b,
-                    )?;
+                    let (mass, error, panel_valid, _) =
+                        e.quadrature_panel(integrand, &bounds, &segment, child_a, child_b)?;
                     left = e.scan_update(&left, child_a, target);
                     right = e.scan_update(&right, child_b, target);
                     masses = e.scan_update(&masses, &mass, target);
@@ -329,17 +342,8 @@ impl Emitter<'_> {
             let left = self.axes_view(&result[1], panel_axes.clone());
             let right = self.axes_view(&result[2], panel_axes.clone());
             let segments = self.axes_view(&result[8], panel_axes);
-            let (logs, _, _, linear) = self.quadrature_panel(
-                Integrand {
-                    body: args[0],
-                    point: args[1],
-                    kind,
-                },
-                &bounds,
-                &segments,
-                &left,
-                &right,
-            )?;
+            let (logs, _, _, linear) =
+                self.quadrature_panel(integrand, &bounds, &segments, &left, &right)?;
             let masses = if kind == IntegralKind::Mass {
                 linear
             } else {
@@ -368,6 +372,7 @@ impl Emitter<'_> {
         } else {
             result[5].clone()
         };
+        let value = self.restore_log_shift(value, integrand.log_shift);
         let value = self.select(&valid, &value, &nan);
         let empty = self.compare("EQ", &lo, &hi);
         let finite = self.abs(&lo);
@@ -756,15 +761,111 @@ impl Emitter<'_> {
         self.select(&nonzero, &log, &neg_inf)
     }
 
+    fn quadrature_log_shift<const N: usize>(
+        &mut self,
+        kind: IntegralKind,
+        body: NodeId,
+        axes: [NodeId; N],
+    ) -> Result<Option<LogShift>, EmitError> {
+        if kind != IntegralKind::Log {
+            return Ok(None);
+        }
+        let body = self.resolve_ref_one(body);
+        let Some(call) = expect_builtin_call(self.m, body, "add") else {
+            return Ok(None);
+        };
+        let [left, right] = *call.args else {
+            return Ok(None);
+        };
+        if !call.named.is_empty() || call.inputs.is_some() {
+            return Ok(None);
+        }
+        let varies = |node| {
+            axes.iter()
+                .any(|&axis| self.integral_depends_on(node, axis))
+        };
+        let (offset, remainder) = match (varies(left), varies(right)) {
+            (false, true) => (left, right),
+            (true, false) => (right, left),
+            _ => return Ok(None),
+        };
+        // The raw addition can promote a varying integer operand. Do not
+        // extract it as a standalone real integrand unless its type permits it.
+        if !matches!(
+            self.type_of(remainder),
+            Some(Type::Scalar(ScalarType::Real))
+        ) {
+            return Ok(None);
+        }
+        let offset = self.lower_node(offset)?;
+        if self.cell_ty(&offset) != MlirTy::Scalar
+            || !matches!(offset.elem, ElemKind::Real | ElemKind::Int)
+        {
+            return Ok(None);
+        }
+        let offset = self.convert(&offset, ElemKind::Real);
+        let magnitude = self.abs(&offset);
+        let infinity = self.scalar(f64::INFINITY);
+        let finite = self.compare("LT", &magnitude, &infinity);
+        let zero = self.scalar(0.0);
+        let safe_offset = self.select(&finite, &offset, &zero);
+        Ok(Some(LogShift {
+            remainder,
+            offset,
+            finite,
+            safe_offset,
+        }))
+    }
+
+    fn quadrature_log_atol(&mut self, atol: f64, shift: Option<&LogShift>) -> Value {
+        let log_atol = self.scalar(atol.ln());
+        // exp(offset) multiplies both the mass and its absolute error.
+        // Measure the original absolute tolerance on the unshifted scale.
+        shift.map_or_else(|| log_atol.clone(), |f| self.sub(&log_atol, &f.safe_offset))
+    }
+
+    fn restore_log_shift(&mut self, value: Value, shift: Option<&LogShift>) -> Value {
+        if let Some(shift) = shift {
+            self.add(&value, &shift.safe_offset)
+        } else {
+            value
+        }
+    }
+
+    fn quadrature_shifted_body<const N: usize>(
+        &mut self,
+        body: NodeId,
+        points: [(NodeId, Value); N],
+        shift: Option<&LogShift>,
+    ) -> Result<Value, EmitError> {
+        let Some(shift) = shift else {
+            return self.quadrature_body(body, points);
+        };
+        let remainder = self.quadrature_body(shift.remainder, points)?;
+        let raw = self.add(&remainder, &shift.offset);
+        let magnitude = self.abs(&raw);
+        let infinity = self.scalar(f64::INFINITY);
+        let raw_finite = self.compare("LT", &magnitude, &infinity);
+        let shifted = self.and(&shift.finite, &raw_finite);
+        // Preserve non-finite samples and overflow from the authored
+        // addition. Only finite samples use the shift.
+        Ok(self.select(&shifted, &remainder, &raw))
+    }
+
     fn quadrature_panel(
         &mut self,
-        integrand: Integrand,
+        integrand: Integrand<'_>,
         bounds: &[Value],
         segment: &Value,
         a: &Value,
         b: &Value,
     ) -> Result<(Value, Value, Value, Value), EmitError> {
-        let Integrand { body, point, kind } = integrand;
+        let Integrand {
+            body,
+            point,
+            kind,
+            log_shift,
+        } = integrand;
         let nodes = self.quadrature_constants(&NODES);
         let kronrod = self.quadrature_constants(&KRONROD);
         let gauss = self.quadrature_constants(&GAUSS);
@@ -802,7 +903,7 @@ impl Emitter<'_> {
         let above = self.compare("GT", &x, &lo);
         let below = self.compare("LT", &x, &hi);
         let physical_interior = self.and(&above, &below);
-        let body = self.quadrature_body(body, [(point, x)])?;
+        let body = self.quadrature_shifted_body(body, [(point, x)], log_shift)?;
         let inf = self.scalar(f64::INFINITY);
         let (log, raw_valid, linear) = if kind == IntegralKind::Mass {
             let log_radius = self.log(&radius);
@@ -949,7 +1050,6 @@ impl Emitter<'_> {
     ) -> (Value, Value, Value) {
         let zero = self.scalar(0.0);
         let one = self.scalar(1.0);
-        let half = self.scalar(0.5);
         let inf = self.scalar(f64::INFINITY);
         let nonnegative = self.compare("GE", body, &zero);
         let finite = self.compare("LT", body, &inf);
@@ -960,12 +1060,24 @@ impl Emitter<'_> {
         let scale = self.floor(&log);
         let neg_inf = self.scalar(f64::NEG_INFINITY);
         let log = self.select(&positive, &log, &neg_inf);
+        let mass = self.quadrature_linear_mass(body, &scale, None, [jacobian, log_radius, kronrod]);
+        (log, valid, mass)
+    }
+
+    fn quadrature_linear_mass(
+        &mut self,
+        body: &Value,
+        scale: &Value,
+        log_weight: Option<&Value>,
+        [jacobian, log_radius, kronrod]: [&Value; 3],
+    ) -> Value {
+        let half = self.scalar(0.5);
         // Replay a scaled linear quadrature sum so AD sees the raw
         // integrand, including at zero. The per-node discrete scale does
         // not couple a large weight at one node to another node's factor.
         // Dividing by a huge scale can lower to a subnormal reciprocal on
         // XLA. Two balanced multiplications keep both factors representable.
-        let half_scale = self.mul(&scale, &half);
+        let half_scale = self.mul(scale, &half);
         let half_scale = self.neg(&half_scale);
         let half_scale = self.exp(&half_scale);
         let normalized = self.mul(body, &half_scale);
@@ -974,13 +1086,24 @@ impl Emitter<'_> {
         // intermediate normalized * width may overflow even if the
         // Kronrod-weighted term and final integral are finite.
         let log_kronrod = self.log(kronrod);
-        let factor = self.add(&scale, jacobian);
+        let factor = log_weight.map_or_else(|| scale.clone(), |weight| self.add(scale, weight));
+        let factor = self.add(&factor, jacobian);
         let factor = self.add(&factor, log_radius);
         let factor = self.add(&factor, &log_kronrod);
-        let factor = self.exp(&factor);
+        let mut factor = self.exp(&factor);
+        if log_weight.is_some() {
+            // A zero score has zero log mass, even when exponentiating
+            // its scale alone would overflow. Keep finite factors at zero
+            // so a later derivative can still see the raw score tangent.
+            let zero = self.scalar(0.0);
+            let infinity = self.scalar(f64::INFINITY);
+            let zero_score = self.compare("EQ", body, &zero);
+            let overflowing = self.compare("EQ", &factor, &infinity);
+            let inactive = self.and(&zero_score, &overflowing);
+            factor = self.select(&inactive, &zero, &factor);
+        }
         let weighted = self.mul(&normalized, &factor);
-        let mass = self.reduce_sum(&weighted);
-        (log, valid, mass)
+        self.reduce_sum(&weighted)
     }
 
     fn quadrature_constants(&mut self, xs: &[f64]) -> Value {

@@ -2,9 +2,9 @@
 //!
 //! The ordinary one-selector vector paths remain in `ops`: their established
 //! slice/gather IR is a compatibility surface. This module owns the stricter
-//! tensor contract: every cell axis has a selector, literal and singleton axes
-//! collapse, `all` survives, and at most one shared integer-vector selector
-//! replaces its axis. Callable batch prefixes are carried but never selected.
+//! tensor contract: omitted trailing axes retain all entries, literal and
+//! singleton axes collapse, and each shared integer-vector selector replaces
+//! its own axis. Callable batch prefixes are carried but never selected.
 
 use flatppl_core::{Node, NodeId, Scalar};
 
@@ -60,18 +60,19 @@ pub(crate) fn lower_multi_axis(
              StableHLO emitter (§07 `get` allows it); index a 0/1 real or integer array instead",
         ));
     }
-    if selector_nodes.len() != cell_dims.len() {
+    if selector_nodes.len() > cell_dims.len() {
         return Err(EmitError::at(
             id,
             format!(
-                "get/get0: {} selector(s) for a rank-{} tensor cell; every cell axis must be selected",
+                "get/get0: too many selectors ({}) for a rank-{} tensor cell",
                 selector_nodes.len(),
                 cell_dims.len()
             ),
         ));
     }
 
-    let selectors = lower_selectors(e, id, selector_nodes, &cell_dims, base)?;
+    let mut selectors = lower_selectors(e, id, selector_nodes, &cell_dims, base)?;
+    selectors.resize_with(cell_dims.len(), || TensorSelector::All);
     // Mapped point selectors choose one scalar per batch. Flatten the shared
     // tensor before gathering so successive axes do not replicate entire rows.
     if e.batch_rank(&operand) == 0
@@ -163,6 +164,17 @@ pub(crate) fn lower_multi_axis(
 
     let mut cell_axis = 0;
     for selector in &selectors {
+        if matches!(
+            selector,
+            TensorSelector::Vector(_) | TensorSelector::DynamicScalar(_)
+        ) && let MlirTy::Ranked(dims) = &selected.ty
+            && dims.iter().any(Option::is_none)
+        {
+            return Err(EmitError::at(
+                id,
+                "get/get0: sequential gathers require static intermediate shapes",
+            ));
+        }
         match selector {
             TensorSelector::Scalar(_) => {}
             TensorSelector::All => cell_axis += 1,
@@ -206,7 +218,6 @@ fn lower_selectors(
     base: i64,
 ) -> Result<Vec<TensorSelector>, EmitError> {
     let mut selectors = Vec::with_capacity(nodes.len());
-    let mut vector_count = 0usize;
     for (&node, &extent) in nodes.iter().zip(cell_dims) {
         let selector = match e.node(node) {
             Node::Lit(Scalar::Int(i)) => {
@@ -247,7 +258,6 @@ fn lower_selectors(
                         "get/get0: a non-literal multi-axis selector must be one shared rank-1 integer vector",
                     ));
                 }
-                vector_count += 1;
                 let size =
                     extent.ok_or_else(|| EmitError::at(id, "get/get0 requires a static axis"))?;
                 let index = e.checked_index(id, &index, size, base)?;
@@ -255,12 +265,6 @@ fn lower_selectors(
             }
         };
         selectors.push(selector);
-    }
-    if vector_count > 1 {
-        return Err(EmitError::at(
-            id,
-            "get/get0: multiple integer-vector selectors have no implemented tensor lowering",
-        ));
     }
     Ok(selectors)
 }

@@ -387,6 +387,7 @@ pub fn optimise_query_with_rules(
 pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
     flatppl_determinizer::LoweringOptions {
         compact_log_cdf_difference: false,
+        disable_optimizations: false,
         disable_sufficient_statistics: false,
         share_normal_scale: false,
         preserve_rand_tuple: false,

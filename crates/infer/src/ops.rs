@@ -2754,6 +2754,10 @@ fn broadcast_collection_cell(name: &str, cell: &Type) -> Option<Type> {
         "var" | "std" | "median" | "quantile" | "l1norm" | "l2norm" | "linfnorm" | "logsumexp" => {
             matches!(elem, Type::Scalar(_)).then_some(Type::Scalar(ScalarType::Real))
         }
+        "cumsum" | "cumprod" if bool_elem_array(Some(cell)) => {
+            Some(cumulative_bool_type(Some(cell)))
+        }
+        "cumsum" | "cumprod" | "cummax" | "cummin" => Some(cell.clone()),
         "lany" | "lall" => Some(Type::Scalar(ScalarType::Boolean)),
         "lengthof" => Some(Type::Scalar(ScalarType::Integer)),
         "sizeof" => Some(sizeof_type(Some(cell))),
@@ -3691,6 +3695,7 @@ fn get_array_type(
     for (dim, (node, ty, _)) in shape.iter().zip(selectors) {
         match inf.module.node(*node) {
             Node::Const(name) if inf.module.resolve(*name) == "all" => retained.push(*dim),
+            Node::Const(name) if inf.module.resolve(*name) == "only" && *dim == Dim::Static(1) => {}
             Node::Axis(_) | Node::Lit(Scalar::Int(_)) => {}
             _ => match ty {
                 Type::Scalar(ScalarType::Integer) => {}
@@ -7751,7 +7756,7 @@ fn broadcast_type(
             "complex" | "cis" | "real" | "imag" | "conj" | "abs" | "abs2" | "exp" | "log" | "sqrt"
             | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
             | "acosh" | "atanh" | "invlogit" | "invprobit" | "logit" | "log1p" | "expm1"
-            | "loggamma",
+            | "loggamma" | "boolean",
             _,
         ) => function_result(inf.module, &op_name, &cells).unwrap_or(Type::Deferred),
         // The comparisons and the logical connectives, whose per-cell result is a

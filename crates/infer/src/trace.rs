@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use flatppl_core::{
-    BindingId, Call, CallHead, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol,
-    Type, ValueSet,
+    BindingId, Call, CallHead, Inputs, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar,
+    Symbol, Type, ValueSet,
 };
 
 use crate::modules::{CallableWorkspace, Dependency, InferSession, Resolution, Resolved};
@@ -86,8 +86,85 @@ enum CallResume {
     Valueset(CallFrame, Type, Phase, Resume<ValueSet>),
 }
 
+#[derive(PartialEq)]
+struct BodySeed {
+    node: NodeId,
+    annotation: (Type, Phase, ValueSet),
+    interface: Option<crate::callable::Interface>,
+}
+
+struct BodySpecialization {
+    seeds: Vec<BodySeed>,
+    annotation: (Type, Phase),
+    valueset: ValueSet,
+}
+
+struct BodyMemo {
+    reachable: Option<Box<[NodeId]>>,
+    results: Vec<BodySpecialization>,
+}
+
+impl BodyMemo {
+    fn new(module: &Module, body: NodeId) -> Self {
+        let mut reachable = HashSet::new();
+        let mut pending = vec![body];
+        while let Some(node) = pending.pop() {
+            if !reachable.insert(node) {
+                continue;
+            }
+            match module.node(node) {
+                Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                }) => {
+                    if let Some(binding) = module.binding_by_name(*name) {
+                        pending.push(module.binding(binding).rhs);
+                    }
+                }
+                Node::Ref(Ref {
+                    ns: RefNs::Module(_),
+                    ..
+                })
+                | Node::Call(Call {
+                    inputs: Some(Inputs::Auto),
+                    ..
+                }) => {
+                    // Import resolution and inferred interfaces use enclosing state.
+                    return Self {
+                        reachable: None,
+                        results: Vec::new(),
+                    };
+                }
+                Node::Call(Call {
+                    inputs: Some(Inputs::Spec(entries)),
+                    ..
+                }) => {
+                    for (_, reference) in entries {
+                        if reference.ns == RefNs::SelfMod
+                            && let Some(binding) = module.binding_by_name(reference.name)
+                        {
+                            pending.push(module.binding(binding).rhs);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            module.for_each_child(node, |child| pending.push(child));
+        }
+        let mut reachable: Vec<_> = reachable.into_iter().collect();
+        reachable.sort_unstable();
+        Self {
+            reachable: Some(reachable.into_boxed_slice()),
+            results: Vec::new(),
+        }
+    }
+}
+
+type BodyMemos = HashMap<NodeId, BodyMemo>;
+
 struct BodyFrame {
     body: NodeId,
+    memo_key: Option<Vec<BodySeed>>,
     seeds: Vec<(NodeId, Resolved)>,
     targets: Option<Box<LocalTargets>>,
     scope: Scope,
@@ -103,6 +180,7 @@ struct ModuleFrame {
     key: (String, String),
     path: String,
     binding: String,
+    body_memos: BodyMemos,
 }
 
 struct ImportedCallFrame {
@@ -115,11 +193,13 @@ struct ImportedCallFrame {
     workspace_tags: Rc<HashSet<NodeId>>,
     workspace_axis_errors: Rc<Vec<(NodeId, Diagnostic)>>,
     workspace_bindings: Rc<HashMap<Symbol, BindingId>>,
+    body_memos: BodyMemos,
 }
 
 pub(crate) struct Inferencer<'m, 's> {
     pub(crate) module: &'m mut Module,
     pub(crate) level: Level,
+    body_memos: BodyMemos,
     /// Spans the dependency bundle; read by the `RefNs::Module` arm to resolve
     /// cross-module references.
     pub(crate) session: &'s InferSession<'s>,
@@ -224,6 +304,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             module,
             level,
             session,
+            body_memos: HashMap::new(),
             diags: Vec::new(),
             inferred: HashMap::new(),
             vsets: HashMap::new(),
@@ -689,9 +770,22 @@ impl<'m, 's> Inferencer<'m, 's> {
                     self.finish_node(node, work);
                 }
                 Work::ResumeBody(frame) => {
-                    let ty = self.inferred[&frame.body].0.clone();
+                    let (ty, phase) = self.node_annotation(frame.body);
                     let vset = self.lookup_valueset(frame.body);
                     self.auto_inputs.pop();
+                    if let Some(key) = frame.memo_key
+                        && ops::first_failed(&ty).is_none()
+                    {
+                        let memo = self.body_memos.get_mut(&frame.body).unwrap();
+                        // A polymorphic body can see arbitrarily many signatures.
+                        if memo.results.len() < 8 {
+                            memo.results.push(BodySpecialization {
+                                seeds: key,
+                                annotation: (ty.clone(), phase),
+                                valueset: vset.clone(),
+                            });
+                        }
+                    }
                     // A substituted body whose type FAILED reports its errors for the
                     // call: without them the refusal leaves a `%failed` at exit 0. A body
                     // that still types keeps them local, since a speculative substitution
@@ -757,6 +851,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                     let dependency = std::mem::replace(self.module, frame.module);
                     self.kernel_tag_nodes = frame.kernel_tag_nodes;
                     self.auto_inputs = frame.auto_inputs;
+                    self.body_memos = frame.body_memos;
                     self.restore_scope(frame.scope);
                     self.session
                         .finish_dependency(frame.key.clone(), dependency, sets, interfaces);
@@ -776,6 +871,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                     let dependency = std::mem::replace(self.module, frame.module);
                     self.kernel_tag_nodes = frame.kernel_tag_nodes;
                     self.auto_inputs = frame.auto_inputs;
+                    self.body_memos = frame.body_memos;
                     self.restore_scope(frame.scope);
                     let result = crate::modules::reintern_resolved(
                         self.module,
@@ -902,6 +998,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             key,
             path,
             binding,
+            body_memos: std::mem::take(&mut self.body_memos),
         })));
         self.schedule_bindings(work);
     }
@@ -1162,6 +1259,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             workspace_tags: kernel_tags,
             workspace_axis_errors: axis_errors,
             workspace_bindings: bindings,
+            body_memos: std::mem::take(&mut self.body_memos),
         })));
         work.push(Work::Enter(root));
         true
@@ -1272,14 +1370,43 @@ impl<'m, 's> Inferencer<'m, 's> {
                 (Type::Failed("recursive definition".into()), Phase::Fixed),
             );
         }
+        let mut memo_key = None;
+        if !recursive {
+            let memo = self
+                .body_memos
+                .entry(body)
+                .or_insert_with(|| BodyMemo::new(self.module, body));
+            if let Some(reachable) = &memo.reachable {
+                // A new body scope reads only effective substitutions on its ancestor graph.
+                let mut key: Vec<_> = self
+                    .seeds
+                    .iter()
+                    .filter(|(node, _)| reachable.binary_search(node).is_ok())
+                    .map(|(&node, annotation)| BodySeed {
+                        node,
+                        annotation: annotation.clone(),
+                        interface: self.module_callable_interfaces.get(&node).cloned(),
+                    })
+                    .collect();
+                key.sort_unstable_by_key(|seed| seed.node);
+                if let Some(result) = memo.results.iter().find(|result| result.seeds == key) {
+                    let set = result.valueset.clone();
+                    self.inferred.insert(body, result.annotation.clone());
+                    self.set_vset(body, set);
+                } else {
+                    memo_key = Some(key);
+                }
+            }
+        }
         work.push(Work::ResumeBody(Box::new(BodyFrame {
             body,
+            memo_key,
             seeds,
             targets,
             scope,
             resume,
         })));
-        if !recursive {
+        if !self.inferred.contains_key(&body) {
             work.push(Work::Enter(body));
         }
     }

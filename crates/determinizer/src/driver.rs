@@ -248,7 +248,7 @@ fn determinize_inner(
     }
 
     let mut specialize_sequences = true;
-    let mut optimise_source = true;
+    let mut optimise_source = !options.disable_optimizations;
     let mut has_mass_queries = false;
     let mut sampling = SamplingInspection {
         observer,
@@ -327,17 +327,46 @@ fn determinize_inner(
 
         match target {
             None => {
-                // Measure layer gone — canonicalize the FlatPDL (and, if
-                // `roots` is given, drop bindings unreachable from them) before
-                // the conformance check and return.
-                crate::canon::canonicalize(&mut work, roots);
+                // Call inlining is still required to reach FlatPDL when the
+                // caller requests the graph before optimization.
+                if options.disable_optimizations {
+                    // Specializing a sequence callback can expose another
+                    // applied callable, and inlining can expose a sequence.
+                    for _ in 0..12 {
+                        let inlined = crate::canon::inline_user_calls(&mut work);
+                        if inlined {
+                            let _ = flatppl_infer::infer(&mut work);
+                        }
+                        let specialized =
+                            crate::density::broadcast::specialize_callable_sequences(&mut work);
+                        if !inlined && !specialized {
+                            break;
+                        }
+                        if specialized {
+                            let _ = flatppl_infer::infer(&mut work);
+                        }
+                    }
+                    if let Some(roots) = roots {
+                        crate::canon::retain_reachable(&mut work, roots);
+                    }
+                } else {
+                    crate::canon::canonicalize(&mut work, roots);
+                }
                 if has_mass_queries && crate::log_mass::lower(&mut work) {
                     if let Some(roots) = roots {
                         crate::canon::retain_reachable(&mut work, roots);
                     }
                     let _ = flatppl_infer::infer(&mut work);
                 }
-                if !options.disable_sufficient_statistics {
+                // Closed inner integrals need their own binding before the
+                // nonnested-integral check, including on the AD input path.
+                if options.disable_optimizations
+                    && options.numerical_integrals
+                    && crate::canon::hoist_integrals(&mut work)
+                {
+                    let _ = flatppl_infer::infer(&mut work);
+                }
+                if !options.disable_optimizations && !options.disable_sufficient_statistics {
                     crate::sufficient_statistics_for_target(
                         &mut work,
                         options.share_normal_scale,
@@ -811,7 +840,13 @@ fn apply_rule(
             })?;
         let root = crate::density::closed_form_totalmass(m, measure)
             .map(Ok)
-            .or_else(|| crate::density::integral::rectangular_totalmass(m, measure))
+            .or_else(|| {
+                crate::density::integral::lebesgue_totalmass(
+                    m,
+                    measure,
+                    options.numerical_integrals,
+                )
+            })
             .ok_or_else(|| {
                 crate::density::refuse(target_node, m, "totalmass needs a closed-form mass")
             })??;

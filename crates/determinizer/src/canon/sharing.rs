@@ -38,6 +38,7 @@ pub(super) fn share_broadcasts(m: &mut Module, lift_scopes: bool) -> bool {
         }
     }
 
+    let closed = lift_scopes.then(|| closed_numeric_candidates(m, &order));
     let mut mapped: Vec<Option<NodeId>> = vec![None; m.node_count()];
     let mut changed = false;
     for id in order {
@@ -61,17 +62,21 @@ pub(super) fn share_broadcasts(m: &mut Module, lift_scopes: bool) -> bool {
         } else {
             rhs
         };
-        let replacement = if uses[id.index()] > 1
-            && is_numeric_broadcast(m, id)
-            && !crate::kernel::has_free_local(m, rhs)
-            && !contains_axis(m, rhs)
-            && !contains_integral(m, rhs)
-        {
-            changed = true;
-            bind(m, rhs)
-        } else {
-            rhs
-        };
+        let replacement =
+            if uses[id.index()] > 1 && closed.as_ref().is_some_and(|nodes| nodes[id.index()]) {
+                changed = true;
+                bind(m, rhs, "__shared")
+            } else if uses[id.index()] > 1
+                && is_numeric_broadcast(m, id)
+                && !crate::kernel::has_free_local(m, rhs)
+                && !contains_axis(m, rhs)
+                && !contains_integral(m, rhs)
+            {
+                changed = true;
+                bind(m, rhs, "__broadcast")
+            } else {
+                rhs
+            };
         mapped[id.index()] = Some(replacement);
     }
     if changed {
@@ -82,6 +87,52 @@ pub(super) fn share_broadcasts(m: &mut Module, lift_scopes: bool) -> bool {
     changed
 }
 
+/// Name closed numeric expressions only at the serialization boundary. Descendants of a
+/// callable or quadrature binder stay in place even if reused outside it.
+fn closed_numeric_candidates(m: &Module, order: &[NodeId]) -> Vec<bool> {
+    let is_binder = |id| match m.node(id) {
+        Node::Call(call) => {
+            call.inputs.is_some()
+                || matches!(call.head, CallHead::Builtin(h)
+                    if matches!(m.resolve(h), flatppl_core::LOG_INTEGRAL | flatppl_core::MASS_INTEGRAL))
+        }
+        _ => false,
+    };
+    let mut fenced = vec![false; m.node_count()];
+    for &id in order.iter().rev() {
+        if fenced[id.index()] || is_binder(id) {
+            m.for_each_child(id, |child| fenced[child.index()] = true);
+        }
+    }
+    let mut open = vec![false; m.node_count()];
+    let mut candidates = vec![false; m.node_count()];
+    for &id in order {
+        let mut lexical = is_binder(id)
+            || matches!(
+                m.node(id),
+                Node::Axis(_)
+                    | Node::Ref(Ref {
+                        ns: RefNs::Local,
+                        ..
+                    })
+            )
+            || matches!(m.node(id), Node::Call(call)
+                if matches!(call.head, CallHead::Builtin(h)
+                    if matches!(m.resolve(h), "elementof" | "external" | "load_data" | flatppl_core::INTEGRATION_POINT)));
+        m.for_each_child(id, |child| lexical |= open[child.index()]);
+        open[id.index()] = lexical;
+        candidates[id.index()] = !lexical
+            && !fenced[id.index()]
+            && matches!(m.node(id), Node::Call(_))
+            && match m.type_of(id) {
+                Some(Type::Scalar(_)) => true,
+                Some(Type::Array { elem, .. }) => matches!(elem.as_ref(), Type::Scalar(_)),
+                _ => false,
+            };
+    }
+    candidates
+}
+
 fn is_numeric_broadcast(m: &Module, id: NodeId) -> bool {
     matches!(m.node(id), Node::Call(c)
         if matches!(c.head, CallHead::Builtin(op) if m.resolve(op) == "broadcast"))
@@ -89,10 +140,10 @@ fn is_numeric_broadcast(m: &Module, id: NodeId) -> bool {
             if matches!(elem.as_ref(), Type::Scalar(_)))
 }
 
-fn bind(m: &mut Module, rhs: NodeId) -> NodeId {
+fn bind(m: &mut Module, rhs: NodeId, prefix: &str) -> NodeId {
     let mut suffix = m.binding_count();
     let name = loop {
-        let name = m.intern(&format!("__broadcast_{suffix}"));
+        let name = m.intern(&format!("{prefix}_{suffix}"));
         if m.binding_by_name(name).is_none() {
             break name;
         }
@@ -149,4 +200,31 @@ fn contains_integral(m: &Module, root: NodeId) -> bool {
         m.for_each_child(id, |child| pending.push(child));
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::prepare_serialization;
+    use flatppl_core::graph::build_call;
+
+    #[test]
+    fn source_serialization_preserves_sharing_in_a_numeric_dag() {
+        let mut module =
+            flatppl_syntax::parse("x = elementof(reals)\ninputs = x\noutputs = x").unwrap();
+        let name = module.intern("outputs");
+        let output = module.binding_by_name(name).unwrap();
+        let mut value = module.binding(output).rhs;
+        for _ in 0..16 {
+            value = build_call(&mut module, "add", &[value, value]);
+        }
+        module.set_binding_rhs(output, value);
+        assert!(flatppl_infer::infer(&mut module).is_empty());
+
+        prepare_serialization(&mut module, None);
+
+        let text = flatppl_syntax::print(&module);
+        assert!(text.len() < 2_048, "serialized size {}", text.len());
+        let mut reparsed = flatppl_syntax::parse(&text).unwrap();
+        assert!(flatppl_infer::infer(&mut reparsed).is_empty());
+    }
 }

@@ -4776,29 +4776,26 @@ fn kernel_and_input(m: &mut Module, ctor: NodeId) -> Result<(NodeId, NodeId), Re
     Ok((kernel, input))
 }
 
+// The standard Student-t CDF is exact at its centre and at infinite endpoints
+// for every valid degree of freedom.
+fn student_t_endpoint_cdf(m: &Module, kernel: NodeId, input: NodeId, x: NodeId) -> Option<f64> {
+    if !matches!(m.node(kernel), Node::Const(sym) if m.resolve(*sym) == "StudentT")
+        || static_real(m, find_field(m, input, "nu")?).is_some_and(|nu| nu <= 0.0 || nu.is_nan())
+    {
+        return None;
+    }
+    match static_real(m, x)? {
+        0.0 => Some(0.5),
+        f64::NEG_INFINITY => Some(0.0),
+        f64::INFINITY => Some(1.0),
+        _ => None,
+    }
+}
+
 /// `builtin_touniform(kernel, kernel_input, x)` — the CDF transport (§07).
 fn build_touniform(m: &mut Module, kernel: NodeId, input: NodeId, x: NodeId) -> NodeId {
-    // Student-t symmetry gives exact normalizers for half-line restrictions
-    // without requiring a general CDF implementation from the target. F(0) = 1/2
-    // holds for every nu > 0, so a run-time nu needs no static value.
-    if matches!(m.node(kernel), Node::Const(sym) if m.resolve(*sym) == "StudentT")
-        && let Some(parameters) = expect_builtin_call(m, input, "record")
-        && let Some(nu) = parameters.named.iter().find(|p| m.resolve(p.name) == "nu")
-        && static_real(m, nu.value).is_none_or(|nu| nu > 0.0)
-        && let Some(x) = static_real(m, x)
-    {
-        let cdf = if x == 0.0 {
-            Some(0.5)
-        } else if x == f64::NEG_INFINITY {
-            Some(0.0)
-        } else if x == f64::INFINITY {
-            Some(1.0)
-        } else {
-            None
-        };
-        if let Some(cdf) = cdf {
-            return m.alloc(Node::Lit(Scalar::Real(cdf)));
-        }
+    if let Some(cdf) = student_t_endpoint_cdf(m, kernel, input, x) {
+        return m.alloc(Node::Lit(Scalar::Real(cdf)));
     }
     let sym = m.intern("builtin_touniform");
     m.alloc(Node::Call(Call {
@@ -5003,10 +5000,10 @@ fn gate_density(m: &mut Module, cond: NodeId, density: NodeId) -> NodeId {
 /// point in every cell, sized off the query point `v` so a dynamic length is covered
 /// too.
 ///
-/// `None` where the support or the variate names no such point (a record or table
-/// variate, an unproven support): no sanitisation then.
+/// `None` when no such point can be derived from the support and variate.
 fn support_witness_point(m: &mut Module, measure: NodeId, v: NodeId) -> Option<NodeId> {
-    if let Some([xlo, xhi, ylo, yhi]) = integral::rectangular_bounds(m, measure) {
+    if let Some(rectangle) = integral::rectangular_bounds(m, measure) {
+        let [xlo, xhi, ylo, yhi] = rectangle.bounds;
         let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
         let midpoint = |m: &mut Module, lo, hi| {
             let a = build_call(m, "mul", &[half, lo]);
@@ -5015,7 +5012,7 @@ fn support_witness_point(m: &mut Module, measure: NodeId, v: NodeId) -> Option<N
         };
         let x = midpoint(m, xlo, xhi);
         let y = midpoint(m, ylo, yhi);
-        return Some(build_call(m, "vector", &[x, y]));
+        return Some(rectangle.variate(m, [x, y]));
     }
     let (ty, support) = match (m.type_of(measure), m.valueset_of(measure)) {
         (Some(ty), Some(support))
@@ -7799,7 +7796,10 @@ fn lower_lebesgue(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
             )
         })?
     };
-    let cond = if let Some([xlo, xhi, ylo, yhi]) = integral::rectangular_support_bounds(m, support)
+    let cond = if let Some(integral::Rectangle {
+        bounds: [xlo, xhi, ylo, yhi],
+        fields: None,
+    }) = integral::rectangular_support_bounds(m, support)
     {
         // A broadcast can bind numeric endpoints, but its cells cannot take
         // the set itself as an argument. Keep the membership structure here.

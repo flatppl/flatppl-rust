@@ -1720,6 +1720,11 @@ pub(crate) fn lower_bare_arith<'m>(
     let Ok([a, b]) = <[NodeId; 2]>::try_from(args) else {
         return binary(e, id, args, op);
     };
+    if head == "sub"
+        && let Some(result) = e.lower_signed_rectangle_difference(id, a, b)
+    {
+        return result;
+    }
     let (sa, sb) = (arith_shape(e, a), arith_shape(e, b));
     let shape = |n: NodeId| match e.type_of(n) {
         Some(t) => format!("{t:?}"),
@@ -3005,12 +3010,10 @@ fn lower_cat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
 ///   axis, yielding a `Scalar`).
 /// - A runtime scalar integer selector, including per-batch selectors and nested cells.
 /// - A runtime vector integer selector, including per-batch selectors and nested cells.
-/// - Multi-axis numeric tensor selection with one shared rank-1 integer-vector
-///   selector and literal integer / `all` / `only` selectors on the remaining
-///   axes — [`crate::indexing::lower_multi_axis`].
+/// - Multi-axis numeric tensor selection with shared rank-1 integer-vector,
+///   literal integer, `all`, and `only` selectors — [`crate::indexing::lower_multi_axis`].
 ///
-/// Named-field forms (record, table, tuple), multiple integer-vector selectors,
-/// and non-numeric tensors remain refused, not guessed.
+/// Structural record and tuple projections are lowered separately.
 fn lower_get(e: &mut Emitter, id: NodeId, args: &[NodeId], base: i64) -> Result<Value, EmitError> {
     if args.len() != 2 {
         return crate::indexing::lower_multi_axis(e, id, args, base);
@@ -3019,6 +3022,12 @@ fn lower_get(e: &mut Emitter, id: NodeId, args: &[NodeId], base: i64) -> Result<
 
     if let Ok(selector) = literal_index(e, id, index) {
         return lower_get_literal(e, id, container, selector, base);
+    }
+    let axis_keyword =
+        matches!(e.node(index), Node::Const(name) if matches!(e.resolve(*name), "all" | "only"));
+    if matches!(e.type_of(container), Some(Type::Array { shape, .. }) if shape.len() > 1 || axis_keyword)
+    {
+        return crate::indexing::lower_multi_axis(e, id, args, base);
     }
     lower_get_gather(e, id, container, index, base)
 }

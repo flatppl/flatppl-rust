@@ -928,6 +928,26 @@ fn a_half_line_student_t_with_a_runtime_nu_uses_the_exact_mass() {
         pir_binding(&flatppl_flatpir::write(&actual), "lp"),
         pir_binding(&flatppl_flatpir::write(&expected), "lp")
     );
+    // Enabling a fallback for targets without a Student-t CDF must still use
+    // the exact endpoint probabilities.
+    let src = source(&format!("logdensityof(normalize({law}), 1.5)"));
+    let mut module = flatppl_syntax::parse(&src).unwrap();
+    let _ = flatppl_infer::infer(&mut module);
+    let numerical = flatppl_determinizer::determinize_with_options(
+        &module,
+        &flatppl_infer::ModuleBundle::new(),
+        None,
+        &flatppl_determinizer::LoweringOptions {
+            numerical_integrals: true,
+            supports_cdf: Some(|_| false),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pir_binding(&flatppl_flatpir::write(&numerical), "lp"),
+        pir_binding(&flatppl_flatpir::write(&expected), "lp"),
+    );
 }
 
 #[test]

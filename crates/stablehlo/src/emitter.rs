@@ -41,6 +41,8 @@ mod affine_scan;
 mod batching;
 #[path = "constants.rs"]
 mod constants;
+#[path = "contraction.rs"]
+mod contraction;
 #[path = "enzyme.rs"]
 mod enzyme;
 #[path = "integration.rs"]
@@ -2376,29 +2378,52 @@ impl<'m> Emitter<'m> {
 
     /// Accumulate native integer counts at already-validated zero-based bins.
     pub(crate) fn scatter_counts(&mut self, bins: u64, indices: &Value, updates: &Value) -> Value {
-        debug_assert_eq!(indices.elem, ElemKind::Int);
         debug_assert_eq!(updates.elem, ElemKind::Int);
-        let zero = self.int_value_const(0);
-        let ty = MlirTy::Ranked(vec![Some(bins)]);
+        self.scatter_add_rows(bins, indices, updates)
+    }
+
+    /// Add each update row at its zero-based index. Trailing dimensions form
+    /// the update window and stay in their original order.
+    pub(crate) fn scatter_add_rows(
+        &mut self,
+        rows: u64,
+        indices: &Value,
+        updates: &Value,
+    ) -> Value {
+        debug_assert_eq!(indices.elem, ElemKind::Int);
+        let zero = match updates.elem {
+            ElemKind::Int => self.int_value_const(0),
+            ElemKind::Real => self.scalar(0.0),
+            _ => unreachable!("scatter-add updates must be real or integer"),
+        };
+        let mut output_shape = shape(&updates.ty).to_vec();
+        output_shape[0] = Some(rows);
+        let update_window_dims = if output_shape.len() > 1 {
+            let dims: Vec<_> = (1..output_shape.len()).map(|dim| dim.to_string()).collect();
+            format!("update_window_dims = [{}], ", dims.join(", "))
+        } else {
+            String::new()
+        };
+        let ty = MlirTy::Ranked(output_shape);
         let initial = self.broadcast_in_dim(&zero, &[], ty.clone());
         let mut dims = shape(&indices.ty).to_vec();
         dims.push(Some(1));
         let indices = self.reshape(indices, MlirTy::Ranked(dims));
-        let scalar_ty = MlirTy::Scalar.render(self.dtype, ElemKind::Int);
-        let result_ty = ty.render(self.dtype, ElemKind::Int);
+        let scalar_ty = MlirTy::Scalar.render(self.dtype, updates.elem);
+        let result_ty = ty.render(self.dtype, updates.elem);
         let left = self.fresh();
         let right = self.fresh();
         let sum = self.fresh();
         let ssa = self.pure(format!(
-            "\"stablehlo.scatter\"({}, {}, {}) <{{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}}> ({{\n^bb0({left}: {scalar_ty}, {right}: {scalar_ty}):\n  {sum} = stablehlo.add {left}, {right} : {scalar_ty}\n  stablehlo.return {sum} : {scalar_ty}\n}}) : ({result_ty}, {}, {}) -> {result_ty}",
+            "\"stablehlo.scatter\"({}, {}, {}) <{{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<{update_window_dims}inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}}> ({{\n^bb0({left}: {scalar_ty}, {right}: {scalar_ty}):\n  {sum} = stablehlo.add {left}, {right} : {scalar_ty}\n  stablehlo.return {sum} : {scalar_ty}\n}}) : ({result_ty}, {}, {}) -> {result_ty}",
             initial.ssa, indices.ssa, updates.ssa,
             indices.ty.render(self.dtype, ElemKind::Int),
-            updates.ty.render(self.dtype, ElemKind::Int),
+            updates.ty.render(self.dtype, updates.elem),
         ));
         Value {
             ssa,
             ty,
-            elem: ElemKind::Int,
+            elem: updates.elem,
         }
     }
 
@@ -3177,6 +3202,11 @@ impl<'m> Emitter<'m> {
         );
         let la = la + batch;
         let lb = lb + batch;
+        let axes = Axes { batch, layers };
+        if let Some(result) = self.compensated_dot(&a, &b, [la, lb], batch, &result_ty, &axes) {
+            self.remember_pointwise(&result.ssa, &result, Pointwise::Dot(a, b, la, lb, batch));
+            return result;
+        }
         let dimensions = (0..batch)
             .map(|axis| axis.to_string())
             .collect::<Vec<_>>()
@@ -3202,7 +3232,7 @@ impl<'m> Emitter<'m> {
             ty: result_ty,
             elem: kind,
         };
-        self.remember_axes(&result.ssa, Axes { batch, layers });
+        self.remember_axes(&result.ssa, axes);
         self.remember_pointwise(&result.ssa, &result, Pointwise::Dot(a, b, la, lb, batch));
         result
     }
@@ -3238,10 +3268,13 @@ impl<'m> Emitter<'m> {
             );
         }
 
+        let result_ty = MlirTy::Ranked(vec![z_dims[0], l_dims[0]]);
+        if let Some(result) = self.compensated_dot(z, l, [1, 1], 0, &result_ty, &Axes::default()) {
+            return result;
+        }
         let ssa = self.fresh();
         let z_ty = z.ty.render(self.dtype, z.elem);
         let l_ty = l.ty.render(self.dtype, l.elem);
-        let result_ty = MlirTy::Ranked(vec![z_dims[0], l_dims[0]]);
         let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
             "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [1], precision = [HIGHEST, HIGHEST] : ({z_ty}, {l_ty}) -> {result_ty_text}",

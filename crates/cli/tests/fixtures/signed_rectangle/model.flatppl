@@ -1,0 +1,5 @@
+theta = elementof(reals)
+weight(x, theta) = theta * (x[1] + x[2] - 1.0)
+support = cartprod(interval(0.0, 1.0), interval(0.0, 1.0))
+inputs = theta
+outputs = log(totalmass(logweighted(weight, Lebesgue(support), theta)))

@@ -213,7 +213,7 @@ impl Emitter<'_> {
         body: NodeId,
         bindings: Vec<(NodeId, Value)>,
     ) -> Result<Value, EmitError> {
-        let memo = self.memo.clone();
+        let mut memo = self.memo.clone();
         let columns = self.columns.clone();
         let mut dependent = bindings
             .iter()
@@ -244,6 +244,15 @@ impl Emitter<'_> {
             self.bind(id, value);
         }
         let result = self.lower_node(body);
+        // The body emits into the same block. Keep values that the temporary
+        // bindings cannot change so sibling aggregate scopes can reuse them.
+        if result.is_ok() {
+            for (id, changes) in dependent {
+                if !changes && let Some(value) = self.memo.get(&id) {
+                    memo.entry(id).or_insert_with(|| value.clone());
+                }
+            }
+        }
         self.memo = memo;
         self.columns = columns;
         result

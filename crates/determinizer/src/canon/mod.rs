@@ -17,7 +17,7 @@ pub(crate) use inline::{
     expand_composed_call, inline_expression, inline_user_calls, normalize_call_wrappers,
 };
 mod integrals;
-pub(crate) use integrals::{is_closed as integral_is_closed, is_integral};
+pub(crate) use integrals::{hoist_integrals, is_closed as integral_is_closed, is_integral};
 mod sharing;
 
 /// The `FLATPPL_DETERMINIZE_NO_CANON` env escape hatch: when set (to any value),
@@ -99,9 +99,8 @@ pub fn resolve_alias_chains(m: &mut Module) -> bool {
 
 /// Prepare an already-determinized module for FlatPPL or FlatPIR serialization.
 ///
-/// Text expands a DAG into a tree. Name repeated cell-local arrays as separate
-/// broadcasts so their expressions are printed once, without cloning per point.
-/// Native backends consume the shared DAG directly and do not need this pass.
+/// Name repeated closed numeric expressions to preserve their DAG sharing. Lift
+/// repeated cell-local arrays as broadcasts to print their expressions once.
 /// `roots` has the same meaning as in `determinize_with_roots`.
 pub fn prepare_serialization(m: &mut Module, roots: Option<&[Symbol]>) {
     if !no_canon() && sharing::share_broadcasts(m, true) {
