@@ -68,6 +68,56 @@ impl Emitter<'_> {
             .collect()
     }
 
+    /// The operands of a batched `dot_general` whose only contracted axis has
+    /// one element: an elementwise product of equal-shaped operands.
+    pub(crate) fn elementwise_dot_operands(&self, value: &Value) -> Option<(Value, Value)> {
+        if let Some(factors) = self.elementwise_products.get(&value.ssa) {
+            return Some(factors.clone());
+        }
+        let Pointwise::Dot(a, b, la, lb, batch) = &self.pointwise.get(&value.ssa)?.op else {
+            return None;
+        };
+        let dims = shape(&a.ty);
+        (dims == shape(&b.ty)
+            && dims.len() == batch + 1
+            && *la == *batch
+            && *lb == *batch
+            && dims.get(*batch) == Some(&Some(1)))
+        .then(|| (a.clone(), b.clone()))
+    }
+
+    /// Whether every element of a stored constant is finite at the target
+    /// precision, seen through views that only move or repeat elements. The
+    /// elements already sit in the module, so no fold bound applies.
+    pub(crate) fn stored_constant_finite(&self, value: &Value) -> Option<bool> {
+        if self.batch_rank(value) != 0 {
+            return None;
+        }
+        if let Some(data) = self.constants.get(&value.ssa) {
+            return data.iter().try_fold(true, |all, x| {
+                Some(
+                    all && match x {
+                        Scalar::Real(x) => match self.dtype {
+                            Dtype::F32 => (*x as f32).is_finite(),
+                            Dtype::F64 => x.is_finite(),
+                        },
+                        Scalar::Int(_) | Scalar::Bool(_) => true,
+                        _ => return None,
+                    },
+                )
+            });
+        }
+        match &self.pointwise.get(&value.ssa)?.op {
+            Pointwise::Reshape(input)
+            | Pointwise::Transpose(input, _)
+            | Pointwise::Broadcast(input, _) => self.stored_constant_finite(input),
+            Pointwise::Concat(parts, _) => parts.iter().try_fold(true, |all, part| {
+                Some(all && self.stored_constant_finite(part)?)
+            }),
+            _ => None,
+        }
+    }
+
     /// Read a fixed element without expanding its views. Also follow fixed
     /// conditions, comparisons, conversions, and sign operations.
     pub(crate) fn fixed_scalar_at(&self, value: &Value, index: usize) -> Option<Scalar> {

@@ -41,14 +41,45 @@ impl Emitter<'_> {
         }
     }
 
+    /// XLA keeps a batched one-element dot as a library call once it has a
+    /// second reader, which costs the gradient more than the product itself.
+    /// A check reads such a product, and a chain of them, as plain multiplies
+    /// of the leaf factors, so no dot gains a reader. The multiplies feed only
+    /// a comparison, so they have no adjoint to preserve.
+    fn product_from_factors(&mut self, value: &Value) -> Value {
+        let Some((a, b)) = self.elementwise_dot_operands(value) else {
+            return value.clone();
+        };
+        let a = self.product_from_factors(&a);
+        let b = self.product_from_factors(&b);
+        let ty = a.ty.render(self.dtype, a.elem);
+        let ssa = self.pure_like(
+            format!("stablehlo.multiply {}, {} : {ty}", a.ssa, b.ssa),
+            &a,
+        );
+        let product = Value {
+            ssa,
+            ty: a.ty.clone(),
+            elem: a.elem,
+        };
+        if product.ty == value.ty {
+            product
+        } else {
+            self.reshape(&product, value.ty.clone())
+        }
+    }
+
     pub(crate) fn check_finite_parameter(
         &mut self,
         id: NodeId,
         name: &str,
         value: &Value,
     ) -> Result<(), EmitError> {
-        if let Some(values) = self.constant_elements(value) {
-            if values.iter().any(|v| !v.is_finite()) {
+        let finite = self
+            .stored_constant_finite(value)
+            .or_else(|| Some(self.constant_elements(value)?.iter().all(|v| v.is_finite())));
+        if let Some(finite) = finite {
+            if !finite {
                 return Err(EmitError::at(
                     id,
                     format!("regression parameter '{name}' must be finite"),
@@ -66,8 +97,9 @@ impl Emitter<'_> {
         if self.region_depth == 0 {
             self.checked_parameters.insert(key);
         }
-        let magnitude = self.abs(value);
-        let infinity = self.inf_like(value);
+        let value = self.product_from_factors(value);
+        let magnitude = self.abs(&value);
+        let infinity = self.inf_like(&value);
         let finite = self.compare("LT", &magnitude, &infinity);
         self.record_runtime_error(&finite, PARAMETER_DOMAIN_STATUS);
         Ok(())

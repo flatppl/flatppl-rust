@@ -213,6 +213,8 @@ impl Emitter<'_> {
             ),
             left,
         );
+        self.elementwise_products
+            .insert(ssa.clone(), (left.clone(), right.clone()));
         Value {
             ssa,
             ty: left.ty.clone(),

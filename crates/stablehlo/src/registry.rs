@@ -2499,6 +2499,22 @@ fn binary_logit_terms(e: &mut Emitter, z: &Value) -> (Value, Value) {
     (e.log1p(&minus_small), log_odds)
 }
 
+/// The Bernoulli log mass at logit `logit` of a supported observation.
+pub(crate) fn bernoulli_logit_score(
+    e: &mut Emitter,
+    logit: &Value,
+    success: &Value,
+    supported: &Value,
+) -> Value {
+    let zero = e.scalar(0.0);
+    let z = e.select(supported, logit, &zero);
+    let (common, log_odds) = binary_logit_terms(e, &z);
+    let nonnegative = e.compare("GE", &z, &zero);
+    let likely = e.compare("EQ", success, &nonnegative);
+    let offset = e.select(&likely, &zero, &log_odds);
+    e.add(&offset, &common)
+}
+
 /// Select the observed probability before taking its log, including p=0 and p=1.
 /// When its logit is known, take the log probability before it rounds to an endpoint.
 fn bernoulli_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
@@ -2509,12 +2525,7 @@ fn bernoulli_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
     let failure = e.compare("EQ", v, &zero);
     let supported = e.or(&success, &failure);
     let score = if let Some(logit) = e.invlogit_operand(&prob) {
-        let z = e.select(&supported, &logit, &zero);
-        let (common, log_odds) = binary_logit_terms(e, &z);
-        let nonnegative = e.compare("GE", &z, &zero);
-        let likely = e.compare("EQ", &success, &nonnegative);
-        let offset = e.select(&likely, &zero, &log_odds);
-        e.add(&offset, &common)
+        bernoulli_logit_score(e, &logit, &success, &supported)
     } else {
         let one_minus_p = e.sub(&one, &prob);
         let selected = e.select(&success, &prob, &one_minus_p);

@@ -236,6 +236,8 @@ pub struct Emitter<'m> {
     expanded: HashMap<(String, Vec<Option<u64>>, Axes), Value>,
     axes: HashMap<String, Axes>,
     constants: HashMap<String, constants::Constant>,
+    /// Products lowered as one-element dots, by result SSA: the factors.
+    elementwise_products: HashMap<String, (Value, Value)>,
     broadcast_frame: Vec<Option<u64>>,
     call_frame: Vec<Option<u64>>,
     /// Nesting depth for region-local runtime checks.
@@ -315,6 +317,7 @@ impl<'m> Emitter<'m> {
             expanded: HashMap::new(),
             axes: HashMap::new(),
             constants: HashMap::new(),
+            elementwise_products: HashMap::new(),
             broadcast_frame: Vec::new(),
             call_frame: Vec::new(),
             region_depth: 0,

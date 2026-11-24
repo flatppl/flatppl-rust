@@ -358,8 +358,30 @@ pub(super) fn runtime_bernoulli_counts(
 }
 
 pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<NodeId> {
-    let f = factor(m, id, r)?;
+    let Some(f) = factor(m, id, r) else {
+        link_law(r, m, id);
+        return None;
+    };
     reduce_factor(r, m, &f)
+}
+
+/// A §09 logit or log regression law scores its cells with a probability or
+/// rate that varies by design row: neither a shared scalar nor a gather. Its
+/// cell form stops here, so the law reports the same reason.
+fn link_law(r: &mut Reducer, m: &Module, id: NodeId) {
+    let Some(density) = call(m, id, "builtin_logdensityof") else {
+        return;
+    };
+    let [kernel, _, observed] = *density.args else {
+        return;
+    };
+    let link = matches!(m.node(kernel), Node::Const(s)
+        if matches!(m.resolve(*s), "BernoulliLogitGLM" | "PoissonLogGLM"));
+    let cells = matches!(m.type_of(observed), Some(Type::Array { shape, .. })
+        if matches!(shape.as_ref(), [Dim::Static(n)] if *n >= 2));
+    if link && cells {
+        r.fallback = "parameters need shared scalars or fixed, in-range gather selectors";
+    }
 }
 
 pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Option<NodeId> {

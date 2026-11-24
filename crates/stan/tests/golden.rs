@@ -274,6 +274,43 @@ fn a_design_matrix_field_of_a_record_that_is_not_data_keeps_the_written_law() {
 }
 
 #[test]
+fn a_regression_law_on_a_parameter_design_is_its_vectorized_statement() {
+    for (law, observed, statement) in [
+        (
+            "reg.NormalGLM(x, 0.0, beta, 1.0)",
+            "[1.0, 2.0, 3.0]",
+            "y ~ normal(x * beta, 1.0);",
+        ),
+        (
+            "reg.BernoulliLogitGLM(x, alpha, beta)",
+            "[1, 0, 1]",
+            "y ~ bernoulli_logit(alpha + x * beta);",
+        ),
+        (
+            "reg.PoissonLogGLM(x, alpha, beta)",
+            "[1, 0, 2]",
+            "y ~ poisson_log(alpha + x * beta);",
+        ),
+    ] {
+        let source = format!(
+            r#"# emit: target=L
+flatppl_compat = "0.1"
+reg = standard_module("regression", "0.1")
+x = elementof(cartpow(reals, [3, 2]))
+alpha = elementof(reals)
+beta = elementof(cartpow(reals, 2))
+y ~ {law}
+K = kernelof(record(y = y), x = x, alpha = alpha, beta = beta)
+L = likelihoodof(K, record(y = {observed}))
+"#
+        );
+        let code = emit(&source).code;
+        assert!(code.contains(statement), "{law}:\n{code}");
+        assert!(!code.contains("_glm"), "{law}:\n{code}");
+    }
+}
+
+#[test]
 fn a_design_matrix_that_is_not_data_keeps_the_written_law() {
     let source = regression("Normal.((sigma .* X) * beta, sigma)", "[1.0, 2.0, 3.0]");
     let code = emit(&source).code;

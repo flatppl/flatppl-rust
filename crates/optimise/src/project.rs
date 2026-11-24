@@ -81,7 +81,16 @@ fn trigger(m: &Module, profile: Profile) -> bool {
                 | "logsumexp",
             )
             | None => matches!(profile, Profile::StableHlo { .. }),
-            Some("draw") => profile == Profile::Stan,
+            Some("draw") => rewrites_source_laws(profile),
+            // A law the GLM rules read, also outside a draw. Stan rewrites
+            // the laws of its draws.
+            Some("broadcast") => {
+                profile == Profile::Portable
+                    && c.args.first().is_some_and(|&op| {
+                        matches!(m.node(op), Node::Const(s)
+                            if matches!(m.resolve(*s), "Normal" | "Bernoulli" | "Poisson"))
+                    })
+            }
             _ => false,
         }
     })
@@ -102,11 +111,17 @@ fn stan_matrix_reader(m: &Module, id: NodeId, profile: Profile) -> bool {
         }
 }
 
-// Stan names a draw once and scores its law in the model block, also inside
-// a kernel. The GLM rules read the law of such a draw and its linear
+/// The profiles that rewrite a law before a target lowers it: Stan, and the
+/// portable stage that determinize and StableHLO lower from.
+fn rewrites_source_laws(profile: Profile) -> bool {
+    matches!(profile, Profile::Stan | Profile::Portable)
+}
+
+// A draw keeps one node and its law is scored where it stands, also inside a
+// kernel. The GLM rules read the law of such a draw and its linear
 // predictor, whatever the phase of their parameters.
-fn stan_glm_node(m: &Module, id: NodeId, profile: Profile) -> bool {
-    if profile != Profile::Stan {
+fn glm_node(m: &Module, id: NodeId, profile: Profile) -> bool {
+    if !rewrites_source_laws(profile) {
         return false;
     }
     let Node::Call(c) = m.node(id) else {
@@ -203,7 +218,7 @@ impl Cuts {
         let mut scoped_nodes = HashSet::new();
         while let Some(node) = scoped.pop() {
             if !nodes.contains(&node) && visited.insert(node) {
-                if !stan_matrix_reader(m, node, profile) && !stan_glm_node(m, node, profile) {
+                if !stan_matrix_reader(m, node, profile) && !glm_node(m, node, profile) {
                     scoped_nodes.insert(node);
                 }
                 m.for_each_child(node, |child| scoped.push(child));
@@ -358,6 +373,7 @@ struct Project<'a> {
     poisson: Vec<(usize, usize, Partition)>,
     fixed_poisson: bool,
     glm_operands: HashSet<NodeId>,
+    glm_shaped: HashSet<usize>,
 }
 
 impl<'a> Project<'a> {
@@ -376,9 +392,10 @@ impl<'a> Project<'a> {
             selectors: Selectors::default(),
             concats: vec![],
             poisson: vec![],
+            glm_shaped: HashSet::new(),
             glm_operands: (0..m.node_count())
                 .map(NodeId::from_usize)
-                .filter(|&id| stan_glm_node(m, id, profile))
+                .filter(|&id| glm_node(m, id, profile))
                 .flat_map(|id| m.node(id).children())
                 .collect(),
             fixed_poisson: sufficient_statistics
@@ -540,10 +557,10 @@ impl<'a> Project<'a> {
                         .then(|| "logsumexp.pair".to_owned());
                     }
                 }
-                // Stan reads a broadcast law or link by its name. The operation
-                // is part of the head, so rules can match it.
+                // A broadcast law or link carries its operation in the head,
+                // so rules can match it.
                 "broadcast"
-                    if self.profile == Profile::Stan
+                    if rewrites_source_laws(self.profile)
                         && let Some(&op) = c.args.first()
                         && let Node::Const(op) = m.node(op)
                         && matches!(
@@ -616,6 +633,46 @@ impl<'a> Project<'a> {
     }
 
     fn project(&mut self, id: NodeId, depth: usize) -> Option<usize> {
+        let i = self.project_node(id, depth)?;
+        if self.glm_operands.contains(&id) || glm_node(self.m, id, self.profile) {
+            self.glm_shape(id, i);
+        }
+        Some(i)
+    }
+
+    /// Shapes of a GLM node and its operands in any phase. A shared term, a
+    /// literal or a name read before, carries them too.
+    fn glm_shape(&mut self, id: NodeId, i: usize) {
+        if self.glm_shaped.contains(&i) {
+            return;
+        }
+        let shaped = match self.m.type_of(id) {
+            Some(Type::Scalar(ScalarType::Real)) => Some(fact("shape-real", i, [])),
+            Some(Type::Array { shape, elem }) if **elem == Type::Scalar(ScalarType::Real) => {
+                let dims: Option<Vec<i64>> = shape
+                    .iter()
+                    .map(|d| match d {
+                        Dim::Static(n) => Some(i64::from(*n)),
+                        Dim::Dynamic => None,
+                    })
+                    .collect();
+                match dims.as_deref() {
+                    Some(&[n]) => Some(fact("shape-real-vector", i, [FactArg::Int(n)])),
+                    Some(&[r, c]) => {
+                        Some(fact("real-matrix", i, [FactArg::Int(r), FactArg::Int(c)]))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(shaped) = shaped {
+            self.facts.push(shaped);
+            self.glm_shaped.insert(i);
+        }
+    }
+
+    fn project_node(&mut self, id: NodeId, depth: usize) -> Option<usize> {
         if let Some(&i) = self.by_node.get(&id) {
             return Some(i);
         }
@@ -627,7 +684,7 @@ impl<'a> Project<'a> {
         let sampled = m.is_sample_result(id) || m.sample_origin(id).is_some();
         let stochastic = m.phase_of(id) == Some(Phase::Stochastic) || sampled;
         let stan_matrix = stan_matrix_reader(m, id, self.profile);
-        let stan_glm = stan_glm_node(m, id, self.profile);
+        let glm = glm_node(m, id, self.profile);
         if let Node::Ref(r) = m.node(id)
             && r.ns == RefNs::SelfMod
         {
@@ -647,7 +704,7 @@ impl<'a> Project<'a> {
                 return Some(i);
             }
         }
-        let allowed = !boundary && (!stochastic || stan_matrix || stan_glm);
+        let allowed = !boundary && (!stochastic || stan_matrix || glm);
         let term = match m.node(id) {
             Node::Lit(Scalar::Bool(b)) if allowed => Term::Boolean(*b),
             Node::Lit(Scalar::Real(x)) if allowed => Term::Real(x.to_bits() as i64),
@@ -699,21 +756,6 @@ impl<'a> Project<'a> {
         }
         if self.reads_data_boundary(id) {
             self.facts.push(fact("data-boundary", i, []));
-        }
-        if (stan_glm || self.glm_operands.contains(&id))
-            && let Some(ty) = m.type_of(id)
-        {
-            match ty {
-                Type::Scalar(ScalarType::Real) => self.facts.push(fact("shape-real", i, [])),
-                Type::Array { shape, elem }
-                    if **elem == Type::Scalar(ScalarType::Real)
-                        && let [Dim::Static(n)] = **shape =>
-                {
-                    self.facts
-                        .push(fact("shape-real-vector", i, [FactArg::Int(i64::from(n))]));
-                }
-                _ => {}
-            }
         }
         let term = &self.terms[i];
         let input = self.cuts.abi_input(m, id);
@@ -1021,7 +1063,7 @@ pub(super) fn optimise(
         m,
         &project.cuts,
         project.hlo(),
-        profile == Profile::Stan,
+        rewrites_source_laws(profile),
         &bindings,
     )?;
     let roots: Vec<_> = outputs

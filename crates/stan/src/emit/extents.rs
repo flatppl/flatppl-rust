@@ -824,6 +824,28 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// The design `x` of a §09 regression law that prints as the vectorized
+    /// statement of its broadcast law: a design that is not data. The
+    /// response then takes the design's rows, as under the broadcast law.
+    /// A GLM function checks its own sizes.
+    fn regression_design(&self, law: NodeId) -> Option<NodeId> {
+        let c = self.call(law)?;
+        let flatppl_core::CallHead::User(callee) = c.head else {
+            return None;
+        };
+        let Node::Ref(r) = self.m.node(callee) else {
+            return None;
+        };
+        let member = self.name(r.name);
+        if self.standard_module(callee).as_deref() != Some("regression")
+            || !matches!(member, "NormalGLM" | "BernoulliLogitGLM" | "PoissonLogGLM")
+        {
+            return None;
+        }
+        let x = *self.law_args(member, law).ok()?.first()?;
+        (self.m.phase_of(self.resolve(x)) != Some(Phase::Fixed)).then_some(x)
+    }
+
     /// Axis `axis` of the variate of a law: `iid` counts, then the law's own
     /// length from its vector argument.
     fn law_extent(&mut self, law: NodeId, axis: usize, d: u32) -> Option<Lin> {
@@ -858,6 +880,10 @@ impl<'m> Emitter<'m> {
                 let a = self.law_args(self.head(m)?, m).ok()?;
                 let v = *a.iter().find(|&&x| self.arank(x) == Some(1))?;
                 self.sym_extent(v, 0, d)
+            }
+            "%call" if axis == 0 => {
+                let x = self.regression_design(m)?;
+                self.sym_extent(x, 0, d)
             }
             _ => None,
         }
@@ -984,6 +1010,16 @@ impl<'m> Emitter<'m> {
                     let x = self.size_argument(n, &format!("an `{h}` dimension"))?;
                     self.tie_axis(shape, offset, &x, n)?;
                     self.tie_axis(shape, offset + 1, &x, n)?;
+                }
+                Ok(())
+            }
+            // §09: the response has one entry for each row of the design.
+            Some("%call") if offset == 0 => {
+                if let Some(x) = self.regression_design(m)
+                    && let Some(l) = shape.axes.and_then(|a| a.first()).cloned()
+                    && let Some(rows) = self.sym_extent(x, 0, 0)
+                {
+                    self.unify(&l, &rows);
                 }
                 Ok(())
             }

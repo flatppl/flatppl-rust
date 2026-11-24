@@ -4,10 +4,12 @@ use super::multivariate::{
     cells, dot, entry, finite_data, get, held_cells, real_shape, residual_factor, vector,
 };
 use super::{
-    Expr, Reducer, data_only, local_ref, map, materialize, num, op, operation,
+    Expr, Reducer, call, data_only, local_ref, map, materialize, num, op, operation,
     per_cell_with_invariants, resolve,
 };
-use flatppl_core::{Binding, Dim, Module, Node, NodeId, Scalar, ScalarType, Type, ValueSet};
+use flatppl_core::{
+    Binding, Dim, Module, Node, NodeId, Scalar, ScalarType, Symbol, Type, ValueSet,
+};
 
 fn data_shape(ty: &Type) -> Option<Vec<usize>> {
     let Type::Array { shape, elem } = ty else {
@@ -221,30 +223,7 @@ fn collect(
         ("mul", [a, b]) => {
             let a = resolve(m, *a, &reducer.boundary);
             let b = resolve(m, *b, &reducer.boundary);
-            if let Some(shape) = m.type_of(a).and_then(data_shape)
-                && let [rows, columns] = shape.as_slice()
-                && *rows == count
-                && m.type_of(b).and_then(real_shape).as_deref() == Some(&[*columns])
-                && data_only(m, a, &reducer.allowed, &reducer.boundary)
-                && finite_data(m, a, reducer)
-            {
-                for j in 0..*columns {
-                    let column = materialize(
-                        m,
-                        op(
-                            "get",
-                            [
-                                Expr::Node(a),
-                                Expr::Constant("all"),
-                                Expr::Integer(j as i64 + 1),
-                            ],
-                        ),
-                    );
-                    design.terms.push(Term {
-                        column,
-                        coefficient: op("mul", [num(sign), get(Expr::Node(b), j)]),
-                    });
-                }
+            if design_columns(reducer, m, a, b, count, sign, design).is_some() {
                 return Some(());
             }
             let (column, coefficient) = if scalar(m, a) {
@@ -268,6 +247,125 @@ fn collect(
         }
         _ => None,
     }
+}
+
+/// One term for each column of a fixed, proven-finite design matrix `x` with
+/// `count` rows, times the matching entry of the coefficient vector `beta`.
+fn design_columns(
+    reducer: &Reducer,
+    m: &mut Module,
+    x: NodeId,
+    beta: NodeId,
+    count: usize,
+    sign: f64,
+    design: &mut Design,
+) -> Option<()> {
+    let shape = m.type_of(x).and_then(data_shape)?;
+    let [rows, columns] = shape.as_slice() else {
+        return None;
+    };
+    if *rows != count
+        || m.type_of(beta).and_then(real_shape).as_deref() != Some(&[*columns])
+        || !data_only(m, x, &reducer.allowed, &reducer.boundary)
+        || !finite_data(m, x, reducer)
+    {
+        return None;
+    }
+    for j in 0..*columns {
+        let column = materialize(
+            m,
+            op(
+                "get",
+                [
+                    Expr::Node(x),
+                    Expr::Constant("all"),
+                    Expr::Integer(j as i64 + 1),
+                ],
+            ),
+        );
+        design.terms.push(Term {
+            column,
+            coefficient: op("mul", [num(sign), get(Expr::Node(beta), j)]),
+        });
+    }
+    Some(())
+}
+
+/// A literal zero intercept adds no column.
+fn is_zero(m: &Module, id: NodeId, reducer: &Reducer) -> bool {
+    match m.node(resolve(m, id, &reducer.boundary)) {
+        Node::Lit(Scalar::Real(x)) => *x == 0.0,
+        Node::Lit(Scalar::Int(0)) => true,
+        _ => false,
+    }
+}
+
+/// The mean of a Normal regression factor: a written mean vector, or the
+/// §09 `NormalGLM` predictor `alpha .+ x * beta`.
+enum Mean {
+    Written(NodeId),
+    Design {
+        x: NodeId,
+        alpha: NodeId,
+        beta: NodeId,
+    },
+}
+
+struct Regression {
+    observed: NodeId,
+    sigma: NodeId,
+    mean: Mean,
+    /// The written Normal constructor and its parameter names, in order.
+    /// `None` for a module law, whose rows are `Normal(mu, sigma)`.
+    written: Option<(Symbol, Vec<Symbol>)>,
+}
+
+fn regression_factor(m: &Module, id: NodeId, reducer: &Reducer) -> Option<Regression> {
+    if let Some(f) = per_cell_with_invariants(m, id, &reducer.boundary) {
+        if m.resolve(f.constructor) != "Normal" {
+            return None;
+        }
+        let parameter = |name: &str| {
+            f.parameters
+                .iter()
+                .find(|(n, _)| m.resolve(*n) == name)
+                .map(|(_, v)| *v)
+        };
+        return Some(Regression {
+            observed: f.observed,
+            sigma: parameter("sigma")?,
+            mean: Mean::Written(parameter("mu")?),
+            written: Some((
+                f.constructor,
+                f.parameters.iter().map(|&(n, _)| n).collect(),
+            )),
+        });
+    }
+    let density = call(m, id, "builtin_logdensityof")?;
+    let [kernel, record, observed] = *density.args else {
+        return None;
+    };
+    if !matches!(m.node(kernel), Node::Const(name) if m.resolve(*name) == "NormalGLM") {
+        return None;
+    }
+    let record = call(m, resolve(m, record, &reducer.boundary), "record")?;
+    let field = |name: &str| {
+        record
+            .named
+            .iter()
+            .find(|f| m.resolve(f.name) == name)
+            .map(|f| f.value)
+    };
+    Some(Regression {
+        observed,
+        sigma: field("sigma")?,
+        mean: Mean::Design {
+            x: field("x")?,
+            alpha: field("alpha")?,
+            beta: field("beta")?,
+        },
+        written: None,
+    })
 }
 
 /// Name preparation intermediates without making them extra scoring inputs.
@@ -417,10 +515,7 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
 }
 
 fn candidate(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Expr> {
-    let f = per_cell_with_invariants(m, id, &reducer.boundary)?;
-    if m.resolve(f.constructor) != "Normal" {
-        return None;
-    }
+    let f = regression_factor(m, id, reducer)?;
     // From here the factor is a regression candidate: each refusal names its own
     // reason for `--explain-reductions`.
     if !data_only(m, f.observed, &reducer.allowed, &reducer.boundary) {
@@ -439,26 +534,28 @@ fn candidate(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Expr> 
     if count < 2 {
         return None;
     }
-    let mu = f
-        .parameters
-        .iter()
-        .find(|(name, _)| m.resolve(*name) == "mu")?
-        .1;
-    let sigma = f
-        .parameters
-        .iter()
-        .find(|(name, _)| m.resolve(*name) == "sigma")?
-        .1;
+    let sigma = f.sigma;
     reducer.fallback =
         "the noise scale is not a shared scalar or fixed row scales within the supported range";
     let (sigma, row_scales) = row_scales(reducer, m, sigma, count)?;
     reducer.fallback =
         "the mean is not a sum of fixed, proven-finite design columns times coefficients";
-    if m.type_of(mu).and_then(real_shape).as_deref() != Some(&[count]) {
-        return None;
-    }
     let mut design = Design::default();
-    collect(reducer, m, mu, count, 1.0, &mut design)?;
+    match f.mean {
+        Mean::Written(mu) => {
+            if m.type_of(mu).and_then(real_shape).as_deref() != Some(&[count]) {
+                return None;
+            }
+            collect(reducer, m, mu, count, 1.0, &mut design)?;
+        }
+        Mean::Design { x, alpha, beta } => {
+            // The intercept comes first, as in `alpha .+ x * beta`.
+            if !is_zero(m, alpha, reducer) {
+                collect(reducer, m, alpha, count, 1.0, &mut design)?;
+            }
+            design_columns(reducer, m, x, beta, count, 1.0, &mut design)?;
+        }
+    }
     if design.terms.is_empty() {
         return None;
     }
@@ -707,12 +804,20 @@ fn candidate(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Expr> 
     };
     let quadratic = op("sum", [map("mul", [standardized.clone(), standardized])]);
     let zero = materialize(m, num(0.0));
-    let parameters = f
-        .parameters
-        .iter()
-        .map(|&(name, _)| (name, if m.resolve(name) == "mu" { zero } else { sigma }))
+    let (constructor, names) = match f.written {
+        Some(written) => written,
+        None => (m.intern("Normal"), vec![m.intern("mu"), m.intern("sigma")]),
+    };
+    let parameters = names
+        .into_iter()
+        .map(|name| (name, if m.resolve(name) == "mu" { zero } else { sigma }))
         .collect::<Vec<_>>();
-    let normalizer = reducer.anchor(m, &f, &parameters, num(0.0));
+    let kernel = m.alloc(Node::Const(constructor));
+    let record = flatppl_core::graph::build_record(m, &parameters);
+    let normalizer = op(
+        "builtin_logdensityof",
+        [Expr::Node(kernel), Expr::Node(record), num(0.0)],
+    );
     let score = op(
         "mul",
         [

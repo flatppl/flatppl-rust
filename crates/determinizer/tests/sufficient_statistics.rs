@@ -989,3 +989,41 @@ fn a_promoted_fixed_value_never_becomes_a_baked_statistic() {
     assert_eq!(inputs(&prepared.preparation), ["y"]);
     assert!(!inputs(&prepared.score).iter().any(|name| name == "y"));
 }
+
+#[test]
+fn a_normal_regression_law_on_a_fixed_design_takes_the_regression_statistics() {
+    let model = |design: &str, alpha: &str| {
+        format!(
+            "reg = standard_module(\"regression\", \"0.1\")
+x = {design}
+alpha = elementof(reals)
+beta = elementof(cartpow(reals, 2))
+sigma = elementof(posreals)
+inputs = (alpha, beta, sigma)
+outputs = logdensityof(reg.NormalGLM(x, {alpha}, beta, sigma), [1.0, 2.0, 2.5, 4.0])
+"
+        )
+    };
+    let fixed = "rowstack([[1.0, 0.5], [1.0, 1.5], [1.0, 2.5], [1.0, 3.5]])";
+    for alpha in ["alpha", "0.0"] {
+        let law = lower(&model(fixed, alpha), true);
+        assert!(summary_count(&law) > 0, "{alpha}");
+        let written = model(fixed, alpha).replace(
+            &format!("reg.NormalGLM(x, {alpha}, beta, sigma)"),
+            &if alpha == "0.0" {
+                "Normal.(x * beta, sigma)".to_owned()
+            } else {
+                format!("Normal.({alpha} .+ x * beta, sigma)")
+            },
+        );
+        assert_eq!(
+            summary_count(&law),
+            summary_count(&lower(&written, true)),
+            "{alpha}"
+        );
+        assert_eq!(summary_count(&lower(&model(fixed, alpha), false)), 0);
+    }
+    // A design that depends on a scoring input keeps the fused regression score.
+    let live = model(&format!("sigma .* {fixed}"), "alpha");
+    assert_eq!(summary_count(&lower(&live, true)), 0);
+}

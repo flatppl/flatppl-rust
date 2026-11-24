@@ -302,25 +302,26 @@ fn score(e: &mut Emitter, p: &Params, y: &Value, family: Family) -> Result<Value
     if family == Family::Ordered {
         return ordered_density(e, p, y, &eta);
     }
+    if family == Family::Bernoulli {
+        if let Some(score) = e.reduce_regression_design(&eta, y) {
+            return Ok(score);
+        }
+        // The arithmetic of the broadcast law `Bernoulli.(invlogit.(eta))`.
+        let one = e.scalar(1.0);
+        let zero = e.scalar(0.0);
+        let success = e.compare("EQ", y, &one);
+        let failure = e.compare("EQ", y, &zero);
+        let supported = e.or(&success, &failure);
+        let rows = super::bernoulli_logit_score(e, &eta, &success, &supported);
+        return Ok(finish(e, &supported, &rows));
+    }
     let one = e.scalar(1.0);
     let zero = e.scalar(0.0);
     let y = e.convert(y, ElemKind::Real);
     match family {
-        Family::Bernoulli | Family::Binomial => {
-            let trials = if family == Family::Bernoulli {
-                one.clone()
-            } else {
-                scalar_param(e, p, "n")?
-            };
+        Family::Binomial => {
+            let trials = scalar_param(e, p, "n")?;
             let (supported, y) = count_support(e, &y, Some(&trials));
-            if family == Family::Bernoulli {
-                let success = e.compare("EQ", &y, &one);
-                let negative_eta = e.neg(&eta);
-                let signed = e.select(&success, &negative_eta, &eta);
-                let penalty = softplus(e, &signed);
-                let rows = e.neg(&penalty);
-                return Ok(finish(e, &supported, &rows));
-            }
             let negative_eta = e.neg(&eta);
             let yes = softplus(e, &negative_eta);
             let no = softplus(e, &eta);
@@ -328,16 +329,14 @@ fn score(e: &mut Emitter, p: &Params, y: &Value, family: Family) -> Result<Value
             let failures = e.sub(&trials, &y);
             let failures = e.mul(&failures, &no);
             let penalty = e.add(&successes, &failures);
-            let mut rows = e.neg(&penalty);
-            if family == Family::Binomial {
-                let n_minus_y = e.sub(&trials, &y);
-                let a = e.add(&y, &one);
-                let b = e.add(&n_minus_y, &one);
-                let lb = e.log_beta(&a, &b);
-                let log_n = e.log1p(&trials);
-                let choose = e.add(&log_n, &lb);
-                rows = e.sub(&rows, &choose);
-            }
+            let rows = e.neg(&penalty);
+            let n_minus_y = e.sub(&trials, &y);
+            let a = e.add(&y, &one);
+            let b = e.add(&n_minus_y, &one);
+            let lb = e.log_beta(&a, &b);
+            let log_n = e.log1p(&trials);
+            let choose = e.add(&log_n, &lb);
+            let rows = e.sub(&rows, &choose);
             Ok(finish(e, &supported, &rows))
         }
         Family::Poisson => {
