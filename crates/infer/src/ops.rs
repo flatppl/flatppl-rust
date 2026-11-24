@@ -7760,7 +7760,7 @@ fn broadcast_type(
             "complex" | "cis" | "real" | "imag" | "conj" | "abs" | "abs2" | "exp" | "log" | "sqrt"
             | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
             | "acosh" | "atanh" | "invlogit" | "invprobit" | "logit" | "log1p" | "expm1"
-            | "loggamma" | "boolean",
+            | "loggamma" | "boolean" | "floor" | "ceil" | "round",
             _,
         ) => function_result(inf.module, &op_name, &cells).unwrap_or(Type::Deferred),
         // The comparisons and the logical connectives, whose per-cell result is a

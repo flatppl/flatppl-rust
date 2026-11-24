@@ -13,6 +13,25 @@ fn lower(source: &str) -> Module {
 }
 
 #[test]
+fn real_rounding_and_conjugation_emit_differentiable_real_queries() {
+    for (input, output) in [
+        ("reals", "conj(x)"),
+        ("reals", "real(floor(x))"),
+        ("reals", "real(ceil(x))"),
+        ("reals", "real(round(x))"),
+        ("cartpow(reals, 2)", "sum(real.(round.(x)))"),
+    ] {
+        let module = lower(&format!(
+            "x = elementof({input})\ninputs = x\noutputs = {output}\n"
+        ));
+        for differentiate in [gradient, jvp, vjp] {
+            let differentiated = differentiate(&module, &["x"]).unwrap();
+            lower(&flatppl_syntax::print(&differentiated));
+        }
+    }
+}
+
+#[test]
 fn determinant_derivatives_use_cofactors() {
     let module = lower(
         "

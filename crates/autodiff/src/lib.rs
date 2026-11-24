@@ -980,6 +980,10 @@ impl<'a> Plan<'a> {
                 .or_else(|| transforms::args(self.module, self.query, call, op))
         {
             (rule, args, op == "broadcast")
+        } else if let Some((rule, arg)) =
+            self.real_rounding(node, op, call, positional_broadcast)?
+        {
+            (rule, vec![arg], op == "broadcast")
         } else if op == "get"
             && let Some(projection) =
                 fixed_scan::Projection::read(self.module, &self.query.inputs, node)
@@ -1051,6 +1055,49 @@ impl<'a> Plan<'a> {
             targets,
             broadcast,
         }))
+    }
+
+    // Bypass the integer intermediate only for the direct conversion back to reals.
+    fn real_rounding(
+        &self,
+        node: NodeId,
+        op: &str,
+        call: &flatppl_core::Call,
+        broadcast: Option<(&str, &[NodeId])>,
+    ) -> Result<Option<(&'static str, NodeId)>, Error> {
+        let rounded = match (op, call.args.as_ref(), broadcast) {
+            ("real", [rounded], _) if call.named.is_empty() => *rounded,
+            (_, _, Some(("real", [rounded]))) => *rounded,
+            _ => return Ok(None),
+        };
+        let Key::Node(rounded) = self.query.key(self.module, rounded)? else {
+            return Ok(None);
+        };
+        let Node::Call(inner) = self.module.node(rounded) else {
+            return Ok(None);
+        };
+        let (CallHead::Builtin(head), true) = (inner.head, inner.named.is_empty()) else {
+            return Ok(None);
+        };
+        let (op, arg) = match (self.module.resolve(head), inner.args.as_ref()) {
+            ("broadcast", [head, arg]) => {
+                let Node::Const(head) = self.module.node(*head) else {
+                    return Ok(None);
+                };
+                (self.module.resolve(*head), *arg)
+            }
+            (op, [arg]) => (op, *arg),
+            _ => return Ok(None),
+        };
+        let rule = match op {
+            "floor" | "ceil" => "real floor or ceil",
+            "round" => "real round",
+            _ => return Ok(None),
+        };
+        let Some(shape) = tensor::real_shape(self.module, arg) else {
+            return Ok(None);
+        };
+        Ok((tensor::real_shape(self.module, node) == Some(shape)).then_some((rule, arg)))
     }
 }
 
