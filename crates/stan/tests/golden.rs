@@ -180,6 +180,106 @@ outputs = logdensityof(Normal(0, 1), theta) + logdensityof(Normal(theta, 1), row
     assert!(code.contains("to_matrix([0.5, 1.5])[1, 2]"), "{code}");
 }
 
+/// A regression on a data design matrix, observed through a kernel.
+fn regression(law: &str, observed: &str) -> String {
+    format!(
+        r#"# emit: target=posterior
+flatppl_compat = "0.1"
+X = rowstack([[1.0, 0.5], [1.0, 1.5], [1.0, 2.5]])
+alpha = elementof(reals)
+beta = elementof(cartpow(reals, 2))
+sigma ~ Exponential(1)
+y ~ {law}
+prior = joint(Lebesgue(cartprod(alpha = reals, beta = cartpow(reals, 2))), lawof((sigma = sigma)))
+forward = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma)
+posterior = bayesupdate(likelihoodof(forward, record(y = {observed})), prior)
+"#
+    )
+}
+
+fn emit_glm(source: &str) -> (String, String) {
+    let glm_off = flatppl_stan::RulePolicy::from_selectors(["ruleset:glm".parse().unwrap()]);
+    let default = emit(source).code;
+    let written = emit_named_with_rules("inline source", source, &glm_off).code;
+    (default, written)
+}
+
+#[test]
+fn a_linear_predictor_on_data_uses_the_stan_glm_functions() {
+    let reals = "[1.0, 2.0, 3.0]";
+    let counts = "[1, 0, 1]";
+    for (law, observed, glm, written) in [
+        (
+            "Normal.(X * beta, sigma)",
+            reals,
+            "y ~ normal_id_glm(X, 0",
+            "y ~ normal(X * beta, sigma);",
+        ),
+        (
+            "Normal.(alpha .+ X * beta, sigma)",
+            reals,
+            "y ~ normal_id_glm(X, alpha, beta, sigma);",
+            "y ~ normal(alpha + X * beta, sigma);",
+        ),
+        (
+            "Bernoulli.(invlogit.(alpha .+ X * beta))",
+            counts,
+            "y ~ bernoulli_logit_glm(X, alpha, beta);",
+            "y ~ bernoulli_logit(alpha + X * beta);",
+        ),
+        (
+            "Poisson.(exp.(X * beta .+ alpha))",
+            counts,
+            "y ~ poisson_log_glm(X, alpha, beta);",
+            "y ~ poisson_log(X * beta + alpha);",
+        ),
+    ] {
+        let source = regression(law, observed);
+        let (default, unrewritten) = emit_glm(&source);
+        assert!(default.contains(glm), "{law}:\n{default}");
+        assert!(unrewritten.contains(written), "{law}:\n{unrewritten}");
+    }
+}
+
+/// The design matrix is a field of a record, read by its name.
+fn record_regression(record: &str) -> String {
+    format!(
+        r#"# emit: target=posterior
+flatppl_compat = "0.1"
+beta = elementof(cartpow(reals, 2))
+sigma ~ Exponential(1)
+d = {record}
+y ~ Normal.(d.X * beta, sigma)
+prior = joint(Lebesgue(cartprod(beta = cartpow(reals, 2))), lawof((sigma = sigma)))
+forward = kernelof(record(y = y), beta = beta, sigma = sigma)
+posterior = bayesupdate(likelihoodof(forward, record(y = [1.0, 2.0, 3.0])), prior)
+"#
+    )
+}
+
+#[test]
+fn a_design_matrix_field_of_a_data_record_uses_the_stan_glm_function() {
+    let source = record_regression("record(X = rowstack([[1.0, 0.5], [1.0, 1.5], [1.0, 2.5]]))");
+    let (default, unrewritten) = emit_glm(&source);
+    assert!(default.contains("y ~ normal_id_glm("), "{default}");
+    assert!(!unrewritten.contains("_glm"), "{unrewritten}");
+}
+
+#[test]
+fn a_design_matrix_field_of_a_record_that_is_not_data_keeps_the_written_law() {
+    let source =
+        record_regression("record(X = sigma .* rowstack([[1.0, 0.5], [1.0, 1.5], [1.0, 2.5]]))");
+    let code = emit(&source).code;
+    assert!(!code.contains("_glm"), "{code}");
+}
+
+#[test]
+fn a_design_matrix_that_is_not_data_keeps_the_written_law() {
+    let source = regression("Normal.((sigma .* X) * beta, sigma)", "[1.0, 2.0, 3.0]");
+    let code = emit(&source).code;
+    assert!(!code.contains("_glm"), "{code}");
+}
+
 fn golden_models() -> Vec<std::path::PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
@@ -199,12 +299,16 @@ fn data_text(program: &flatppl_stan::StanProgram) -> String {
 /// The emitter runs after optimisation and must also translate the model as
 /// written. With every rule and pass off, each golden keeps its data and its
 /// `~` statements, and its text differs only where a default rule rewrites an
-/// expression.
+/// expression. A golden whose law a default rule replaces by design prints
+/// its written law, and differs from the golden in that one line only.
 #[test]
 fn goldens_without_optimisation() {
     // The mixture weights are already normalised, so the default drops the
     // zero `- log(sum(weights))` term.
     const REWRITTEN: &[&str] = &["ksuperpose_shared_argument"];
+    // A linear predictor on a data matrix uses a Stan GLM function by default.
+    const LAW_REPLACED: &[(&str, &str)] =
+        &[("user_function_loop", "y ~ normal(alpha + X * beta, sigma);")];
     let rules = flatppl_stan::RulePolicy::all_disabled();
     let tildes = |code: &str| -> Vec<String> {
         code.lines()
@@ -223,7 +327,22 @@ fn goldens_without_optimisation() {
         }
         let expected = std::fs::read_to_string(path.with_extension("stan")).unwrap();
         let stem = path.file_stem().unwrap().to_str().unwrap();
-        if !REWRITTEN.contains(&stem) {
+        if let Some(&(_, written)) = LAW_REPLACED.iter().find(|(name, _)| *name == stem) {
+            let changed: Vec<_> = program
+                .code
+                .lines()
+                .zip(expected.lines())
+                .filter(|(unoptimised, golden)| unoptimised != golden)
+                .map(|(unoptimised, _)| unoptimised.trim())
+                .collect();
+            let same_length = program.code.lines().count() == expected.lines().count();
+            if !same_length || changed != [written] {
+                failures.push(format!(
+                    "{name}: expected only `{written}` to differ\n{}",
+                    program.code
+                ));
+            }
+        } else if !REWRITTEN.contains(&stem) {
             if program.code != expected {
                 failures.push(format!("{name}: text\n{}", program.code));
             }

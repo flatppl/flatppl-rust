@@ -40,7 +40,7 @@ pub(super) struct Extraction {
     pub(super) sources: HashMap<usize, usize>,
 }
 
-const CONSTRUCTORS: [&str; 7] = ["Leaf", "Boolean", "Integer", "Real", "U", "B", "T"];
+const CONSTRUCTORS: [&str; 8] = ["Leaf", "Boolean", "Integer", "Real", "U", "B", "T", "Q"];
 const MAX_INPUT_ROWS: usize = 32_768;
 const MAX_NEW_ROWS: usize = 16_384;
 const MAX_MATCHES: usize = 131_072;
@@ -129,8 +129,9 @@ fn build_catalogue(config: Catalogue, rules: &RulePolicy) -> EGraph {
     load("schema", include_str!("rules/schema.egg"));
     load("portable", include_str!("rules/portable.egg"));
     load("concat", include_str!("rules/concat.egg"));
+    load("glm", include_str!("rules/glm.egg"));
     let mut portable =
-        String::from("(unstable-combined-ruleset query-portable analysis portable concat");
+        String::from("(unstable-combined-ruleset query-portable analysis portable concat glm");
     if config.measures {
         load("gaussian", include_str!("rules/gaussian.egg"));
         load("conjugacy", include_str!("rules/conjugacy.egg"));
@@ -413,6 +414,7 @@ fn has_candidates(terms: &[Term], facts: &[Fact], profile: Profile) -> bool {
             }
             ("ifelse", [c, a, b]) => a == b || boolean(*c) || (boolean(*a) && boolean(*b)),
             ("mul", [x, y]) if hlo || stan => is_transposed(*x, *y) || is_transposed(*y, *x),
+            ("broadcast.Normal" | "broadcast.Bernoulli" | "broadcast.Poisson", _) if stan => true,
             _ if !hlo => false,
             ("tile", [_, counts]) => matches!(terms[*counts], Term::Integer(1)) || unit_counts.contains(counts),
             ("addaxes", [x, left, right]) => {
@@ -984,6 +986,27 @@ impl CostModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_four_operand_term_survives_extraction() {
+        let mut terms = vec![
+            Term::Leaf(0),
+            Term::Leaf(1),
+            Term::Leaf(2),
+            Term::Leaf(3),
+            Term::Call("four".into(), vec![0, 1, 2, 3]),
+            Term::Call("identity".into(), vec![4]),
+        ];
+        let ty = |id| Fact {
+            name: "type-id",
+            args: vec![FactArg::Expr(id), FactArg::Int(1)],
+        };
+        let rules = RulePolicy::default();
+        let extraction = optimise(&mut terms, &[5], &[ty(4), ty(5)], Profile::Portable, &rules)
+            .expect("identity removed");
+        assert_eq!(extraction.roots, [4]);
+        assert_eq!(terms[4], Term::Call("four".into(), vec![0, 1, 2, 3]));
+    }
 
     #[test]
     fn invalid_query_facts_retain_the_original() {

@@ -1,0 +1,28 @@
+(ruleset glm)
+
+; FlatPPL §09 module regression: each GLM law is the broadcast law of its
+; linear predictor `alpha .+ x * beta`. A target seeds `data-boundary` for a
+; design it reads as data. Its extraction cost decides which form it keeps.
+; Shapes of real terms in any phase. The value relations of the schema hold
+; only for terms whose values other rules may erase.
+(relation shape-real (Expr))
+(relation shape-real-vector (Expr i64))
+(relation glm-linear (Expr Expr Expr Expr))
+(rule ((= eta (B "mul" x b)) (data-boundary x) (real-matrix x n k)
+       (shape-real-vector b k) (shape-real-vector eta n))
+      ((glm-linear eta x (Real 0) b)) :ruleset glm :name "glm.design")
+(rule ((= eta (B "broadcast.add" a lin)) (glm-linear lin x (Real 0) b)
+       (shape-real a) (shape-real-vector eta n) (shape-real-vector lin n))
+      ((glm-linear eta x a b)) :ruleset glm :name "glm.leading-intercept")
+(rule ((= eta (B "broadcast.add" lin a)) (glm-linear lin x (Real 0) b)
+       (shape-real a) (shape-real-vector eta n) (shape-real-vector lin n))
+      ((glm-linear eta x a b)) :ruleset glm :name "glm.trailing-intercept")
+
+(rule ((= law (B "broadcast.Normal" eta sigma)) (glm-linear eta x a b) (shape-real sigma))
+      ((union law (Q "regression.NormalGLM" x a b sigma))) :ruleset glm :name "glm.normal")
+(rule ((= law (U "broadcast.Bernoulli" p)) (= p (U "broadcast.invlogit" eta))
+       (glm-linear eta x a b))
+      ((union law (T "regression.BernoulliLogitGLM" x a b))) :ruleset glm :name "glm.bernoulli-logit")
+(rule ((= law (U "broadcast.Poisson" rate)) (= rate (U "broadcast.exp" eta))
+       (glm-linear eta x a b))
+      ((union law (T "regression.PoissonLogGLM" x a b))) :ruleset glm :name "glm.poisson-log")
