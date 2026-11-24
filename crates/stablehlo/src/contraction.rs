@@ -22,6 +22,14 @@ impl Emitter<'_> {
         }
         let result = shape(result_ty);
         let groups = tile_count(shape(&a.ty), shape(&b.ty), result, [left, right], batch)?;
+        // Fixed nonnegative vector weights commonly appear in repeated
+        // reductions. Preserve their compact native matrix-vector lowering.
+        if batch == 0
+            && matches!((shape(&a.ty).len(), shape(&b.ty).len()), (1, 2) | (2, 1))
+            && (self.fixed_nonnegative_weights(a) || self.fixed_nonnegative_weights(b))
+        {
+            return None;
+        }
         let axis = shape(&a.ty).len() - 1;
         let mut product = result.to_vec();
         product.insert(axis, shape(&a.ty)[left]);
@@ -45,6 +53,15 @@ impl Emitter<'_> {
         let [hi, lo] = self.sum_pairs(pair, axis, groups);
         let result = self.add(&hi, &lo);
         Some(self.axes_view(&result, result_axes.clone()))
+    }
+
+    fn fixed_nonnegative_weights(&self, value: &Value) -> bool {
+        shape(&value.ty).len() == 1
+            && self.fixed_operand(value).is_some_and(|cells| {
+                cells
+                    .iter()
+                    .all(|cell| matches!(cell, Scalar::Real(x) if x.is_finite() && *x >= 0.0))
+            })
     }
 
     fn contraction_broadcast(

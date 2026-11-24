@@ -706,3 +706,46 @@ fn f32_contractions_keep_their_abi_across_compensated_and_native_shapes() {
         }
     }
 }
+
+#[test]
+fn fixed_nonnegative_matrix_vector_weights_keep_native_contractions() {
+    for (name, weights, inputs, compensated) in [
+        ("fixed-weights", "cat(fill(0.5, 64), [1.0])", "a", false),
+        ("splat-weights", "fill(1.0, 65)", "a", false),
+        ("signed-weights", "cat(fill(0.5, 64), [-1.0])", "a", true),
+        (
+            "runtime-weights",
+            "elementof(cartpow(reals, 65))",
+            "(a, b)",
+            true,
+        ),
+    ] {
+        let input = write_model(
+            name,
+            &format!(
+                "a = elementof(cartpow(reals, [2, 65]))\nb = {weights}\ninputs = {inputs}\noutputs = (a * b, transpose(b) * transpose(a))\n"
+            ),
+        );
+        for target in ["cpu", "gpu"] {
+            let output = flatppl()
+                .args(["stablehlo", "--dtype", "f32", "--target", target])
+                .arg(&input)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let ir = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(ir.contains("stablehlo.is_finite"), compensated, "{name}");
+            let native_dots = ir
+                .lines()
+                .filter(|line| {
+                    line.contains("stablehlo.dot_general") && line.contains("-> tensor<2xf32>")
+                })
+                .count();
+            assert_eq!(native_dots, if compensated { 0 } else { 2 }, "{name}");
+        }
+    }
+}
