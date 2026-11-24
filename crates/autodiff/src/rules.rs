@@ -28,11 +28,15 @@ impl<'a> Rules<'a> {
             "\n",
             include_str!("math.egg"),
             "\n",
+            include_str!("array_math.egg"),
+            "\n",
             include_str!("complex.egg"),
             "\n",
             include_str!("glm.egg"),
             "\n",
-            include_str!("vector_scan.egg")
+            include_str!("vector_scan.egg"),
+            "\n",
+            include_str!("spectral.egg")
         )
         .to_owned();
         for (catalog, op, arity, slot) in &keys {
@@ -115,11 +119,34 @@ impl Template {
             return None;
         };
         let node = match (head.as_str(), operands.as_slice()) {
+            ("WindowTranspose", [slot]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                crate::array_math::window_transpose(emitter, values.step, values.bar, slot)?
+            }
+            ("OrderPartial" | "GridWeight", [slot]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                if head == "OrderPartial" {
+                    crate::array_math::order_partial(emitter, values.step, slot)?
+                } else {
+                    crate::array_math::grid_weight(emitter, values.step, slot)?
+                }
+            }
+            ("BernsteinWeights" | "BernsteinSlope", []) => {
+                crate::array_math::bernstein(emitter, values.step, head == "BernsteinSlope")?
+            }
+            ("StepMask", []) => crate::array_math::step_mask(emitter, values.step)?,
+            ("DiagonalScatter", []) => {
+                crate::array_math::diagonal_scatter(emitter, values.step, values.bar)?
+            }
             ("Arg", [index]) => {
                 let index = usize::try_from(self.int(*index)?).ok()?;
                 emitter.primal(*values.step.args.get(index)?)
             }
             ("Out", []) => emitter.primal(values.step.node),
+            ("ParticleScore", [index]) => {
+                let index = usize::try_from(self.int(*index)?).ok()?;
+                crate::particle::partial(emitter, values.step, index)?
+            }
             ("Bar", []) => values.bar,
             ("ZeroOut", []) => emitter.zero_like(values.step.node).ok()?,
             ("Int", [value]) => tensor::int(&mut emitter.module, self.int(*value)?),
@@ -244,10 +271,70 @@ impl Template {
                 let (&primal, selectors) = values.step.args.split_first()?;
                 tensor::scatter(emitter, bar, primal, selectors, self.int(*base)?)?
             }
-            ("BesselOrder", [order, argument]) => {
+            ("ArrayShapePushforward", []) => {
+                crate::array_transforms::pushforward(emitter, values.step, values.bar)?
+            }
+            ("ArrayShapePullback", [slot]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                crate::array_transforms::pullback(emitter, values.step, values.bar, slot)?
+            }
+            ("BetaShape", [slot]) => crate::beta_shape::contribution(
+                emitter,
+                values.step,
+                values.bar,
+                self.int(*slot)? == 1,
+            )?,
+            ("AirySlope", [argument]) => {
+                let argument = self.emit(*argument, emitter, values)?;
+                let module = &mut emitter.module;
+                if values.pointwise {
+                    let mut entries = Vec::new();
+                    let x = crate::callbacks::callback_input(module, "airy_argument", &mut entries);
+                    let body = crate::special::airy_slope(module, x);
+                    let function = crate::callbacks::reify(module, body, entries);
+                    build_call(module, "broadcast", &[function, argument])
+                } else {
+                    crate::special::airy_slope(module, argument)
+                }
+            }
+            ("BesselOrder", [member, order, argument]) => {
+                let Term::Lit(Literal::String(member)) = self.dag.get(*member) else {
+                    return None;
+                };
                 let order = self.emit(*order, emitter, values)?;
                 let argument = self.emit(*argument, emitter, values)?;
-                bessel_order(&mut emitter.module, order, argument)
+                crate::special::bessel_order(&mut emitter.module, order, argument, member)
+            }
+            ("BesselKOrder", [member, order, argument]) => {
+                let Term::Lit(Literal::String(member)) = self.dag.get(*member) else {
+                    return None;
+                };
+                let order = self.emit(*order, emitter, values)?;
+                let argument = self.emit(*argument, emitter, values)?;
+                if values.pointwise {
+                    return None;
+                }
+                crate::special::bessel_k_order(&mut emitter.module, order, argument, member)
+            }
+            ("BesselYOrder", [order, argument]) => {
+                let order = self.emit(*order, emitter, values)?;
+                let argument = self.emit(*argument, emitter, values)?;
+                if values.pointwise {
+                    return None;
+                }
+                crate::special::bessel_y_order(&mut emitter.module, order, argument)
+            }
+            ("CumulativeProduct", [forward]) => {
+                let [input] = *values.step.args.as_slice() else {
+                    return None;
+                };
+                crate::cumulative::product(
+                    emitter,
+                    input,
+                    values.bar,
+                    self.int(*forward)? != 0,
+                    values.masked,
+                )?
             }
             ("CumulativeExtreme" | "CumulativeExtremeForward", [maximum]) => {
                 let [input] = *values.step.args.as_slice() else {
@@ -403,6 +490,38 @@ impl Template {
                 let slot = usize::try_from(self.int(*slot)?).ok()?;
                 math::identity(emitter, *values.step.args.get(slot)?)?
             }
+            ("ComplexExponentialPart", [slot, forward]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                let forward = self.int(*forward)? != 0;
+                crate::linalg::complex_exponential_part(
+                    emitter,
+                    values.step,
+                    values.bar,
+                    slot,
+                    forward,
+                )?
+            }
+            ("EigenProjectionPart", [forward]) => {
+                let forward = self.int(*forward)? != 0;
+                crate::linalg::projection_part(emitter, values.step, values.bar, forward)?
+            }
+            ("SpectrumPart", [forward]) => {
+                let forward = self.int(*forward)? != 0;
+                crate::linalg::spectrum_part(emitter, values.step, values.bar, forward)?
+            }
+            ("FactorizationPart", [forward]) => {
+                let forward = self.int(*forward)? != 0;
+                crate::linalg::factorization_part(emitter, values.step, values.bar, forward)?
+            }
+            ("KronPart" | "FactorSolvePart", [slot, forward]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                let forward = self.int(*forward)? != 0;
+                if head == "KronPart" {
+                    crate::linalg::kron_part(emitter, values.step, values.bar, slot, forward)?
+                } else {
+                    crate::linalg::solve_part(emitter, values.step, values.bar, slot, forward)?
+                }
+            }
             ("MatrixExpFrechet", [base, direction]) => {
                 let base = self.emit(*base, emitter, values)?;
                 let direction = self.emit(*direction, emitter, values)?;
@@ -413,6 +532,17 @@ impl Template {
                     base,
                     direction,
                 )?
+            }
+            ("SpectralProduct", [slot, forward]) => {
+                let slot = usize::try_from(self.int(*slot)?).ok()?;
+                let forward = self.int(*forward)? != 0;
+                let result =
+                    crate::spectral::product(emitter, values.step, values.bar, slot, forward)?;
+                if values.masked {
+                    crate::spectral::mask(emitter, values.step, slot, values.bar, result)?
+                } else {
+                    result
+                }
             }
             ("DetCofactors", []) => math::cofactors(emitter, values.step.args[0])?,
             ("TriangleHalf", [value]) => {
@@ -425,7 +555,10 @@ impl Template {
             }
             ("Insert", [index]) => {
                 let index = self.int(*index)?;
-                if tensor::nested_vector(&emitter.module, values.step.node).is_some() {
+                if emitter.module.type_of(values.step.node).is_some_and(|ty| {
+                    tensor::nested_vector_type(ty).is_some()
+                        || tensor::vector_of_arrays(ty).is_some()
+                }) {
                     let slot = usize::try_from(index - 1).ok()?;
                     let zero = emitter.zero_like(*values.step.args.get(slot)?).ok()?;
                     tensor::insert_nested(
@@ -483,54 +616,4 @@ pub(super) fn special_call(
         named: Vec::new().into(),
         inputs: None,
     }))
-}
-
-// DLMF 10.15.1. For 0 <= ν <= 16 and 1/8 <= x <= 4 the first
-// omitted derivative term is bounded by 2^16 (4^32/(32!)^2)
-// (log(16) + log(49)). Subsequent bounds have ratio below 0.004.
-fn bessel_order(module: &mut Module, order: NodeId, argument: NodeId) -> NodeId {
-    use crate::callbacks::{callback_input, reify};
-
-    let mut parameters = Vec::new();
-    let k = callback_input(module, "term", &mut parameters);
-    let nu = callback_input(module, "order", &mut parameters);
-    let log_half = callback_input(module, "loghalf", &mut parameters);
-    let zero = tensor::int(module, 0);
-    let one = tensor::int(module, 1);
-    let two = tensor::int(module, 2);
-    let one_real = real(module, 1.0);
-    let minus_one = real(module, -1.0);
-    let parity = build_call(module, "mod", &[k, two]);
-    let even = build_call(module, "equal", &[parity, zero]);
-    let sign = build_call(module, "ifelse", &[even, one_real, minus_one]);
-    let kp1 = build_call(module, "add", &[k, one]);
-    let gamma_arg = build_call(module, "add", &[nu, kp1]);
-    let log_k_factorial = build_call(module, "loggamma", &[kp1]);
-    let log_gamma = build_call(module, "loggamma", &[gamma_arg]);
-    let twice_k = build_call(module, "mul", &[two, k]);
-    let power = build_call(module, "add", &[nu, twice_k]);
-    let log_power = build_call(module, "mul", &[power, log_half]);
-    let exponent = build_call(module, "sub", &[log_power, log_k_factorial]);
-    let exponent = build_call(module, "sub", &[exponent, log_gamma]);
-    let magnitude = build_call(module, "exp", &[exponent]);
-    let coefficient = build_call(module, "mul", &[sign, magnitude]);
-    let digamma = special_call(module, "digamma", vec![gamma_arg], false);
-    let factor = build_call(module, "sub", &[log_half, digamma]);
-    let term = build_call(module, "mul", &[coefficient, factor]);
-    let function = reify(module, term, parameters);
-
-    let terms = tensor::int(module, 32);
-    let zeros = build_call(module, "zeros", &[terms]);
-    let indices = build_call(module, "indicesof0", &[zeros]);
-    let log_x = build_call(module, "log", &[argument]);
-    let log_two = real(module, std::f64::consts::LN_2);
-    let log_half = build_call(module, "sub", &[log_x, log_two]);
-    let held_order = build_call(module, "vector", &[order]);
-    let held_log_half = build_call(module, "vector", &[log_half]);
-    let terms = build_call(
-        module,
-        "broadcast",
-        &[function, indices, held_order, held_log_half],
-    );
-    build_call(module, "sum", &[terms])
 }

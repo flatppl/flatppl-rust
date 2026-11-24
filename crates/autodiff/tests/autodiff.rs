@@ -96,17 +96,17 @@ outputs = score
 }
 
 #[test]
-fn rejects_an_active_operation_without_a_rule() {
+fn rejects_a_real_input_restricted_to_integer_values() {
     let module = lower(
         "
 x = elementof(reals)
-score = bernstein([1.0, 2.0], invlogit(x))
+score = real(integer(x))
 inputs = x
 outputs = score
 ",
     );
     let error = gradient(&module, &["x"]).unwrap_err();
-    assert_eq!(error.to_string(), "no pullback for `bernstein` operand 2");
+    assert!(error.to_string().contains("integer"), "{error}");
     assert!(error.node.is_some());
 }
 

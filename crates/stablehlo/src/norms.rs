@@ -423,13 +423,10 @@ pub(crate) fn lower_cumulative(
     if n == 0 {
         return Ok(xs);
     }
-    if e.restrict_enzyme_compatible()
-        && which == Cumulative::Prod
-        && matches!(xs.elem, ElemKind::Real | ElemKind::Complex)
-    {
+    if e.restrict_enzyme_compatible() && which == Cumulative::Prod && xs.elem == ElemKind::Complex {
         return Err(EmitError::at(
             id,
-            "cumprod has no qualified Enzyme derivative lowering",
+            "complex cumprod has no qualified Enzyme derivative lowering",
         ));
     }
     let (op, identity) = match (which, xs.elem) {

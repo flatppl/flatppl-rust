@@ -227,3 +227,110 @@ outputs = logdensityof(Bernoulli(p), 0)
     let text = flatppl_syntax::print(&derivative);
     assert!(text.contains(" / "), "{text}");
 }
+
+#[test]
+fn extended_matrix_operations_roundtrip_derivative_source() {
+    for output in [
+        "e.kron(A, A)",
+        "e.solve_triangular(A = A, b = b, lower = false, unit_diagonal = true)",
+        "e.cholesky_solve(A, b)",
+        "e.lu_solve(record(P = rowstack([[1.0, 0.0], [0.0, 1.0]]), L = rowstack([[1.0, 0.0], [0.3, 1.0]]), U = A), b)",
+    ] {
+        let module = lower(&format!(
+            "e = standard_module(\"ext-linear-algebra\", \"0.1\")\n\
+             A = elementof(cartpow(reals, [2, 2]))\n\
+             b = elementof(cartpow(reals, 2))\ninputs = (A, b)\noutputs = {output}"
+        ));
+        for transform in [jvp, vjp] {
+            let mut derivative = transform(&module, &["A", "b"]).unwrap();
+            flatppl_autodiff::prepare_source(&mut derivative);
+            lower(&flatppl_syntax::print(&derivative));
+        }
+    }
+}
+
+#[test]
+fn lu_and_tall_qr_factor_derivatives_roundtrip() {
+    for (setup, output) in [
+        (
+            "e = standard_module(\"ext-linear-algebra\", \"0.1\")\nA = elementof(cartpow(reals, [2, 2]))",
+            "e.lu(A)",
+        ),
+        ("A = elementof(cartpow(reals, [3, 2]))", "qr(A)"),
+    ] {
+        let module = lower(&format!("{setup}\ninputs = A\noutputs = {output}"));
+        for transform in [jvp, vjp] {
+            let mut derivative = transform(&module, &["A"]).unwrap();
+            flatppl_autodiff::prepare_source(&mut derivative);
+            lower(&flatppl_syntax::print(&derivative));
+        }
+    }
+}
+
+#[test]
+fn real_spectral_derivatives_roundtrip() {
+    for output in ["e.eigh(A)", "e.eigvalsh(A)", "e.eigmax(A)", "e.eigmin(A)"] {
+        let module = lower(&format!(
+            "e = standard_module(\"ext-linear-algebra\", \"0.1\")\n\
+             A = elementof(cartpow(reals, [2, 2]))\ninputs = A\noutputs = {output}"
+        ));
+        for transform in [jvp, vjp] {
+            let mut derivative = transform(&module, &["A"]).unwrap();
+            flatppl_autodiff::prepare_source(&mut derivative);
+            lower(&flatppl_syntax::print(&derivative));
+        }
+    }
+}
+
+#[test]
+fn cumulative_product_derivatives_round_trip_for_fixed_vector_sizes() {
+    for length in [1, 5, 8] {
+        let source =
+            format!("x = elementof(cartpow(reals, {length}))\ninputs = x\noutputs = cumprod(x)\n");
+        let module = lower(&source);
+        for transform in [jvp, vjp] {
+            let result = transform(&module, &["x"]).unwrap();
+            lower(&flatppl_syntax::print(&result));
+        }
+        let scalar = lower(&source.replace("outputs = cumprod(x)", "outputs = sum(cumprod(x))"));
+        let result = gradient(&scalar, &["x"]).unwrap();
+        lower(&flatppl_syntax::print(&result));
+    }
+}
+
+#[test]
+fn complex_eigen_projections_roundtrip_from_real_inputs() {
+    for output in [
+        "real.(e.eigen(A).values)",
+        "imag.(e.eigen(A).values)",
+        "real.(e.eigen(A).vectors)",
+        "imag.(e.eigen(A).vectors)",
+    ] {
+        let module = lower(&format!(
+            "e = standard_module(\"ext-linear-algebra\", \"0.1\")\n\
+             A = elementof(cartpow(reals, [2, 2]))\ninputs = A\noutputs = {output}"
+        ));
+        for transform in [jvp, vjp] {
+            let mut derivative = transform(&module, &["A"]).unwrap();
+            flatppl_autodiff::prepare_source(&mut derivative);
+            lower(&flatppl_syntax::print(&derivative));
+        }
+    }
+}
+
+#[test]
+fn projected_complex_matrix_exponential_roundtrips_both_input_coordinates() {
+    for projection in ["real", "imag"] {
+        let module = lower(&format!(
+            "e = standard_module(\"ext-linear-algebra\", \"0.1\")\n\
+             R = elementof(cartpow(reals, [2, 2]))\n\
+             I = elementof(cartpow(reals, [2, 2]))\n\
+             inputs = (R, I)\noutputs = {projection}.(e.matexp(complex.(R, I)))"
+        ));
+        for transform in [jvp, vjp] {
+            let mut derivative = transform(&module, &["R", "I"]).unwrap();
+            flatppl_autodiff::prepare_source(&mut derivative);
+            lower(&flatppl_syntax::print(&derivative));
+        }
+    }
+}

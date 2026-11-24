@@ -9,6 +9,25 @@ pub(super) fn structural(op: &str) -> bool {
     matches!(
         op,
         "indexed sum product"
+            | "inner product"
+            | "conv"
+            | "crosscorr"
+            | "cross"
+            | "adjoint"
+            | "self_outer"
+            | "row_gram"
+            | "col_gram"
+            | "quadform"
+            | "l1unit"
+            | "l2unit"
+            | "softmax"
+            | "logsoftmax"
+            | "quantile"
+            | "median"
+            | "linspace"
+            | "extlinspace"
+            | "bernstein"
+            | "stepwise"
             | "polynomial"
             | "l2norm"
             | "l1norm"
@@ -79,6 +98,18 @@ pub(super) fn matrix_exp_frechet(
         return None;
     };
     let callee = *callee;
+    Some(matrix_exp_frechet_block(
+        emitter, callee, n, base, direction,
+    ))
+}
+
+pub(super) fn matrix_exp_frechet_block(
+    emitter: &mut Emitter,
+    callee: NodeId,
+    n: i64,
+    base: NodeId,
+    direction: NodeId,
+) -> NodeId {
     let base = emitter.primal(base);
     let direction = emitter.primal(direction);
     let m = &mut emitter.module;
@@ -118,7 +149,7 @@ pub(super) fn matrix_exp_frechet(
     let cols = index_vector(m, n + 1..=2 * n);
     let top = build_call(m, "get", &[exponential, rows, all]);
     let derivative = build_call(m, "get", &[top, all, cols]);
-    Some(build_call(m, "mul", &[scale, derivative]))
+    build_call(m, "mul", &[scale, derivative])
 }
 
 pub(super) fn identity(emitter: &mut Emitter, primal: NodeId) -> Option<NodeId> {
@@ -247,6 +278,20 @@ pub(super) fn complex_rule(
         "exp" => "complex exp",
         "log" => "complex log",
         "sqrt" => "complex sqrt",
+        "abs" => "complex abs",
+        "pow" => "complex pow",
+        "sin" => "complex sin",
+        "cos" => "complex cos",
+        "tan" => "complex tan",
+        "sinh" => "complex sinh",
+        "cosh" => "complex cosh",
+        "tanh" => "complex tanh",
+        "asin" => "complex asin",
+        "acos" => "complex acos",
+        "atan" => "complex atan",
+        "asinh" => "complex asinh",
+        "acosh" => "complex acosh",
+        "atanh" => "complex atanh",
         _ => return None,
     })
 }
@@ -304,6 +349,10 @@ pub(super) fn scalar_reduction(op: &str) -> bool {
     matches!(
         op,
         "polynomial"
+            | "quantile"
+            | "median"
+            | "bernstein"
+            | "stepwise"
             | "l2norm"
             | "l1norm"
             | "linfnorm"

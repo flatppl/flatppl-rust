@@ -426,7 +426,7 @@ impl<'a, 'm, 's> Filter<'a, 'm, 's> {
         self.vector(data, 0)?
             .into_iter()
             .try_fold(initial, |state, value| {
-                if self.predicate(body, (param, &value), 0)? {
+                if self.predicate(body, Some((param, &value)), 0)? {
                     Some(keep(state, value))
                 } else {
                     Some(state)
@@ -443,7 +443,56 @@ pub(crate) fn fixed_filter_count(
     if inf.level < Level::Shape {
         return None;
     }
-    Filter::new(inf).fold_kept(pred?, data?, 0, |count, _| count + 1)
+    let pred = pred?;
+    let data = data?;
+    let filter = Filter::new(inf);
+    if let Some(keep) = filter.constant_predicate(pred) {
+        let Type::Array { shape, .. } = inf.node_annotation(data).0 else {
+            return None;
+        };
+        let [Dim::Static(len)] = *shape else {
+            return None;
+        };
+        return Some(if keep { len as usize } else { 0 });
+    }
+    filter.fold_kept(pred, data, 0, |count, _| count + 1)
+}
+
+pub(crate) fn fixed_selectbins_count(
+    inf: &mut Inferencer<'_, '_>,
+    edges: NodeId,
+    region: NodeId,
+    count: Dim,
+) -> Option<usize> {
+    if inf.level < Level::Shape {
+        return None;
+    }
+    let Dim::Static(count) = count else {
+        return None;
+    };
+    let reader = Filter::new(inf);
+    let (edges, edges32) = reader.bin_edges(edges)?;
+    if edges.len() != (count as usize).checked_add(1)? {
+        return None;
+    }
+    let region = reader.container(region, 0)?;
+    let (lo, open, hi) = if let Node::Const(name) = inf.module.node(region) {
+        match inf.module.resolve(*name) {
+            "reals" => (f64::NEG_INFINITY, false, f64::INFINITY),
+            "posreals" => (0.0, true, f64::INFINITY),
+            "nonnegreals" => (0.0, false, f64::INFINITY),
+            "unitinterval" => (0.0, false, 1.0),
+            _ => return None,
+        }
+    } else {
+        let (lo, hi) = reader.interval(region, 0)?;
+        (lo, false, hi)
+    };
+    // A f32 replay must see the same number of bins as f64.
+    let selected = crate::selected_bins(&edges, lo, open, hi).count();
+    let count32 =
+        crate::selected_bins(&edges32, f64::from(lo as f32), open, f64::from(hi as f32)).count();
+    (selected == count32).then_some(selected)
 }
 
 /// The `filter` call behind `node`, through refs to fixed bindings.
@@ -540,6 +589,60 @@ impl Filter<'_, '_, '_> {
         (r.ns == RefNs::Local).then_some((r.name, *c.args.first()?))
     }
 
+    fn bin_edges(&self, node: NodeId) -> Option<(Vec<f64>, Vec<f64>)> {
+        let node = self.container(node, 0)?;
+        let lookup = |name| flatppl_core::graph::expect_builtin_call(self.inf.module, node, name);
+        if let Some(call) = lookup("linspace").or_else(|| lookup("extlinspace")) {
+            let [from, to, count] = *call.args else {
+                return None;
+            };
+            let from = as_real(&self.number(from, None, 0)?)?;
+            let to = as_real(&self.number(to, None, 0)?)?;
+            let FixedValue::Int(count) = self.number(count, None, 0)? else {
+                return None;
+            };
+            let count = u32::try_from(count).ok()?;
+            if !(1..=MAX_FIXED_FILTER_INDICES).contains(&count)
+                || !from.is_finite()
+                || !to.is_finite()
+                || (count == 1 && from != to)
+            {
+                return None;
+            }
+            let mut wide = Vec::with_capacity(count as usize + 2);
+            let mut narrow = Vec::with_capacity(count as usize + 2);
+            let extended = lookup("extlinspace").is_some();
+            if extended {
+                wide.push(f64::NEG_INFINITY);
+                narrow.push(f64::NEG_INFINITY);
+            }
+            wide.push(from);
+            narrow.push(f64::from(from as f32));
+            if count > 1 {
+                let width64 = (to - from) / f64::from(count - 1);
+                let width32 = (to as f32 - from as f32) / (count - 1) as f32;
+                for i in 1..count - 1 {
+                    wide.push(from + f64::from(i) * width64);
+                    narrow.push(f64::from(from as f32 + i as f32 * width32));
+                }
+                wide.push(to);
+                narrow.push(f64::from(to as f32));
+            }
+            if extended {
+                wide.push(f64::INFINITY);
+                narrow.push(f64::INFINITY);
+            }
+            return Some((wide, narrow));
+        }
+        let edges = self
+            .vector(node, 0)?
+            .iter()
+            .map(as_real)
+            .collect::<Option<Vec<_>>>()?;
+        let narrow = edges.iter().map(|&x| f64::from(x as f32)).collect();
+        Some((edges, narrow))
+    }
+
     fn vector(&self, node: NodeId, depth: u32) -> Option<Vec<FixedValue>> {
         let node = self.container(node, depth)?;
         let Node::Call(c) = self.inf.module.node(node) else {
@@ -602,6 +705,10 @@ impl Filter<'_, '_, '_> {
         match self.inf.module.node(node) {
             Node::Lit(Scalar::Int(n)) => exact_filter_int(*n),
             Node::Lit(Scalar::Real(x)) => Some(FixedValue::Real(*x)),
+            Node::Const(name) if self.inf.module.resolve(*name) == "inf" => {
+                Some(FixedValue::Real(f64::INFINITY))
+            }
+
             Node::Ref(r) if r.ns == RefNs::Local => {
                 let (name, value) = param?;
                 (r.name == name).then(|| value.clone())
@@ -826,10 +933,25 @@ impl Filter<'_, '_, '_> {
         ))
     }
 
-    fn predicate(&self, body: NodeId, param: (Symbol, &FixedValue), depth: u32) -> Option<bool> {
+    fn constant_predicate(&self, node: NodeId) -> Option<bool> {
+        let node = self.container(node, 0)?;
+        let call = flatppl_core::graph::expect_builtin_call(self.inf.module, node, "functionof")?;
+        let [body] = *call.args else {
+            return None;
+        };
+        self.predicate(body, None, 0)
+    }
+
+    fn predicate(
+        &self,
+        body: NodeId,
+        param: Option<(Symbol, &FixedValue)>,
+        depth: u32,
+    ) -> Option<bool> {
         if depth > 64 || self.inf.is_substituted(body) {
             return None;
         }
+        let body = self.container(body, depth)?;
         let c = match self.inf.module.node(body) {
             Node::Lit(Scalar::Bool(value)) => return Some(*value),
             Node::Call(c) => c,
@@ -844,15 +966,14 @@ impl Filter<'_, '_, '_> {
         let op = self.inf.module.resolve(op);
         match (op, c.args.as_ref()) {
             (op @ ("get" | "get0"), [data, selectors @ ..]) => {
-                let Scalar::Bool(value) =
-                    self.indexed_cell(*data, selectors, op, Some(param), depth)?
+                let Scalar::Bool(value) = self.indexed_cell(*data, selectors, op, param, depth)?
                 else {
                     return None;
                 };
                 Some(value)
             }
             ("in", [a, set]) => {
-                let x = as_real(&self.number(*a, Some(param), depth + 1)?)?;
+                let x = as_real(&self.number(*a, param, depth + 1)?)?;
                 let (lo, hi) = self.interval(*set, depth + 1)?;
                 Some(
                     shared_real_comparison(lo, x, Ordering::is_le)?
@@ -860,8 +981,8 @@ impl Filter<'_, '_, '_> {
                 )
             }
             (cmp @ ("lt" | "le" | "gt" | "ge" | "equal" | "unequal"), [a, b]) => {
-                let lhs = self.number(*a, Some(param), depth + 1)?;
-                let rhs = self.number(*b, Some(param), depth + 1)?;
+                let lhs = self.number(*a, param, depth + 1)?;
+                let rhs = self.number(*b, param, depth + 1)?;
                 fixed_comparison(cmp, &lhs, &rhs)
             }
             ("land", [a, b]) => Some(
@@ -1061,8 +1182,8 @@ pub(crate) fn static_dim(n: i64) -> Dim {
 
 /// A dim from a resolved SIZE, per `flatppl-dev/empty-arrays-ruling.md`
 /// (2026-08-20, shape C): an extent of 0 is `%dynamic`, never `Dim::Static(0)`,
-/// so §11's "a positive integer dimension size, or `%dynamic`" holds for every
-/// type this crate produces. A written 0 is refused earlier, at the call
+/// so §11's "a positive integer dimension size, or `%dynamic`" holds for
+/// portable annotations. Compilation can recover the concrete extent privately. A written 0 is refused earlier, at the call
 /// ([`crate::ops::written_size_check`]); a 0 reaching here is DERIVED, and
 /// legality must not depend on how much of it the const-eval table can fold.
 ///
@@ -1079,7 +1200,7 @@ fn size_dim(inf: &mut Inferencer<'_, '_>, node: NodeId, n: i64) -> Dim {
         ));
         return Dim::Dynamic;
     }
-    if n == 0 {
+    if n == 0 && !inf.concrete_empty_axes {
         return Dim::Dynamic;
     }
     static_dim(n)

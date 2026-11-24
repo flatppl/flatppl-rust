@@ -185,19 +185,15 @@ fn polynomials_members_lower_at_a_literal_degree() {
     }
 }
 
-// A `polynomials` degree that is not a literal cannot select a recursion depth, so
-// it must refuse rather than lower to some default.
 #[test]
-fn polynomials_member_refuses_a_non_literal_degree() {
+fn polynomial_non_literal_degree_uses_a_bounded_scan() {
     let src = probe_model(
         &format!("{POLY}\nx = elementof(reals)\nn = integer(x)"),
         "poly.legendre(n, x)",
     );
-    let err = determinize(&parse_infer(&src)).expect_err("a non-literal degree must refuse");
-    assert!(
-        format!("{err:?}").contains("legendre"),
-        "the refusal must name the member: {err:?}"
-    );
+    let pir = lower(&src);
+    assert!(pir.contains("(scan "), "{pir}");
+    assert!(!pir.contains("(%ref poly legendre)"), "{pir}");
 }
 
 // The five `distances` members with a §07 base-op form. §07 lists `mul` on two

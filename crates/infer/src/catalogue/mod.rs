@@ -512,6 +512,8 @@ pub(crate) enum DimExpr {
     /// Product of two dim expressions (e.g. `kron`'s pq × mn). Static only when
     /// both operands are static (overflow falls back to dynamic).
     Mul(Box<DimExpr>, Box<DimExpr>),
+    /// Minimum of two static dimensions, as in a thin factorization.
+    Min(Box<DimExpr>, Box<DimExpr>),
     /// A fixed number of appended entries, as in a spline's affine columns.
     Add(Box<DimExpr>, u32),
     /// The positive integer literal written at positional arg `i`, as in

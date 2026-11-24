@@ -357,7 +357,7 @@ impl Projection {
         let mut module = std::borrow::Cow::Owned(module);
         let query = Query::read(&mut module, &names, mode)?;
         let root = query.key(&module, body)?;
-        let mut plan = Plan::new(&module, &query);
+        let mut plan = Plan::new(&module, &query, None);
         plan.visit(root, 0)?;
         let mut requests = BTreeSet::new();
         plan.collect_rules(mode, &mut requests);

@@ -159,20 +159,16 @@ fn integrate(m: &mut Module, a: NodeId, b: NodeId, knots: &[NodeId], degree: usi
     let n = knots.len() - degree - 1;
     let zero = lit(m, 0.0);
     let half = lit(m, 0.5);
-    let minus_one = lit(m, -1.0);
-    let one = lit(m, 1.0);
-    let reversed = build_call(m, "gt", &[a, b]);
-    let lower = build_call(m, "min", &[a, b]);
-    let upper = build_call(m, "max", &[a, b]);
-    let sign = choose(m, reversed, minus_one, one);
     let mut result = vec![zero; n];
     for span in degree..n {
-        let left = build_call(m, "max", &[lower, knots[span]]);
-        let right = build_call(m, "min", &[upper, knots[span + 1]]);
+        // Clip each endpoint separately. A signed span width handles reversal
+        // and preserves the two endpoint derivatives even when a == b.
+        let left = build_call(m, "max", &[a, knots[span]]);
+        let left = build_call(m, "min", &[left, knots[span + 1]]);
+        let right = build_call(m, "max", &[b, knots[span]]);
+        let right = build_call(m, "min", &[right, knots[span + 1]]);
         let width = sub(m, right, left);
-        let width = build_call(m, "max", &[width, zero]);
         let radius = mul(m, half, width);
-        // Clamping the midpoint keeps a zero-width quadrature harmless for AD.
         let center = add(m, left, radius);
         for (node, weight) in gauss_legendre((degree + 2) / 2) {
             let node = lit(m, node);
@@ -180,7 +176,6 @@ fn integrate(m: &mut Module, a: NodeId, b: NodeId, knots: &[NodeId], degree: usi
             let x = add(m, center, offset);
             let weight = lit(m, weight);
             let scale = mul(m, radius, weight);
-            let scale = mul(m, scale, sign);
             for (target, value) in result.iter_mut().zip(basis(m, x, knots, degree, 0)) {
                 let contribution = mul(m, scale, value);
                 *target = add(m, *target, contribution);

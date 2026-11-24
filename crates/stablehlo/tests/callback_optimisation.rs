@@ -25,7 +25,7 @@ fn compile(source: &str, restrict_enzyme_compatible: bool) -> Result<String, Emi
 }
 
 #[test]
-fn named_callback_body_keeps_its_batched_reverse_refusal() {
+fn named_callback_body_reverses_only_its_cell_axis() {
     let source = "\
         a = [1.0, 2.0]\n\
         body = reverse(reverse(a))\n\
@@ -34,12 +34,15 @@ fn named_callback_body_keeps_its_batched_reverse_refusal() {
         inputs = x\n\
         outputs = f.(x)\n";
     for restricted in [false, true] {
-        let error = compile(source, restricted).unwrap_err();
+        let hlo = compile(source, restricted).unwrap();
+        let reversals: Vec<_> = hlo
+            .lines()
+            .filter(|line| line.contains("stablehlo.reverse"))
+            .collect();
+        assert_eq!(reversals.len(), 2, "{hlo}");
         assert!(
-            error
-                .to_string()
-                .contains("reverse` has no batched lowering"),
-            "{error}"
+            reversals.iter().all(|line| line.contains("dims = [1]")),
+            "{hlo}"
         );
     }
 }

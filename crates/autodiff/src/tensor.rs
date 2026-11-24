@@ -36,16 +36,21 @@ pub(super) fn nested_vector_type(ty: &Type) -> Option<(u32, u32)> {
     }
 }
 
-// Larger cells keep their own array axes inside the outer vector axis.
-pub(super) fn vector_of_arrays(ty: &Type) -> Option<(Dim, &Type)> {
+// Array cells retain their own axes inside the outer collection.
+pub(super) fn array_of_arrays(ty: &Type) -> Option<(&[Dim], &Type)> {
     let Type::Array { shape, elem } = ty else {
         return None;
     };
-    let [rows @ Dim::Static(_)] = **shape else {
+    let cell_shape = real_shape_of(elem)?;
+    (!shape.is_empty() && fixed(shape) && !cell_shape.is_empty()).then_some((shape, elem))
+}
+
+pub(super) fn vector_of_arrays(ty: &Type) -> Option<(Dim, &Type)> {
+    let (outer, elem) = array_of_arrays(ty)?;
+    let [rows] = *outer else {
         return None;
     };
-    let cell_shape = real_shape_of(elem)?;
-    (cell_shape.len() > 1).then_some((rows, elem))
+    (real_shape_of(elem)?.len() > 1).then_some((rows, elem))
 }
 
 pub(super) fn add_terms(emitter: &mut Emitter, primal: NodeId, terms: &[NodeId]) -> NodeId {
@@ -54,8 +59,7 @@ pub(super) fn add_terms(emitter: &mut Emitter, primal: NodeId, terms: &[NodeId])
     }
     if let Some(ty) = emitter.module.type_of(primal)
         && (matches!(ty, Type::Record(_) | Type::Table { .. } | Type::Tuple(_))
-            || nested_vector_type(ty).is_some()
-            || vector_of_arrays(ty).is_some())
+            || array_of_arrays(ty).is_some())
     {
         return add_typed(emitter, &ty.clone(), terms);
     }
@@ -80,7 +84,7 @@ pub(super) fn add_typed(emitter: &mut Emitter, ty: &Type, terms: &[NodeId]) -> N
             .collect();
         let matrix = fold_add(m, &matrices);
         callbacks::pack_rows(m, matrix, count)
-    } else if vector_of_arrays(ty).is_some() {
+    } else if array_of_arrays(ty).is_some() {
         let m = &mut emitter.module;
         let mut entries = Vec::with_capacity(terms.len());
         let cells: Vec<_> = (0..terms.len())
@@ -243,10 +247,9 @@ pub(super) fn fill_typed(
         let rows = int(m, i64::from(rows));
         return Some(build_call(m, "fill", &[row, rows]));
     }
-    if let Some((rows, cell_type)) = vector_of_arrays(ty) {
-        let size = shape_arg(emitter, primal, &[rows])?;
-        let index = int(&mut emitter.module, 1);
-        let cell = build_call(&mut emitter.module, "get", &[primal, index]);
+    if let Some((outer, cell_type)) = array_of_arrays(ty) {
+        let size = shape_arg(emitter, primal, outer)?;
+        let cell = first_cell(&mut emitter.module, primal, outer.len());
         let value = fill_typed(emitter, value, cell, cell_type)?;
         return Some(build_call(&mut emitter.module, "fill", &[value, size]));
     }
@@ -291,15 +294,14 @@ pub(super) fn seed_set(emitter: &mut Emitter, primal: NodeId, ty: &Type) -> Opti
         let row_set = build_call(m, "cartpow", &[reals, cols]);
         let rows = int(m, i64::from(rows));
         Some(build_call(m, "cartpow", &[row_set, rows]))
-    } else if let Some((rows, cell_type)) = vector_of_arrays(ty) {
-        let rows = shape_arg(emitter, primal, &[rows])?;
-        let index = int(&mut emitter.module, 1);
-        let cell = build_call(&mut emitter.module, "get", &[primal, index]);
+    } else if let Some((outer, cell_type)) = array_of_arrays(ty) {
+        let size = shape_arg(emitter, primal, outer)?;
+        let cell = first_cell(&mut emitter.module, primal, outer.len());
         let cell_set = seed_set(emitter, cell, cell_type)?;
         Some(build_call(
             &mut emitter.module,
             "cartpow",
-            &[cell_set, rows],
+            &[cell_set, size],
         ))
     } else {
         let shape = real_shape_of(ty)?;
@@ -444,6 +446,11 @@ pub(super) fn stack_insert(
     build_call(module, op, &[vectors])
 }
 
+fn first_cell(module: &mut Module, value: NodeId, rank: usize) -> NodeId {
+    let one = int(module, 1);
+    indexed(module, value, &vec![one; rank])
+}
+
 fn shape_arg(emitter: &mut Emitter, primal: NodeId, shape: &[Dim]) -> Option<NodeId> {
     let sizes = shape
         .iter()
@@ -566,6 +573,27 @@ pub(super) fn index_axes(module: &Module, selector: NodeId) -> Option<usize> {
     }
 }
 
+pub(super) fn full_array_cell_access(module: &Module, args: &[NodeId]) -> bool {
+    let Some((&array, indices)) = args.split_first() else {
+        return false;
+    };
+    module
+        .type_of(array)
+        .and_then(array_of_arrays)
+        .is_some_and(|(shape, _)| shape.len() > 1 && scalar_cell_indices(module, shape, indices))
+}
+
+fn scalar_cell_indices(module: &Module, shape: &[Dim], indices: &[NodeId]) -> bool {
+    shape.len() == indices.len()
+        && indices
+            .iter()
+            .zip(shape)
+            .all(|(&index, &dim)| match module.node(index) {
+                Node::Const(name) => module.resolve(*name) == "only" && dim == Dim::Static(1),
+                _ => index_axes(module, index) == Some(0),
+            })
+}
+
 pub(super) fn scatter(
     emitter: &mut Emitter,
     bar: NodeId,
@@ -626,8 +654,67 @@ pub(super) fn scatter_typed(
         };
         return scatter_array_cells(emitter, bar, primal, selector, base, cell_type);
     }
+    if let Some((shape, cell)) = array_of_arrays(ty)
+        && shape.len() > 1
+        && scalar_cell_indices(&emitter.module, shape, selectors)
+    {
+        return scatter_whole_cell(emitter, bar, shape, cell, selectors, base);
+    }
     let rank = real_shape_of(ty)?.len();
     scatter_axes(emitter, bar, primal, selectors, base, rank)
+}
+
+// Compare one axis coordinate at a time and place the whole cell where
+// every selector matches. The broadcast reconstructs the nested array.
+fn scatter_whole_cell(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    shape: &[Dim],
+    cell: &Type,
+    selectors: &[NodeId],
+    base: i64,
+) -> Option<NodeId> {
+    let zero = real(&mut emitter.module, 0.0);
+    let zero = fill_typed(emitter, zero, bar, cell)?;
+    let m = &mut emitter.module;
+    let mut boundary = Vec::new();
+    let mut operands = Vec::new();
+    let mut selected = None;
+    for (axis, (&size, &selector)) in shape.iter().zip(selectors).enumerate() {
+        let Dim::Static(size) = size else {
+            return None;
+        };
+        let dim = int(m, i64::from(size));
+        let zeros = build_call(m, "zeros", &[dim]);
+        let indices = build_call(
+            m,
+            if base == 0 { "indicesof0" } else { "indicesof" },
+            &[zeros],
+        );
+        let leading = int(m, axis as i64);
+        let trailing = int(m, (shape.len() - axis - 1) as i64);
+        operands.push(build_call(m, "addaxes", &[indices, leading, trailing]));
+        let position = callbacks::callback_input(m, &format!("position_{axis}"), &mut boundary);
+        let index = if matches!(m.node(selector), Node::Const(_)) {
+            int(m, base)
+        } else {
+            selector
+        };
+        operands.push(index);
+        let index = callbacks::callback_input(m, &format!("index_{axis}"), &mut boundary);
+        let same = build_call(m, "equal", &[position, index]);
+        selected = Some(selected.map_or(same, |previous| build_call(m, "land", &[previous, same])));
+    }
+    let adjoint = callbacks::callback_input(m, "adjoint", &mut boundary);
+    let empty = callbacks::callback_input(m, "empty", &mut boundary);
+    let one = int(m, 1);
+    let size = build_call(m, "vector", &vec![one; shape.len()]);
+    operands.push(build_call(m, "fill", &[bar, size]));
+    operands.push(build_call(m, "fill", &[zero, size]));
+    let value = build_call(m, "ifelse", &[selected?, adjoint, empty]);
+    let callback = callbacks::reify(m, value, boundary);
+    operands.insert(0, callback);
+    Some(build_call(m, "broadcast", &operands))
 }
 
 fn scatter_array_cells(

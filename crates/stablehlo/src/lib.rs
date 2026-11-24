@@ -452,6 +452,8 @@ pub fn emit_with_rules(
     } else {
         m
     };
+    let specialized = flatppl_infer::specialize_empty_axes(m);
+    let m = specialized.as_ref().unwrap_or(m);
     match modes::read_abi(m)? {
         Some(abi) => match mode {
             Mode::LogDensity => modes::emit_logdensity_abi(m, &abi, opts, rules),

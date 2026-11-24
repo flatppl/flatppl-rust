@@ -17,11 +17,13 @@ pub mod calling;
 pub mod depth;
 pub mod graph;
 pub mod id;
+pub mod landau;
 mod module;
 pub mod node;
 pub mod query;
 pub mod text;
 pub mod ty;
+pub mod voigt;
 pub mod width_classes;
 
 pub use depth::{DEFAULT_MAX_DEPTH, Depth, TooDeep};

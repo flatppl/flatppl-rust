@@ -272,3 +272,69 @@ outputs = (q, p.tag, z)
         lower(&flatppl_syntax::print(&derivative));
     }
 }
+
+#[test]
+fn inner_products_and_distance_callbacks_emit_reparsable_derivatives() {
+    let vectors = r#"
+d = standard_module("distances", "0.1")
+x = elementof(cartpow(reals, 3))
+y = elementof(cartpow(reals, 3))
+row = transpose(x)
+inputs = (x, y)
+"#;
+    for expression in ["row * y", "d.squared_euclidean(x, y)", "d.cosine(x, y)"] {
+        let module = lower(&format!("{vectors}\noutputs = {expression}\n"));
+        for transform in [gradient, jvp, vjp] {
+            let ad = transform(&module, &["x", "y"]).unwrap();
+            lower(&flatppl_syntax::print(&ad));
+        }
+    }
+
+    let columns = r#"
+d = standard_module("distances", "0.1")
+x = elementof(cartpow(cartpow(reals, 3), 2))
+y = elementof(cartpow(cartpow(reals, 3), 4))
+scale = external(reals)
+metric(a,b) = scale * sum((a .- b) .^ 2)
+inputs = (x, y, scale)
+"#;
+    for expression in [
+        "d.pairwise_distance(d.euclidean, x)",
+        "d.cross_distance(d.squared_euclidean, x, y)",
+        "d.cross_distance(metric, x, y)",
+    ] {
+        for (transform, expression) in [
+            (
+                gradient as fn(&Module, &[&str]) -> _,
+                format!("sum({expression})"),
+            ),
+            (jvp, expression.into()),
+            (vjp, expression.into()),
+        ] {
+            let module = lower(&format!("{columns}\noutputs = {expression}\n"));
+            let ad = transform(&module, &["x", "y", "scale"]).unwrap();
+            lower(&flatppl_syntax::print(&ad));
+        }
+    }
+}
+
+#[test]
+fn structural_array_derivatives_reparse_with_literal_sizes_and_bin_selections() {
+    let module = lower(
+        "
+m = elementof(cartpow(reals, [4, 3]))
+v = elementof(cartpow(reals, 4))
+edges = [0.0, 1.0, 2.0, 3.0, 4.0]
+mask = [1, -1, 2, -2] .> 0
+inputs = (m, v)
+outputs = (splitblocks(tile(m, [2, 1]), [2, 1]),
+           selectbins(edges, interval(1.25, 2.5), v),
+           v[filter(fn(mask[_]), indicesof(v))])
+",
+    );
+    for transform in [jvp, vjp] {
+        let derivative = transform(&module, &["m", "v"]).unwrap();
+        let reparsed = lower(&flatppl_syntax::print(&derivative));
+        flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
+    }
+}

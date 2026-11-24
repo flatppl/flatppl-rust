@@ -41,6 +41,10 @@ fn dim_of(e: &DimExpr, ctx: &LowerCtx) -> Dim {
                 _ => Dim::Dynamic,
             }
         }
+        DimExpr::Min(a, b) => match (dim_of(a, ctx), dim_of(b, ctx)) {
+            (Dim::Static(a), Dim::Static(b)) => Dim::Static(a.min(b)),
+            _ => Dim::Dynamic,
+        },
         DimExpr::Add(a, offset) => match dim_of(a, ctx) {
             Dim::Static(n) => n.checked_add(*offset).map_or(Dim::Dynamic, Dim::Static),
             _ => Dim::Dynamic,

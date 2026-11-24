@@ -116,14 +116,22 @@ pub fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId {
 
 /// Reuse or introduce the standard special-functions module for generated expressions.
 pub fn special_functions_alias(m: &mut Module) -> Symbol {
-    const NAME: &str = "special-functions";
-    const VERSION: &str = "0.1";
+    standard_module_alias(m, "special-functions", "0.1", "__special_functions")
+}
+
+/// Reuse or introduce a standard module for generated expressions.
+pub fn standard_module_alias(
+    m: &mut Module,
+    module_name: &str,
+    version: &str,
+    prefix: &str,
+) -> Symbol {
     let is_load = |m: &Module, rhs: NodeId| match m.node(rhs) {
         Node::Call(c) => {
             matches!(c.head, CallHead::Builtin(h) if m.resolve(h) == "standard_module")
                 && matches!(c.args.as_ref(), [n, v]
-                    if matches!(m.node(*n), Node::Lit(crate::Scalar::Str(s)) if s.as_ref() == NAME)
-                        && matches!(m.node(*v), Node::Lit(crate::Scalar::Str(s)) if s.as_ref() == VERSION))
+                    if matches!(m.node(*n), Node::Lit(crate::Scalar::Str(s)) if s.as_ref() == module_name)
+                        && matches!(m.node(*v), Node::Lit(crate::Scalar::Str(s)) if s.as_ref() == version))
         }
         _ => false,
     };
@@ -136,14 +144,14 @@ pub fn special_functions_alias(m: &mut Module) -> Symbol {
     }
     let mut index = 0;
     let name = loop {
-        let name = m.intern(&format!("__special_functions_{index}"));
+        let name = m.intern(&format!("{prefix}_{index}"));
         if m.binding_by_name(name).is_none() {
             break name;
         }
         index += 1;
     };
-    let module = m.alloc(Node::Lit(crate::Scalar::Str(NAME.into())));
-    let version = m.alloc(Node::Lit(crate::Scalar::Str(VERSION.into())));
+    let module = m.alloc(Node::Lit(crate::Scalar::Str(module_name.into())));
+    let version = m.alloc(Node::Lit(crate::Scalar::Str(version.into())));
     let rhs = build_call(m, "standard_module", &[module, version]);
     m.add_binding(crate::Binding {
         name,

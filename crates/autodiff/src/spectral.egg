@@ -1,0 +1,9 @@
+; Matrix and retained-spectrum products are transposes under Frobenius pairing.
+(rewrite (Pushforward "real svd" 1 0) (SpectralProduct 0 1) :ruleset pullbacks)
+(rewrite (Pullback "real svd" 1 0) (SpectralProduct 0 0) :ruleset pullbacks)
+(rewrite (Pushforward "real condition number" 1 0) (SpectralProduct 0 1) :ruleset pullbacks)
+(rewrite (Pullback "real condition number" 1 0) (SpectralProduct 0 0) :ruleset pullbacks)
+(rewrite (Pushforward "real pseudoinverse" arity slot) (SpectralProduct slot 1) :ruleset pullbacks)
+(rewrite (Pullback "real pseudoinverse" arity slot) (SpectralProduct slot 0) :ruleset pullbacks)
+(rewrite (Pushforward "real least squares" arity slot) (SpectralProduct slot 1) :ruleset pullbacks)
+(rewrite (Pullback "real least squares" arity slot) (SpectralProduct slot 0) :ruleset pullbacks)

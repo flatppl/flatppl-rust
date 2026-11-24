@@ -46,6 +46,12 @@
   (Binary "mul" (Binary "mul" (Real 4.0) (TanhRatio))
     (Binary "sub" (Real 1.0) (TanhRatio)))) :ruleset pullbacks)
 
+; Transposition establishes the inner product; the two sources are vectors.
+(rewrite (Pullback "inner product" 2 0) (Binary "mul" (Bar) (Arg 1)) :ruleset pullbacks)
+(rewrite (Pullback "inner product" 2 1) (Binary "mul" (Bar) (Arg 0)) :ruleset pullbacks)
+(rewrite (Pushforward "inner product" 2 0) (MathDot (Bar) (Arg 1)) :ruleset pullbacks)
+(rewrite (Pushforward "inner product" 2 1) (MathDot (Bar) (Arg 0)) :ruleset pullbacks)
+
 ; Euclidean norm. The zero vector has a chosen zero subgradient.
 (constructor L2Direction () Expr :unextractable)
 (rewrite (L2Direction)
@@ -90,6 +96,44 @@
 (rewrite (Pushforward "linsolve" 2 0) (Unary "neg"
   (Binary "linsolve" (Arg 0) (Binary "mul" (Bar) (Out)))) :ruleset pullbacks)
 (rewrite (Pushforward "linsolve" 2 1) (ForwardCall "linsolve" 1) :ruleset pullbacks)
+
+(rewrite (Pullback "kron" 2 slot) (KronPart slot 0) :ruleset pullbacks)
+(rewrite (Pushforward "kron" 2 slot) (KronPart slot 1) :ruleset pullbacks)
+(rewrite (Pullback "solve_triangular" 2 slot) (FactorSolvePart slot 0) :ruleset pullbacks)
+(rewrite (Pushforward "solve_triangular" 2 slot) (FactorSolvePart slot 1) :ruleset pullbacks)
+(rewrite (Pullback "cholesky_solve" 2 slot) (FactorSolvePart slot 0) :ruleset pullbacks)
+(rewrite (Pushforward "cholesky_solve" 2 slot) (FactorSolvePart slot 1) :ruleset pullbacks)
+(rewrite (Pullback "lu_solve" 2 slot) (FactorSolvePart slot 0) :ruleset pullbacks)
+(rewrite (Pushforward "lu_solve" 2 slot) (FactorSolvePart slot 1) :ruleset pullbacks)
+
+(rewrite (Pullback "lu" 1 0) (FactorizationPart 0) :ruleset pullbacks)
+(rewrite (Pushforward "lu" 1 0) (FactorizationPart 1) :ruleset pullbacks)
+(rewrite (Pullback "qr" 1 0) (FactorizationPart 0) :ruleset pullbacks)
+(rewrite (Pushforward "qr" 1 0) (FactorizationPart 1) :ruleset pullbacks)
+
+(rewrite (Pullback "eigh" 1 0) (SpectrumPart 0) :ruleset pullbacks)
+(rewrite (Pushforward "eigh" 1 0) (SpectrumPart 1) :ruleset pullbacks)
+(rewrite (Pullback "eigvalsh" 1 0) (SpectrumPart 0) :ruleset pullbacks)
+(rewrite (Pushforward "eigvalsh" 1 0) (SpectrumPart 1) :ruleset pullbacks)
+(rewrite (Pullback "eigmax" 1 0) (SpectrumPart 0) :ruleset pullbacks)
+(rewrite (Pushforward "eigmax" 1 0) (SpectrumPart 1) :ruleset pullbacks)
+(rewrite (Pullback "eigmin" 1 0) (SpectrumPart 0) :ruleset pullbacks)
+(rewrite (Pushforward "eigmin" 1 0) (SpectrumPart 1) :ruleset pullbacks)
+
+(rewrite (Pullback "eigen real values" 2 0) (EigenProjectionPart 0) :ruleset pullbacks)
+(rewrite (Pushforward "eigen real values" 2 0) (EigenProjectionPart 1) :ruleset pullbacks)
+(rewrite (Pullback "eigen imag values" 2 0) (EigenProjectionPart 0) :ruleset pullbacks)
+(rewrite (Pushforward "eigen imag values" 2 0) (EigenProjectionPart 1) :ruleset pullbacks)
+
+(rewrite (Pullback "eigen real vectors" 2 0) (EigenProjectionPart 0) :ruleset pullbacks)
+(rewrite (Pushforward "eigen real vectors" 2 0) (EigenProjectionPart 1) :ruleset pullbacks)
+(rewrite (Pullback "eigen imag vectors" 2 0) (EigenProjectionPart 0) :ruleset pullbacks)
+(rewrite (Pushforward "eigen imag vectors" 2 0) (EigenProjectionPart 1) :ruleset pullbacks)
+
+(rewrite (Pullback "matexp real projection" 3 slot) (ComplexExponentialPart slot 0) :ruleset pullbacks)
+(rewrite (Pushforward "matexp real projection" 3 slot) (ComplexExponentialPart slot 1) :ruleset pullbacks)
+(rewrite (Pullback "matexp imag projection" 3 slot) (ComplexExponentialPart slot 0) :ruleset pullbacks)
+(rewrite (Pushforward "matexp imag projection" 3 slot) (ComplexExponentialPart slot 1) :ruleset pullbacks)
 
 ; Cholesky is defined on symmetric inputs. Use the symmetric projection in
 ; both modes to extend its tangent and cotangent to full real matrices.
@@ -137,8 +181,10 @@
 (rewrite (Pullback "indexed sum product" 2 slot) (IndexedProduct slot 0) :ruleset pullbacks)
 (rewrite (Pushforward "indexed sum product" 2 slot) (IndexedProduct slot 1) :ruleset pullbacks)
 
-(rewrite (Pullback "diag" 1 0) (Unary "diagmat" (Bar)) :ruleset pullbacks)
+(constructor DiagonalScatter () Expr)
+(rewrite (Pullback "diag" arity 0) (DiagonalScatter) :ruleset pullbacks)
 (rewrite (Pushforward "diag" 1 0) (ForwardCall "diag" 0) :ruleset pullbacks)
+(rewrite (Pushforward "diag" 2 0) (ForwardCall "diag" 0) :ruleset pullbacks)
 
 ; For q[t] = a * q[t-1] + b[t], solve the transposed scalar recurrence
 ; in reverse time. A zero reverse carry must not multiply an inactive NaN.

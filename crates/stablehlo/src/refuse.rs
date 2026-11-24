@@ -244,12 +244,7 @@
 //! - `land`/`lor`/`lxor` whose operands have different shapes — "<head>:
 //!   operands must have the same shape, got ... and ...". `Emitter::and`/`or`/
 //!   `xor` render ONE type for both operands and the result.
-//! - `diag` with a non-zero offset `k` — "`diag`: only the MAIN diagonal (`k =
-//!   0`, §07's default) lowers, got k = N — a §07 super- or sub-diagonal needs a
-//!   shifted mask and a shorter result than this lowering produces". PARTIAL
-//!   against §07's entry, which defines every `k`; `Emitter::diag` masks on
-//!   `row == col`. A non-literal `k` gets its own wording ("the diagonal offset
-//!   `k` must be an integer literal").
+//! - A runtime `diag` offset cannot determine a static result length.
 //! - `diag`/`trace`/`lower_cholesky`/`row_gram`/`col_gram`/`quadform` on a
 //!   non-rank-2 operand — "`<head>`: §07 \"Linear algebra\" gives this a matrix
 //!   domain, so a rank-2 operand is required, got ..."; and `self_outer` on a

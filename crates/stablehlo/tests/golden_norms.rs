@@ -966,3 +966,16 @@ fn median_over_a_table_reduces_each_column() {
     );
     assert!(out.contains("stablehlo.sort"), "got: {out}");
 }
+
+#[test]
+fn enzyme_restricted_real_cumprod_uses_static_multiplication() {
+    let module = determinize_abi(&vec_src("cumprod", "reals", 5));
+    let hlo = flatppl_stablehlo::emit(
+        &module,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap();
+    assert!(!hlo.contains("stablehlo.while"), "{hlo}");
+    assert_eq!(hlo.matches("stablehlo.multiply").count(), 3, "{hlo}");
+}

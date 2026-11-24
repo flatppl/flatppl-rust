@@ -145,12 +145,14 @@ pub(crate) fn lower_reverse(
 ) -> Result<Value, EmitError> {
     let [xs] = args_exact(id, args)?;
     let v = e.lower_node(xs)?;
-    dims(e, id, &v, "reverse")?;
+    static_dims(id, e.cell_ty(&v), "reverse")?;
     // A vector of vectors is a vector too: its outer order reverses.
     if !matches!(nest_ranks(e, xs), Some((1, _))) {
         return Err(EmitError::at(id, "`reverse` lowers a vector here"));
     }
-    Ok(e.reverse(&v, &[0]))
+    let axes = e.axes_of(&v);
+    let value = e.reverse(&v, &[axes.batch as u64]);
+    Ok(e.axes_view(&value, axes))
 }
 
 /// `tile(A, size)`: broadcast `A` to `[n₀, d₀, n₁, d₁, …]`, then merge each pair.
@@ -331,9 +333,19 @@ pub(crate) fn lower_blockdiagmat(
                     "`blockdiagmat` takes a vector of matrices (spec §07)",
                 ));
             }
-            (0..d[0])
-                .map(|i| get_literal_value(e, id, v.clone(), i))
-                .collect::<Result<Vec<_>, _>>()?
+            let [count, rows, cols] = d[..] else {
+                return Err(EmitError::at(
+                    id,
+                    "blockdiagmat expects one outer axis and two matrix axes",
+                ));
+            };
+            (0..count)
+                .map(|i| {
+                    let tile = e.slice(&v, &[i, 0, 0], &[i + 1, rows, cols], &[1, 1, 1]);
+                    let block = e.reshape(&tile, tensor(&[rows, cols]));
+                    layered(e, &block, vec![2])
+                })
+                .collect()
         }
     };
     let shapes = blocks
@@ -646,14 +658,7 @@ pub(crate) fn lower_selectbins(
     if n == 0 {
         return Ok(cv);
     }
-    let last = edges.len() - 2;
-    let picked = (0..=last)
-        .filter(|&i| {
-            let (a, b) = (edges[i], edges[i + 1]);
-            let starts = a <= hi;
-            let ends = if i == last { b >= lo } else { b > lo };
-            lo <= hi && starts && ends && !(lo_open && b <= lo)
-        })
+    let picked = flatppl_infer::selected_bins(&edges, lo, lo_open, hi)
         .map(|i| get_literal_value(e, id, cv.clone(), i as u64))
         .collect::<Result<Vec<_>, _>>()?;
     if picked.is_empty() {

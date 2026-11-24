@@ -5,18 +5,27 @@
 
 mod affine_scan;
 mod aggregate;
+mod array_math;
+mod array_transforms;
+mod batched_regression;
+mod beta_shape;
 mod callbacks;
 mod contract;
+mod cumulative;
 mod fixed_scan;
 mod gamma_shape;
 mod integral;
+mod linalg;
 mod math;
 mod metric;
+mod particle;
 mod probability_scan;
 mod record;
 mod recurrence;
 mod rules;
 mod source;
+mod special;
+mod spectral;
 mod table;
 mod tensor;
 mod transforms;
@@ -29,8 +38,8 @@ use std::fmt;
 
 use flatppl_core::graph::{build_call, expect_builtin_call};
 use flatppl_core::{
-    Binding, BindingId, Call, CallHead, DEFAULT_MAX_DEPTH, Dim, Module, Node, NodeId, Phase, Ref,
-    RefNs, Scalar, ScalarType, Symbol, Type,
+    Binding, BindingId, CallHead, DEFAULT_MAX_DEPTH, Dim, Module, Node, NodeId, Phase, Ref, RefNs,
+    Scalar, ScalarType, Symbol, Type,
 };
 
 use flatppl_determinizer::LoweringOptions;
@@ -231,14 +240,18 @@ fn transform(
     options: &LoweringOptions<'_>,
 ) -> Result<Module, Error> {
     check_flatpdl(module, options)?;
-    let mut module = Cow::Borrowed(module);
+    let specialized = flatppl_infer::specialize_empty_axes(module);
+    let concrete_empty_axes = specialized.is_some();
+    let mut module = specialized.map_or(Cow::Borrowed(module), Cow::Owned);
     let mut query = Query::read(&mut module, wrt, mode)?;
     let legalized = if wrt.is_empty() {
         None
     } else {
         callbacks::legalize(&module, &query)
     };
-    if let Some(legalized) = legalized {
+    let mut splines = HashMap::new();
+    if let Some((legalized, expansions)) = legalized {
+        splines = expansions;
         module = Cow::Owned(legalized);
         query = Query::read(&mut module, wrt, mode)?;
     }
@@ -254,7 +267,7 @@ fn transform(
             }
         })
         .collect::<Result<_, _>>()?;
-    let mut plan = Plan::new(module, &query);
+    let mut plan = Plan::new(module, &query, Some(&splines));
     if !wrt.is_empty() {
         for &root in &roots {
             plan.visit(root, 0)?;
@@ -349,8 +362,14 @@ fn transform(
     } else {
         Type::Tuple(expected.into())
     };
-    if emitter.module.type_of(result) != Some(&expected) {
-        let actual = emitter.module.type_of(result);
+    let specialized_types = concrete_empty_axes
+        .then(|| flatppl_infer::specialize_empty_axes(&emitter.module))
+        .flatten();
+    let actual = specialized_types
+        .as_ref()
+        .unwrap_or(&emitter.module)
+        .type_of(result);
+    if actual != Some(&expected) {
         return Err(Error::new(
             None,
             format!("expected derivative result type {expected:?}, got {actual:?}"),
@@ -456,10 +475,11 @@ fn reverse_values_with_mask(
         }
         let scope = plan.integrals.get(&step.node);
         let aggregate = plan.aggregates.get(&step.node);
-        if scope.is_none() && aggregate.is_none() {
+        let batched_regression = plan.batched_regressions.contains(&step.node);
+        if scope.is_none() && aggregate.is_none() && !batched_regression {
             step.check_types(plan.module)?;
         }
-        if masked && math::requires_unmasked(step.op) {
+        if masked && (math::requires_unmasked(step.op) || linalg::structural(step.op)) {
             return Err(Error::new(
                 Some(step.node),
                 format!("`{}` needs a mask-aware pullback", step.op),
@@ -476,6 +496,8 @@ fn reverse_values_with_mask(
                 scope.pullback(emitter, step, slot, (bar, masked), adjoints)?
             } else if let Some(scope) = aggregate {
                 scope.pullback(emitter, rules, slot, bar, masked)?
+            } else if batched_regression {
+                batched_regression::pullback(emitter, rules, step, slot, bar, masked)?
             } else {
                 let template = step.rule(rules, mode, slot)?;
                 template.instantiate(emitter, step, bar, masked)?
@@ -498,6 +520,7 @@ fn reverse_values_with_mask(
                     tensor::zero_when_masked(&mut emitter.module, bar, contribution, true);
             } else if masked
                 && scope.is_none()
+                && !batched_regression
                 && (!structural(step.op) || multivariate_density(step.op))
             {
                 let pointwise = step.pointwise(plan.module) || multivariate_density(step.op);
@@ -589,7 +612,22 @@ fn forward_values(
             tangents.insert(Key::Node(step.node), tangent);
             continue;
         }
+        if plan.batched_regressions.contains(&step.node) {
+            let tangent = batched_regression::pushforward(emitter, rules, step, &tangents)?;
+            tangents.insert(Key::Node(step.node), tangent);
+            continue;
+        }
         step.check_types(plan.module)?;
+        if step.op == "blockdiag literal" {
+            let fields = step
+                .targets
+                .iter()
+                .map(|target| target.and_then(|key| tangents.get(&key)).copied());
+            let tangent = array_transforms::blockdiag_pushforward(emitter, step, fields)?;
+            let tangent = emitter.name_adjoint("_ad_tangent", tangent);
+            tangents.insert(Key::Node(step.node), tangent);
+            continue;
+        }
         if matches!(step.op, "record" | "table") {
             let fields = step
                 .targets
@@ -951,21 +989,29 @@ fn binding_target(module: &Module, id: NodeId, name: Symbol) -> Result<BindingId
 struct Plan<'a> {
     module: &'a Module,
     query: &'a Query<'a>,
+    splines: Option<&'a HashMap<NodeId, NodeId>>,
     activity: HashMap<Key, bool>,
     steps: Vec<Step<'a>>,
     integrals: HashMap<NodeId, integral::Scope<'a>>,
     aggregates: HashMap<NodeId, aggregate::Scope<'a>>,
+    batched_regressions: HashSet<NodeId>,
 }
 
 impl<'a> Plan<'a> {
-    fn new(module: &'a Module, query: &'a Query<'a>) -> Self {
+    fn new(
+        module: &'a Module,
+        query: &'a Query<'a>,
+        splines: Option<&'a HashMap<NodeId, NodeId>>,
+    ) -> Self {
         Self {
             module,
             query,
+            splines,
             activity: HashMap::new(),
             steps: Vec::new(),
             integrals: HashMap::new(),
             aggregates: HashMap::new(),
+            batched_regressions: HashSet::new(),
         }
     }
 
@@ -982,7 +1028,7 @@ impl<'a> Plan<'a> {
                 scope.plan.collect_rules(Mode::Jvp, requests);
                 continue;
             }
-            if (mode == Mode::Jvp && matches!(step.op, "record" | "table"))
+            if (mode == Mode::Jvp && matches!(step.op, "record" | "table" | "blockdiag literal"))
                 || (mode != Mode::Jvp && step.record_access(self.module).is_some())
             {
                 continue;
@@ -1070,7 +1116,42 @@ impl<'a> Plan<'a> {
         Ok(self.activity[&root])
     }
 
+    fn vector_inner_product(&self, args: &[NodeId]) -> Result<Option<[NodeId; 2]>, Error> {
+        let [left, right] = *args else {
+            return Ok(None);
+        };
+        let Some(Type::TVector { len, elem }) = self.module.type_of(left) else {
+            return Ok(None);
+        };
+        if **elem != REAL || tensor::real_shape(self.module, right) != Some(&[*len]) {
+            return Ok(None);
+        }
+        let Key::Node(row) = self.query.key(self.module, left)? else {
+            return Ok(None);
+        };
+        let Some(transpose) = expect_builtin_call(self.module, row, "transpose") else {
+            return Ok(None);
+        };
+        let [vector] = *transpose.args else {
+            return Ok(None);
+        };
+        Ok((tensor::real_shape(self.module, vector) == Some(&[*len])).then_some([vector, right]))
+    }
+
     fn prepare_node(&mut self, node: NodeId, depth: usize) -> Result<Prepared<'a>, Error> {
+        // The primal retains the original call and its runtime domain checks.
+        // Differentiate the equivalent tensor expression only on this edge.
+        if let Some(&expanded) = self.splines.and_then(|splines| splines.get(&node)) {
+            let target = self.query.key(self.module, expanded)?;
+            return Ok(Prepared::Step(Step {
+                node,
+                op: "identity",
+                args: vec![expanded],
+                targets: vec![Some(target)],
+                broadcast: false,
+            }));
+        }
+
         let Node::Call(call) = self.module.node(node) else {
             return Ok(Prepared::Known(false));
         };
@@ -1105,7 +1186,18 @@ impl<'a> Plan<'a> {
                 "a runtime value must be declared in `inputs`",
             ));
         }
+        // An empty real tensor has no differentiable cells. Keep its primal
+        // computation for the normal evaluation and domain semantics.
+        if tensor::real_shape(self.module, node)
+            .is_some_and(|shape| shape.contains(&Dim::Static(0)))
+        {
+            return Ok(Prepared::Known(false));
+        }
         // The content of a fixed-shape input has no influence on its shape.
+        if op == "bincounts" {
+            // Counts are locally constant while each observation stays in its bin.
+            return Ok(Prepared::Known(false));
+        }
         if matches!(op, "lengthof" | "sizeof" | "indicesof" | "indicesof0")
             && let [input] = call.args.as_ref()
             && (tensor::numeric_shape(self.module, *input).is_some()
@@ -1131,12 +1223,33 @@ impl<'a> Plan<'a> {
         } else {
             None
         };
-        let (op, args, broadcast) = if let Some((rule, args)) =
-            density_args(self.module, self.query, node)
-                .or_else(|| transforms::args(self.module, self.query, call, op))
-                .or_else(|| real_bessel_j_args(self.module, self.query, call, op))
+        let (op, args, broadcast) = if op == "checked"
+            && let [value, _] = call.args.as_ref()
+        {
+            ("identity", vec![*value], false)
+        } else if op == "fixed"
+            && let [value] = call.args.as_ref()
+        {
+            ("identity", vec![*value], false)
+        } else if let Some((rule, args)) =
+            batched_regression::operands(self.module, self.query, node)
+        {
+            self.batched_regressions.insert(node);
+            (rule, args, false)
+        } else if let Some((rule, args)) =
+            linalg::eigen_projection(self.module, self.query, positional_broadcast).or_else(|| {
+                linalg::matexp_projection(self.module, self.query, positional_broadcast)
+            })
+        {
+            (rule, args, false)
+        } else if let Some((rule, args)) = density_args(self.module, self.query, node)
+            .or_else(|| transforms::args(self.module, self.query, call, op))
         {
             (rule, args, op == "broadcast")
+        } else if let Some((rule, args)) =
+            array_transforms::operands(self.module, self.query, op, &call.args, node)
+        {
+            (rule, args, false)
         } else if let Some((rule, arg)) =
             self.real_rounding(node, op, call, positional_broadcast)?
         {
@@ -1176,6 +1289,12 @@ impl<'a> Plan<'a> {
             positional_broadcast.filter(|(head, _)| !structural(head))
         {
             (head, args.to_vec(), true)
+        } else if let Some((head, args)) =
+            positional_broadcast.filter(|(head, _)| linalg::structural(head))
+        {
+            (head, args.to_vec(), true)
+        } else if op == "solve_triangular" && call.args.len() >= 2 {
+            (op, call.args[..2].to_vec(), false)
         } else if matches!(call.head, CallHead::User(_)) && op != "user call" {
             (op, call.args.to_vec(), false)
         } else if matches!(op, "rowstack" | "colstack")
@@ -1194,15 +1313,57 @@ impl<'a> Plan<'a> {
             ("record from table", call.args.to_vec(), false)
         } else if op == "table" && !call.args.is_empty() && call.named.is_empty() {
             ("table from record", call.args.to_vec(), false)
+        } else if op == "mul"
+            && let Some(args) = self.vector_inner_product(&call.args)?
+        {
+            ("inner product", args.to_vec(), false)
         } else if op == "mul" && tensor::matmul(self.module, &call.args) {
             ("matrix product", call.args.to_vec(), false)
         } else {
             (op, self.module.node(node).children(), false)
         };
+        let op = match (op, args.as_slice()) {
+            ("complex Bessel J" | "complex Bessel I" | "complex scaled Bessel I", [v, z])
+                if bessel_range(self.module, *v, 0.0, 16.0)
+                    && (bessel_range(self.module, *z, 0.125, 4.0)
+                        || bessel_range(self.module, *z, -4.0, -0.125)) =>
+            {
+                match op {
+                    "complex Bessel J" => "complex bounded Bessel J",
+                    "complex Bessel I" => "complex bounded Bessel I",
+                    _ => "complex bounded scaled Bessel I",
+                }
+            }
+            ("bessel_y", [v, z])
+                if bessel_range(self.module, *v, -16.0, 16.0)
+                    && bessel_range(self.module, *z, 0.125, 64.0) =>
+            {
+                "bounded Bessel Y"
+            }
+            ("log_bessel_i", [v, z])
+                if bessel_range(self.module, *v, 0.0, 16.0)
+                    && bessel_range(self.module, *z, 0.125, 4.0) =>
+            {
+                "bounded log Bessel I"
+            }
+            ("bessel_k" | "bessel_k_scaled" | "log_bessel_k", [v, z])
+                if bessel_range(self.module, *v, -16.0, 16.0)
+                    && bessel_range(self.module, *z, 0.125, 64.0) =>
+            {
+                match op {
+                    "bessel_k" => "bounded Bessel K",
+                    "bessel_k_scaled" => "bounded scaled Bessel K",
+                    _ => "bounded log Bessel K",
+                }
+            }
+            _ => op,
+        };
         let op = math::complex_rule(self.module, node, &args, op).unwrap_or(op);
         let mut targets = Vec::with_capacity(args.len());
         for (slot, &arg) in args.iter().enumerate() {
             if (op == "ifelse" && slot == 0)
+                || (linalg::is_eigen_projection(op) && slot == 1)
+                || (linalg::is_matexp_projection(op) && slot == 2)
                 || (matches!(op, "record" | "table")
                     && self.module.type_of(arg).is_some_and(record::is_passive))
             {
@@ -1277,8 +1438,20 @@ enum Prepared<'a> {
 
 fn special_op(module: &Module, callee: NodeId) -> Option<&'static str> {
     let (module, member) = flatppl_determinizer::standard_function(module, callee)?;
-    if module == "ext-linear-algebra" && member == "matexp" {
-        return Some("matrix exponential");
+    if module == "ext-linear-algebra" {
+        return match member.as_str() {
+            "matexp" => Some("matrix exponential"),
+            "kron" => Some("kron"),
+            "solve_triangular" => Some("solve_triangular"),
+            "cholesky_solve" => Some("cholesky_solve"),
+            "lu_solve" => Some("lu_solve"),
+            "lu" => Some("lu"),
+            "eigh" => Some("eigh"),
+            "eigvalsh" => Some("eigvalsh"),
+            "eigmax" => Some("eigmax"),
+            "eigmin" => Some("eigmin"),
+            _ => spectral::operation(&member),
+        };
     }
     if module != "special-functions" {
         return None;
@@ -1300,57 +1473,26 @@ fn special_op(module: &Module, callee: NodeId) -> Option<&'static str> {
         "logbeta" => Some("logbeta"),
         "digamma" => Some("digamma"),
         "polygamma" => Some("polygamma"),
+        "airy" => Some("airy"),
+        "bessel_j" => Some("complex Bessel J"),
+        "bessel_i" => Some("complex Bessel I"),
+        "bessel_i_scaled" => Some("complex scaled Bessel I"),
+        "bessel_y" => Some("bessel_y"),
+        "bessel_k" => Some("bessel_k"),
+        "bessel_k_scaled" => Some("bessel_k_scaled"),
+        "log_bessel_i" => Some("log_bessel_i"),
+        "log_bessel_k" => Some("log_bessel_k"),
         _ => None,
     }
 }
 
-// Keep the principal-branch projection in the derivative. The StableHLO
-// backend consumes Bessel J through its supported complex projections.
-fn real_bessel_j_args(
-    module: &Module,
-    query: &Query<'_>,
-    call: &Call,
-    op: &str,
-) -> Option<(&'static str, Vec<NodeId>)> {
-    let [argument] = call.args.as_ref() else {
-        return None;
-    };
-    if op != "real" {
-        return None;
+fn bessel_range(module: &Module, node: NodeId, lower: f64, upper: f64) -> bool {
+    use flatppl_core::ValueSet;
+    match module.valueset_of(node) {
+        Some(ValueSet::Interval(lo, hi)) => lower <= *lo && *lo <= *hi && *hi <= upper,
+        Some(ValueSet::UnitInterval) => lower <= 0.0 && 1.0 <= upper,
+        _ => false,
     }
-    let Key::Node(value) = query.key(module, *argument).ok()? else {
-        return None;
-    };
-    let Node::Call(Call {
-        head: CallHead::User(callee),
-        args,
-        ..
-    }) = module.node(value)
-    else {
-        return None;
-    };
-    let (namespace, member) = flatppl_determinizer::standard_function(module, *callee)?;
-    if namespace != "special-functions" || member != "bessel_j" {
-        return None;
-    }
-    let &[order, argument] = args.as_ref() else {
-        return None;
-    };
-    let in_range = |node, lower, upper| {
-        use flatppl_core::ValueSet;
-        match module.valueset_of(node) {
-            Some(ValueSet::Interval(lo, hi)) => lower <= *lo && *lo <= *hi && *hi <= upper,
-            Some(ValueSet::UnitInterval) => lower <= 0.0 && 1.0 <= upper,
-            _ => false,
-        }
-    };
-    let bounded = in_range(order, 0.0, 16.0) && in_range(argument, 0.125, 4.0);
-    let op = if bounded {
-        "bounded real Bessel J"
-    } else {
-        "real Bessel J"
-    };
-    Some((op, args.to_vec()))
 }
 
 fn density_args(
@@ -1383,28 +1525,6 @@ fn density_args(
     };
     let (rule, fields): (&str, &[&str]) = match module.resolve(*tag) {
         "Normal" => ("Normal log density", &["mu", "sigma"]),
-        "NormalGLM" if !batched => ("Normal GLM log density", &["x", "alpha", "beta", "sigma"]),
-        "CategoricalLogitGLM" if !batched => {
-            ("Categorical GLM log density", &["x", "alpha", "beta"])
-        }
-        "OrderedLogitGLM" if !batched => ("Ordered GLM log density", &["x", "beta", "cutpoints"]),
-        "BernoulliLogitGLM" if !batched => ("Bernoulli GLM log density", &["x", "alpha", "beta"]),
-        "BinomialLogitGLM" if !batched => {
-            ("Binomial GLM log density", &["x", "alpha", "beta", "n"])
-        }
-        "PoissonLogGLM" if !batched => ("Poisson GLM log density", &["x", "alpha", "beta"]),
-        "NegativeBinomial2LogGLM" if !batched => (
-            "NegativeBinomial2 GLM log density",
-            &["x", "alpha", "beta", "psi"],
-        ),
-        "StudentTGLM" if !batched => (
-            "StudentT GLM log density",
-            &["x", "alpha", "beta", "sigma", "nu"],
-        ),
-        "GammaLogGLM" if !batched => ("Gamma GLM log density", &["x", "alpha", "beta", "shape"]),
-        "BetaLogitGLM" if !batched => {
-            ("Beta GLM log density", &["x", "alpha", "beta", "precision"])
-        }
         "GeneralizedNormal" => ("GeneralizedNormal log density", &["mean", "alpha", "beta"]),
         "VonMises" => ("VonMises log density", &["mu", "kappa"]),
         "ChiSquared" => ("ChiSquared log density", &["k"]),
@@ -1412,6 +1532,19 @@ fn density_args(
         "Rayleigh" => ("Rayleigh log density", &["scale"]),
         "Weibull" => ("Weibull log density", &["shape", "scale"]),
         "Geometric" => ("Geometric log density", &["p"]),
+        "Voigtian" => ("Voigtian log density", &["mean", "width", "sigma"]),
+        "Landau" => ("Landau log density", &["loc", "scale"]),
+        "Argus" => ("Argus log density", &["resonance", "slope", "power"]),
+        "CrystalBall" => ("CrystalBall log density", &["m0", "sigma", "alpha", "n"]),
+        "DoubleSidedCrystalBall" => (
+            "DoubleSidedCrystalBall log density",
+            &["m0", "sigmaL", "sigmaR", "alphaL", "alphaR", "nL", "nR"],
+        ),
+        "RelativisticBreitWigner" => ("RelativisticBreitWigner log density", &["mean", "width"]),
+        "BifurcatedNormal" => (
+            "BifurcatedNormal log density",
+            &["mean", "sigmaL", "sigmaR"],
+        ),
         "ContinuedPoisson" | "hep-physics::ContinuedPoisson" => {
             ("ContinuedPoisson log density", &["rate"])
         }
@@ -1442,6 +1575,7 @@ fn density_args(
         "InverseWishart" if !batched => ("InverseWishart log density", &["nu", "scale"]),
         "Multinomial" if !batched => ("Multinomial log density", &["n", "p"]),
         "Uniform" => ("Uniform log density", &["support"]),
+        tag if !batched => batched_regression::rule(tag)?,
         _ => return None,
     };
     if let Some(operands) = mapped {
@@ -1650,6 +1784,7 @@ fn structural(op: &str) -> bool {
         op,
         "sum"
             | "cumsum"
+            | "cumprod"
             | "cummax"
             | "cummin"
             | "reverse"
@@ -1664,6 +1799,15 @@ fn structural(op: &str) -> bool {
             | "record from table"
             | "table from record"
             | "addaxes"
+            | "tile"
+            | "splitblocks"
+            | "joinblocks"
+            | "partition"
+            | "bandedmat"
+            | "blockdiagmat"
+            | "blockdiag literal"
+            | "selectbins"
+            | "filter all"
             | "get"
             | "get0"
             | "stack rows"
@@ -1685,6 +1829,8 @@ fn structural(op: &str) -> bool {
             | "rowwise Categorical log density"
             | "rowwise Categorical0 log density"
     ) || math::structural(op)
+        || linalg::structural(op)
+        || spectral::structural(op)
         || multivariate_density(op)
 }
 
@@ -1706,11 +1852,21 @@ impl<'a> Step<'a> {
         slot: usize,
     ) -> Result<&'r rules::Template, Error> {
         rules.get(self.rule_key(mode, slot)).ok_or_else(|| {
-            if self.op == "real Bessel J" && slot == 0 {
+            if matches!(self.op, "complex Bessel J" | "complex Bessel I" | "complex scaled Bessel I")
+                && slot == 0 {
                 return Error::new(
                     Some(self.node),
-                    "source AD differentiates bessel_j with respect to its order only when the order is proven in [0, 16] and the argument in [0.125, 4]",
+                    "source AD differentiates Bessel J and I projections with respect to order only with inferred order in [0, 16] and argument in [0.125, 4] or [-4, -0.125]",
                 );
+            }
+            if slot == 0 && matches!(self.op, "bessel_k" | "bessel_k_scaled" | "log_bessel_k") {
+                return Error::new(Some(self.node), "Bessel K order differentiation requires numerical integration and inferred order in [-16, 16] and argument in [0.125, 64]");
+            }
+            if slot == 0 && self.op == "bessel_y" {
+                return Error::new(Some(self.node), "Bessel Y order differentiation requires numerical integration and inferred order in [-16, 16] and argument in [0.125, 64]");
+            }
+            if slot == 0 && self.op == "log_bessel_i" {
+                return Error::new(Some(self.node), "log Bessel I order differentiation requires inferred order in [0, 16] and argument in [0.125, 4]");
             }
             if self.op == "Poisson log density" && slot == 1 {
                 return Error::new(
@@ -1744,6 +1900,36 @@ impl<'a> Step<'a> {
     }
 
     fn check_types(&self, module: &Module) -> Result<(), Error> {
+        if array_transforms::valid(module, self) {
+            return Ok(());
+        }
+
+        if self.op == "vector"
+            && module
+                .type_of(self.node)
+                .is_some_and(|ty| tensor::vector_of_arrays(ty).is_some())
+            && self
+                .args
+                .iter()
+                .all(|&arg| tensor::real_shape(module, arg).is_some())
+        {
+            return Ok(());
+        }
+
+        if linalg::structural(self.op) {
+            return linalg::check_types(module, self);
+        }
+        if spectral::structural(self.op) {
+            return if spectral::valid_types(module, self) {
+                Ok(())
+            } else {
+                Err(Error::new(
+                    Some(self.node),
+                    "spectral products require a nonempty fixed-shape real matrix",
+                ))
+            };
+        }
+
         if matches!(
             self.op,
             "record" | "table" | "record from table" | "table from record"
@@ -1758,6 +1944,9 @@ impl<'a> Step<'a> {
                 })
             })
         {
+            return Ok(());
+        }
+        if matches!(self.op, "get" | "get0") && tensor::full_array_cell_access(module, &self.args) {
             return Ok(());
         }
         let nested_vector = |node| tensor::nested_vector(module, node).is_some();
@@ -1881,10 +2070,10 @@ impl<'a> Step<'a> {
                 "matrix exponential differentiation requires a fixed real square matrix with supported block dimensions",
             ));
         }
-        if self.op == "diag" && math::square_size(module, self.args[0]).is_none() {
+        if self.op == "diag" && !matches!(tensor::real_shape(module, self.args[0]), Some([_, _])) {
             return Err(Error::new(
                 Some(self.node),
-                "diagonal pullback requires a nonempty real square matrix",
+                "diagonal pullback requires a real matrix",
             ));
         }
         if self.op == "det" && !math::cofactor_shape(module, self.args[0]) {

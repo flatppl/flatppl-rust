@@ -700,38 +700,16 @@ fn diag_lowers_both_spellings_of_the_main_diagonal() {
     );
 }
 
-/// A non-zero `k` refuses. §07 defines super- and sub-diagonals, but
-/// `Emitter::diag` masks on `row == col`; a shifted diagonal needs a shifted
-/// mask AND a shorter result, which is a different lowering rather than a
-/// parameter of this one. PARTIAL, stated, not approximated.
 #[test]
-fn diag_refuses_a_non_zero_offset() {
-    let msg = emit_err(&format!(
-        "{MAT_VEC_ABI}d = diag(A, 2)\ninputs = (A, v)\noutputs = (d)\n"
-    ));
-    assert!(
-        msg.contains("only the MAIN diagonal") && msg.contains("k = 2"),
-        "unexpected message: {msg}"
-    );
-}
-
-/// `diag` and `trace` refuse a NON-SQUARE matrix even though §07's `diag` domain
-/// is "matrices" (only `trace` says "square matrices"). `Emitter::diag` row-sums
-/// an `n`-column mask, so on an `m`x`n` operand with `m > n` it would return `m`
-/// entries — zeros for the rows the diagonal never reaches — instead of the
-/// `min(m, n)` §07 defines. Refusing keeps that from being silently answered.
-#[test]
-fn diag_and_trace_refuse_a_non_square_matrix() {
-    let abi = "M = elementof(cartpow(reals, [3, 2]))\n";
-    for head in ["diag", "trace"] {
-        let msg = emit_err(&format!(
-            "{abi}y = {head}(M)\ninputs = (M)\noutputs = (y)\n"
-        ));
-        assert!(
-            msg.contains("square matrices") && msg.contains("3x2"),
-            "`{head}` on a 3x2: unexpected message: {msg}"
-        );
+fn diagonal_offsets_select_the_available_rows_and_columns() {
+    let abi = "M = elementof(cartpow(reals, [3, 2]))";
+    for (k, n) in [(-3, 0), (-2, 1), (-1, 2), (0, 2), (1, 1), (2, 0)] {
+        let ir = emit(&format!("{abi}\ninputs = M\noutputs = diag(M, {k})"));
+        assert!(ir.contains(&format!("-> tensor<{n}xf32>")), "{ir}");
     }
+    assert!(
+        emit_err(&format!("{abi}\ninputs = M\noutputs = trace(M)")).contains("square matrices")
+    );
 }
 
 /// Diagonal extraction and Cholesky require real or complex matrices.
