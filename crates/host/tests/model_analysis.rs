@@ -325,6 +325,219 @@ fn fixed_record_regression_requires_finite_design_columns() -> Result<(), Box<dy
     Ok(())
 }
 
+/// A design column or observation derived from loaded data (a logarithm, a
+/// product, a centred or z-scored column) is proven finite from its prepared
+/// values. A value the proof cannot show finite keeps the full factor, with a
+/// reason of the regression path: a logarithm of zero or of a negative value, a
+/// division by zero or by a value below twice the smallest normal `f32`, a
+/// power outside the evaluator, a z-score over a constant column, an infinite
+/// loaded value, and a product above the single-precision headroom (the proof
+/// holds both precisions to it). A matrix product is outside the evaluator, so
+/// its cellwise values never prove it, and the type check refuses a matrix
+/// power. An input, or no preparation, also keeps the full factor.
+#[test]
+fn fixed_record_regression_proves_derived_columns_from_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    use flatppl_host::ReductionOutcome;
+    const MEAN: &str =
+        "the mean is not a sum of fixed, proven-finite design columns times coefficients";
+    const OBSERVATION: &str = "regression observations are not proven finite";
+    const POWER: &str = "`pow` operands are outside its domain";
+    let square = "rowstack([data.x, data.w, data.x, data.w])";
+    let product = format!("{square} * {square}");
+    let power = format!("{square} ^ 2");
+    let derived = "colstack([ones(4), log.(data.x), data.x .* data.w, \
+                   (data.w .- mean(data.w)) ./ std(data.w)])";
+    let (x, w, y) = ("1,2,3,4", "2,1,4,3", "1,3,2,4");
+    let fit = "(beta, sigma)";
+    // (x, w, y as CSV columns), x's set, design, its columns, inputs, preparing, expected.
+    let cases = [
+        ((x, w, y), "nonnegreals", derived, 4, fit, true, Ok(())),
+        ((x, w, y), "integers", derived, 4, fit, true, Ok(())),
+        ((x, w, y), "nonnegreals", derived, 4, fit, false, Err("")),
+        (
+            (x, w, y),
+            "nonnegreals",
+            derived,
+            4,
+            "(beta, sigma, data)",
+            true,
+            Err(""),
+        ),
+        // A logarithm of zero or of a negative value.
+        (
+            ("0,2,3,4", w, y),
+            "nonnegreals",
+            derived,
+            4,
+            fit,
+            true,
+            Err(MEAN),
+        ),
+        (
+            ("-1,2,3,4", w, y),
+            "reals",
+            derived,
+            4,
+            fit,
+            true,
+            Err(MEAN),
+        ),
+        // A division by zero, and by a value below twice the smallest normal f32.
+        (
+            (x, w, y),
+            "nonnegreals",
+            "colstack([ones(4), data.x ./ (data.w .- 1.0)])",
+            2,
+            fit,
+            true,
+            Err(MEAN),
+        ),
+        (
+            (x, "2,1e-39,4,3", y),
+            "nonnegreals",
+            "colstack([ones(4), data.x ./ data.w])",
+            2,
+            fit,
+            true,
+            Err(MEAN),
+        ),
+        // A real power of a negative value.
+        (
+            (x, "2,-1,4,3", y),
+            "nonnegreals",
+            "colstack([ones(4), pow.(data.w, 0.5)])",
+            2,
+            fit,
+            true,
+            Err(MEAN),
+        ),
+        // A z-score over a constant column divides by a zero spread.
+        (
+            (x, "2,2,2,2", y),
+            "nonnegreals",
+            derived,
+            4,
+            fit,
+            true,
+            Err(MEAN),
+        ),
+        // An infinite loaded value.
+        (
+            (x, "2,inf,4,3", y),
+            "nonnegreals",
+            derived,
+            4,
+            fit,
+            true,
+            Err(MEAN),
+        ),
+        // 1e60 is finite in f64, not in f32: the proof holds both to f32.
+        (
+            (x, "2,1e30,4,3", y),
+            "nonnegreals",
+            "colstack([ones(4), data.w .* data.w])",
+            2,
+            fit,
+            true,
+            Err(MEAN),
+        ),
+        // The observation log.(y) of a zero.
+        (
+            (x, w, "0,3,2,4"),
+            "nonnegreals",
+            derived,
+            4,
+            fit,
+            true,
+            Err(OBSERVATION),
+        ),
+        // A matrix product of two fixed square matrices, and a matrix power.
+        (
+            (x, w, y),
+            "nonnegreals",
+            product.as_str(),
+            4,
+            fit,
+            true,
+            Err(MEAN),
+        ),
+        (
+            (x, w, y),
+            "nonnegreals",
+            power.as_str(),
+            4,
+            fit,
+            true,
+            Err(POWER),
+        ),
+    ];
+    for ((x, w, y), x_set, design, columns, inputs, preparing, expected) in cases {
+        let path = std::env::temp_dir().join(format!(
+            "flatppl-regression-derived-{}.csv",
+            std::process::id()
+        ));
+        let rows: Vec<_> = x
+            .split(',')
+            .zip(w.split(','))
+            .zip(y.split(','))
+            .map(|((a, b), c)| format!("{a},{b},{c}"))
+            .collect();
+        std::fs::write(&path, format!("x,w,y\n{}\n", rows.join("\n")))?;
+        let source = format!(
+            "data = load_data({path:?}, cartprod(x = cartpow({x_set},4), \
+             w = cartpow(reals,4), y = cartpow(nonnegreals,4)))\n\
+             X = {design}\n\
+             beta = elementof(cartpow(reals,{columns}))\nsigma = elementof(posreals)\n\
+             inputs = {inputs}\noutputs = logdensityof(Normal.(X * beta, sigma), log.(data.y))"
+        );
+        // A context keeps the bytes it read under the path, and every case
+        // writes the same path, so each case needs its own context.
+        let mut context = Context::default();
+        let module = match context.parse(&source, None, None) {
+            Ok(module) => module,
+            Err(error) if expected == Err(POWER) => {
+                assert!(error.message.contains(POWER), "{source}\n{}", error.message);
+                std::fs::remove_file(&path)?;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let report = context.analyze_query(&module, &[], preparing, true)?;
+        std::fs::remove_file(&path)?;
+        let reduced = report.reductions.decisions.iter().any(|d| {
+            matches!(
+                d.outcome,
+                ReductionOutcome::Reduced {
+                    rule: "regression statistics",
+                    ..
+                }
+            )
+        });
+        match expected {
+            Ok(()) => assert!(
+                reduced,
+                "{source}\n{rows:?}\n{:?}",
+                report.reductions.decisions
+            ),
+            Err(reason) => {
+                assert!(!reduced, "{source}\n{rows:?}");
+                if !reason.is_empty() {
+                    assert!(
+                        report.reductions.decisions.iter().any(|d| matches!(
+                            d.outcome,
+                            ReductionOutcome::Retained { reason: r } if r == reason
+                        )),
+                        "{source}\n{:?}",
+                        report.reductions.decisions
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn reduction_reports_match_preparation_and_leave_compilation_unchanged() {
     use flatppl_host::ReductionOutcome;

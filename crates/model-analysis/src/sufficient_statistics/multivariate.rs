@@ -145,7 +145,13 @@ pub(super) fn finite_data(m: &Module, root: NodeId, reducer: &Reducer) -> bool {
         Node::Call(c) if matches!(c.head, flatppl_core::CallHead::Builtin(h) if matches!(m.resolve(h), "vector" | "rowstack" | "colstack" | "cat" | "fill" | "neg")) => {
             c.args.iter().all(|&child| finite_data(m, child, reducer))
         }
-        _ => m.valueset_of(root).is_some_and(finite_bound),
+        // Prepared data are baked literals, so a derived column's values are in
+        // hand. Without preparation the design is not factored at all.
+        _ => {
+            m.valueset_of(root).is_some_and(finite_bound)
+                || (reducer.preparing
+                    && crate::fixed_values::fixed_values(m, root, &reducer.boundary).is_some())
+        }
     }
 }
 

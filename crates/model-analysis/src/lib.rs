@@ -5,6 +5,7 @@
 mod ancestry;
 mod conjugacy;
 mod dependencies;
+pub mod fixed_values;
 mod incremental;
 mod normal_coordinates;
 pub mod posterior;
