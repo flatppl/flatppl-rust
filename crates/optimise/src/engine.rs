@@ -7,6 +7,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use egglog::sort::S;
 use egglog::{Core, EGraph, Error, FullState, RawValues, Read, Value, Write};
 
+use crate::boundary::Choice;
 use crate::policy::load_program;
 use crate::{Dtype, Profile, RulePolicy, Target};
 
@@ -30,6 +31,13 @@ pub(super) enum FactArg {
     Bool(bool),
     Str(&'static str),
     Call(&'static str, Vec<FactArg>),
+}
+
+/// The extracted root terms. A written term of the same e-class stands for
+/// each new term, so the rebuilt node keeps the span of the text it replaces.
+pub(super) struct Extraction {
+    pub(super) roots: Vec<usize>,
+    pub(super) sources: HashMap<usize, usize>,
 }
 
 const CONSTRUCTORS: [&str; 7] = ["Leaf", "Boolean", "Integer", "Real", "U", "B", "T"];
@@ -170,7 +178,7 @@ pub(super) fn optimise(
     facts: &[Fact],
     profile: Profile,
     rules: &RulePolicy,
-) -> Option<Vec<usize>> {
+) -> Option<Extraction> {
     if rules.is_all_disabled()
         || roots.is_empty()
         || terms.len() + facts.len() > MAX_INPUT_ROWS
@@ -257,7 +265,7 @@ fn optimise_query(
     facts: &[Fact],
     profile: Profile,
     policy: &RulePolicy,
-) -> Result<Option<Vec<usize>>, Error> {
+) -> Result<Option<Extraction>, Error> {
     let config = Catalogue::for_query(profile, terms, facts);
     let mut graph = catalogue(config, terms.len() + facts.len(), policy);
     graph.update(|mut state| {
@@ -621,10 +629,29 @@ impl ExecutionDag {
             original.push((class, choice));
         }
         let costs = CostModel::read(state, &classes, config)?;
+        let mut written = vec![Vec::new(); choices.len()];
+        for &(class, choice) in &original {
+            written[class].push(choice);
+        }
         let costs = choices
             .iter()
             .enumerate()
-            .map(|(class, row)| row.iter().map(|term| costs.cost(class, term)).collect())
+            .map(|(class, row)| {
+                row.iter()
+                    .enumerate()
+                    .map(|(choice, term)| {
+                        let extra = config.profile.extra_cost(Choice {
+                            head: match term {
+                                Term::Call(head, _) => Some(head.as_str()),
+                                _ => None,
+                            },
+                            data_boundary: costs.data_boundary[class],
+                            written: written[class].contains(&choice),
+                        });
+                        costs.cost(class, term).saturating_add(extra)
+                    })
+                    .collect()
+            })
             .collect();
         Ok(Some(Self {
             choices,
@@ -638,7 +665,7 @@ impl ExecutionDag {
         terms: &mut Vec<Term>,
         roots: &[usize],
         mut budget: usize,
-    ) -> Option<Vec<usize>> {
+    ) -> Option<Extraction> {
         let original_cost = self.original_cost(terms, roots);
         let roots: Vec<_> = roots.iter().map(|&id| self.original[id].0).collect();
         let cheapest = self.cheapest_tree_choices();
@@ -696,6 +723,11 @@ impl ExecutionDag {
             .enumerate()
             .map(|(id, term)| (term.clone(), id))
             .collect();
+        let mut written = vec![None; self.choices.len()];
+        for (id, &(class, _)) in self.original.iter().enumerate() {
+            written[class].get_or_insert(id);
+        }
+        let mut sources = HashMap::new();
         let mut ids = vec![0; self.choices.len()];
         for class in order {
             let term = match &self.choices[class][selected[class]] {
@@ -706,10 +738,16 @@ impl ExecutionDag {
             };
             ids[class] = *interned.entry(term.clone()).or_insert_with(|| {
                 terms.push(term);
+                if let Some(source) = written[class] {
+                    sources.insert(terms.len() - 1, source);
+                }
                 terms.len() - 1
             });
         }
-        Some(roots.into_iter().map(|class| ids[class]).collect())
+        Some(Extraction {
+            roots: roots.into_iter().map(|class| ids[class]).collect(),
+            sources,
+        })
     }
 
     fn original_cost(&self, terms: &[Term], roots: &[usize]) -> u64 {
@@ -803,6 +841,7 @@ fn children(term: &Term) -> &[usize] {
 }
 
 struct CostModel {
+    data_boundary: Vec<bool>,
     elements: Vec<u64>,
     selectors: Vec<u64>,
     measure_work: Vec<u64>,
@@ -824,6 +863,12 @@ impl CostModel {
         let mut folded_native = vec![false; classes.len()];
         let mut removed_transports = HashSet::new();
         let mut poisson_rows = vec![];
+        let mut data_boundary = vec![false; classes.len()];
+        state.constructor_enodes("data-boundary", |row| {
+            if let Some(&class) = classes.get(&row.children[0]) {
+                data_boundary[class] = true;
+            }
+        })?;
         if config.measures {
             state.constructor_enodes("gaussian-folded-native", |row| {
                 if let Some(&class) = classes.get(&row.children[0]) {
@@ -846,6 +891,7 @@ impl CostModel {
         }
         let Profile::StableHlo { dtype, .. } = config.profile else {
             return Ok(Self {
+                data_boundary,
                 elements,
                 selectors,
                 measure_work,
@@ -889,6 +935,7 @@ impl CostModel {
             Dtype::F64 => 8,
         };
         Ok(Self {
+            data_boundary,
             elements,
             selectors,
             measure_work,
@@ -976,7 +1023,10 @@ mod tests {
             original: vec![(0, 0), (1, 0), (2, 0)],
         };
         let mut single = original.clone();
-        let winner = dag.improve(&mut single, &[2], MAX_TRIAL_VISITS).unwrap();
+        let winner = dag
+            .improve(&mut single, &[2], MAX_TRIAL_VISITS)
+            .unwrap()
+            .roots;
         assert_eq!(single[winner[0]], early);
 
         let mut shared = original.clone();
@@ -987,7 +1037,10 @@ mod tests {
         assert_eq!(shared, original);
 
         dag.costs[2][1] = 1;
-        let winners = dag.improve(&mut shared, &[2, 1], MAX_TRIAL_VISITS).unwrap();
+        let winners = dag
+            .improve(&mut shared, &[2, 1], MAX_TRIAL_VISITS)
+            .unwrap()
+            .roots;
         assert_eq!(shared[winners[0]], early);
         assert_eq!(winners[1], 1);
     }
@@ -1011,7 +1064,10 @@ mod tests {
         dag.costs[1].push(1);
         assert!(dag.improve(&mut terms, &[1], 1).is_none());
         assert_eq!(terms, original);
-        let winner = dag.improve(&mut terms, &[1], MAX_TRIAL_VISITS).unwrap();
+        let winner = dag
+            .improve(&mut terms, &[1], MAX_TRIAL_VISITS)
+            .unwrap()
+            .roots;
         assert_eq!(terms[winner[0]], Term::Integer(1));
     }
 }

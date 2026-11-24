@@ -716,11 +716,8 @@ impl<'a> Project<'a> {
                     .collect::<Option<Vec<_>>>()?;
                 self.concats.push((i, witness, args));
             }
-            // Stan reads a written literal matrix as data. An inserted axis
-            // would compute it in `transformed data` instead.
-            if self.profile != Profile::Stan
-                && let Some((head, vector)) =
-                    concat::fixed_stack_vector(m, id, |n| self.cuts.resolve(m, n))
+            if let Some((head, vector)) =
+                concat::fixed_stack_vector(m, id, |n| self.cuts.resolve(m, n))
             {
                 let source = self.project(vector, depth + 1)?;
                 self.facts.push(fact(
@@ -752,11 +749,12 @@ impl<'a> Project<'a> {
         &self,
         m: &mut Module,
         roots: &[usize],
-        winners: &[usize],
+        extraction: &engine::Extraction,
     ) -> Option<Vec<Option<NodeId>>> {
+        let winners = &extraction.roots;
         let original = self.origins.len();
         let mut live = HashSet::new();
-        let mut stack = winners.to_vec();
+        let mut stack = winners.clone();
         while let Some(i) = stack.pop() {
             if i >= original
                 && live.insert(i)
@@ -831,6 +829,28 @@ impl<'a> Project<'a> {
             };
             created.insert(i, id);
         }
+        // A refusal inside a rebuilt value still points at the written text.
+        // A class with no written member takes the span of its consumer.
+        let mut spans: Vec<_> = created.keys().copied().collect();
+        spans.sort_unstable_by(|a, b| b.cmp(a));
+        for i in spans {
+            let id = created[&i];
+            if let Some(&source) = extraction.sources.get(&i)
+                && let Some(span) = self.m.span_of(self.origins[source])
+            {
+                m.set_span(id, span);
+            }
+            let (Some(span), Term::Call(_, args)) = (m.span_of(id), &self.terms[i]) else {
+                continue;
+            };
+            for arg in args {
+                if let Some(&child) = created.get(arg)
+                    && m.span_of(child).is_none()
+                {
+                    m.set_span(child, span);
+                }
+            }
+        }
         roots
             .iter()
             .zip(winners)
@@ -884,6 +904,13 @@ pub(super) fn optimise(
         .iter()
         .map(|&id| project.project(id, 0))
         .collect::<Option<_>>()?;
+    for (bid, b) in m.bindings() {
+        if crate::boundary::data_boundary(m, profile, bid)
+            && let Some(&i) = project.by_node.get(&b.rhs)
+        {
+            project.facts.push(fact("data-boundary", i, []));
+        }
+    }
     let transposed_cells = project.transposed_cells();
     let affine_transports = gaussian::partial_transports(&project.facts);
     let vector_selectors = match profile {

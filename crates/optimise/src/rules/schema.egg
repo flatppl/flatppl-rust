@@ -17,6 +17,9 @@
 (relation real-vector (Expr i64))
 (relation real-matrix (Expr i64 i64))
 (relation erasable (Expr))
+; A named value the target reads by its name. The profile's extraction cost
+; keeps its written form.
+(relation data-boundary (Expr))
 
 (ruleset analysis)
 (rule ((= x (Boolean b))) ((bool-value x) (erasable x)) :ruleset analysis :name "analysis.literal-boolean")

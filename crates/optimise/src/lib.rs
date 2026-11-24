@@ -1,5 +1,6 @@
 //! Typed rewrites of an inferred FlatPPL model or a determinized query.
 
+mod boundary;
 mod categorical_counts;
 mod concat;
 mod conjugacy;

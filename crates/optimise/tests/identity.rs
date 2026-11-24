@@ -77,3 +77,26 @@ fn alternating_rule_policies_only_affect_the_current_optimisation() {
         );
     }
 }
+
+#[test]
+fn a_rebuilt_value_keeps_the_span_of_the_written_value() {
+    let source = "m = external(cartpow(reals, [4, 3]))\ninputs = m\n\
+                  outputs = sum(sum(transpose(transpose(m))))\n";
+    let mut module = flatppl_syntax::parse(source).unwrap();
+    let diagnostics = flatppl_infer::infer(&mut module);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| d.severity != flatppl_infer::Severity::Error),
+        "{diagnostics:?}"
+    );
+    let output = module.intern("outputs");
+    let out = optimise(&module, Some(&[output]), Profile::Portable).expect("rewrite");
+    let rhs = |m: &Module| m.binding(m.binding_by_name(output).unwrap()).rhs;
+    let (before, after) = (rhs(&module), rhs(&out));
+    assert_ne!(before, after);
+    assert_eq!(out.span_of(after), module.span_of(before));
+    let mut inner = Vec::new();
+    out.for_each_child(after, |child| inner.push(child));
+    assert!(inner.iter().all(|&child| out.span_of(child).is_some()));
+}
