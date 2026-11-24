@@ -394,40 +394,30 @@ pub(crate) fn host_node(
             n = reader;
             continue;
         }
-        return rebuilt_host_node(host, work, grafted.host_bindings, n).unwrap_or(n);
-    }
-    n
-}
-
-/// A host value rebuilt around an import or by the optimiser has the shape of
-/// the host's own value: walk both together to the node `n` was rebuilt from.
-fn rebuilt_host_node(
-    host: &Module,
-    work: &Module,
-    host_bindings: usize,
-    n: NodeId,
-) -> Option<NodeId> {
-    use flatppl_core::Idx;
-    for (b, binding) in work.bindings() {
-        if b.index() >= host_bindings {
-            continue;
-        }
-        let mut stack = vec![(binding.rhs, host.binding(b).rhs)];
-        let mut seen = HashSet::new();
-        while let Some((w, h)) = stack.pop() {
-            if w == n {
-                return Some(h);
-            }
-            if !seen.insert(w) {
+        // A host value rebuilt around an import has the shape of the host's
+        // own value: walk both together to the node `n` was rebuilt from.
+        for (b, binding) in work.bindings() {
+            if b.index() >= grafted.host_bindings {
                 continue;
             }
-            let (wc, hc) = (work.node(w).children(), host.node(h).children());
-            if wc.len() == hc.len() {
-                stack.extend(wc.into_iter().zip(hc));
+            let mut stack = vec![(binding.rhs, host.binding(b).rhs)];
+            let mut seen = HashSet::new();
+            while let Some((w, h)) = stack.pop() {
+                if w == n {
+                    return h;
+                }
+                if !seen.insert(w) {
+                    continue;
+                }
+                let (wc, hc) = (work.node(w).children(), host.node(h).children());
+                if wc.len() == hc.len() {
+                    stack.extend(wc.into_iter().zip(hc));
+                }
             }
         }
+        return n;
     }
-    None
+    n
 }
 
 pub(crate) fn sanitize(name: &str) -> String {
@@ -3009,16 +2999,20 @@ pub(crate) fn program(
     let Some(work) = optimised else {
         return program_printed(m, opts, &ImportNames::default(), target).0;
     };
-    // A refusal names a node of `m`, also when the optimiser rebuilt it.
+    // A refusal names a node of `m`. A rebuilt node carries the span of the
+    // written node it replaces.
     program_printed(&work, opts, &ImportNames::default(), target)
         .0
         .map_err(|mut r| {
             r.node = r.node.map(|n| {
-                if n.index() < m.node_count() {
-                    n
-                } else {
-                    rebuilt_host_node(m, &work, m.binding_count(), n).unwrap_or(n)
-                }
+                let written = work.span_of(n).filter(|_| n.index() >= m.node_count());
+                written
+                    .and_then(|span| {
+                        (0..m.node_count())
+                            .map(NodeId::from_usize)
+                            .find(|&h| m.span_of(h) == Some(span))
+                    })
+                    .unwrap_or(n)
             });
             r
         })

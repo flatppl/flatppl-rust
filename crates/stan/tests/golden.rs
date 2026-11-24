@@ -169,6 +169,17 @@ outputs = logdensityof(Normal(0, 1), theta) + logdensityof(Normal(theta, 1), x[1
     assert!(program.data.contains_key("x"), "{:?}", program.data);
 }
 
+#[test]
+fn an_unnamed_singleton_stack_keeps_its_stan_form() {
+    let source = r#"# emit: target=outputs
+theta = elementof(reals)
+inputs = theta
+outputs = logdensityof(Normal(0, 1), theta) + logdensityof(Normal(theta, 1), rowstack([[0.5, 1.5]])[1, 2])
+"#;
+    let code = emit(source).code;
+    assert!(code.contains("to_matrix([0.5, 1.5])[1, 2]"), "{code}");
+}
+
 fn golden_models() -> Vec<std::path::PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
     let mut entries: Vec<_> = std::fs::read_dir(&dir)

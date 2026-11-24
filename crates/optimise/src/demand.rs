@@ -81,7 +81,7 @@ pub(super) fn prune(
                 ..
             }
         ),
-        named_data: profile == Profile::Stan,
+        profile,
         values: HashMap::new(),
         projections: HashMap::new(),
     };
@@ -212,7 +212,7 @@ struct Proof<'a> {
     protected: HashSet<NodeId>,
     abi_cuts: Option<&'a Cuts>,
     wide_integers: bool,
-    named_data: bool,
+    profile: Profile,
     values: HashMap<(NodeId, ValueUse), bool>,
     projections: HashMap<NodeId, Option<Projection>>,
 }
@@ -295,9 +295,8 @@ impl Proof<'_> {
         }
         let (next, binding) = resolve_ref_one(self.module, node);
         if let Some(binding) = binding {
-            // Stan declares a named fixed value as data, read through its name.
             if self.module.query_pinned_rhs(binding).is_some()
-                || (self.named_data && self.module.phase_of(next) == Some(Phase::Fixed))
+                || crate::boundary::data_boundary(self.module, self.profile, binding)
             {
                 return None;
             }
