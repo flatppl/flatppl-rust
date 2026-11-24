@@ -52,6 +52,275 @@ pub fn builtin_catalogue() -> &'static Catalogue {
     catalogue::builtin()
 }
 
+/// Whether the base builtin `name` is a function of one argument whose §07
+/// domain is a scalar (`exp`, `log`, `logit`). Over an array variate such a
+/// name is no `pushfwd` map: the map is written `fn(name.(_))`. Array-domain
+/// names (`neg`, `inv`, `sum`) and distribution names are not.
+pub fn scalar_domain_function(name: &str) -> bool {
+    use catalogue::{ParamSig, Sig};
+    matches!(
+        catalogue::builtin().base(name),
+        Some(Sig::Function { params, .. } | Sig::Structural { params, .. })
+            if matches!(params[..], [ParamSig::Scalar(_)])
+    )
+}
+
+/// What the spec fixes as the reference measure of a measure's support, read
+/// for the change of variables of `pushfwd` and for the density of `superpose`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeasureChart {
+    /// A support of this many fewer dimensions than its cells under the
+    /// coordinate Lebesgue measure §03 gives `stdsimplex(n)` and `zerosum(n)`
+    /// (0: full-dimensional).
+    Deficit(u64),
+    /// A point mass (`Dirac`).
+    PointMass,
+    /// A lower-dimensional support with no reference measure in §03 (the
+    /// correlation sets of `LKJ` and `LKJCholesky`).
+    NoReference,
+    /// A `superpose` whose components have reference measures of different
+    /// dimension.
+    MixedDimension,
+    /// A `superpose` or `joint` that holds a point mass.
+    PointMassMix,
+}
+
+/// The [`MeasureChart`] of `node`. A bijection keeps the dimension of its
+/// base's support, so a `pushfwd` or `locscale` takes its base's chart, through
+/// bindings and through `normalize`, `truncate`, `weighted` and `logweighted`,
+/// which keep the support. Elsewhere the inferred value set decides.
+pub fn measure_chart(module: &Module, node: NodeId) -> MeasureChart {
+    use flatppl_core::{CallHead, Node, RefNs};
+    let own = || match module.valueset_of(node).map(|s| s.chart_deficit()) {
+        Some(Some(d)) => MeasureChart::Deficit(d),
+        Some(None) => MeasureChart::NoReference,
+        None => MeasureChart::Deficit(0),
+    };
+    let call = match module.node(node) {
+        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+            return match module.binding_by_name(r.name) {
+                Some(b) => measure_chart(module, module.binding(b).rhs),
+                None => own(),
+            };
+        }
+        Node::Call(c) => c,
+        _ => return own(),
+    };
+    let head = match call.head {
+        CallHead::Builtin(head) => head,
+        // An applied kernel or callable yields the measure its body builds.
+        CallHead::User(callee) => {
+            return match (applied_body(module, callee), own()) {
+                (Some(body), MeasureChart::Deficit(b)) => match measure_chart(module, body) {
+                    MeasureChart::Deficit(a) => MeasureChart::Deficit(a.max(b)),
+                    w => w,
+                },
+                (Some(body), _) => measure_chart(module, body),
+                (None, own) => own,
+            };
+        }
+    };
+    let inner = |i: usize| call.args.get(i).map(|&a| measure_chart(module, a));
+    let point =
+        |c: &MeasureChart| matches!(c, MeasureChart::PointMass | MeasureChart::PointMassMix);
+    let walked = match module.resolve(head) {
+        "LKJ" | "LKJCholesky" => Some(MeasureChart::NoReference),
+        "Dirac" => Some(MeasureChart::PointMass),
+        "pushfwd" | "weighted" | "logweighted" | "bayesupdate" => inner(1),
+        "locscale" | "normalize" | "truncate" | "relabel" => inner(0),
+        // The tilted measure lives on its base measure `B` (§06 `tilt(M, B)`).
+        "tilt" => inner(1),
+        // A product of point masses is a point mass; any other product keeps its
+        // value set's deficit (`cartpow` of a simplex counts each factor).
+        "iid" => inner(0).filter(point),
+        // The law of a draw is the measure of its `~` binding when that measure has
+        // no stochastic ancestor; with one, `lawof` marginalises it and keeps its
+        // value set. A record, tuple or array of draws holds a point mass when a
+        // draw's own measure does, whatever its ancestors (`x ~ Dirac(mu)` beside
+        // `mu` is a point mass in `x` given `mu`), read as `joint` is. The law of
+        // any other expression keeps its value set.
+        "lawof" => call.args.first().and_then(|&a| {
+            if let Some(law) = drawn_law(module, a) {
+                if module.phase_of(law) == Some(flatppl_core::Phase::Stochastic) {
+                    return None;
+                }
+                return Some(measure_chart(module, law));
+            }
+            let Node::Call(c) = module.node(a) else {
+                return None;
+            };
+            let CallHead::Builtin(h) = c.head else {
+                return None;
+            };
+            if !matches!(module.resolve(h), "record" | "tuple" | "vector") {
+                return None;
+            }
+            c.args
+                .iter()
+                .copied()
+                .chain(c.named.iter().map(|f| f.value))
+                .filter_map(|f| drawn_law(module, f))
+                .map(|law| measure_chart(module, law))
+                .any(|c| point(&c))
+                .then_some(MeasureChart::PointMassMix)
+        }),
+        // A product with a point-mass part holds a point mass beside its other
+        // parts; any other product keeps its value set's deficit.
+        "joint" => call
+            .args
+            .iter()
+            .copied()
+            .chain(call.named.iter().map(|a| a.value))
+            .map(|a| measure_chart(module, a))
+            .any(|c| point(&c))
+            .then_some(MeasureChart::PointMassMix),
+        "superpose" => {
+            let parts: Vec<MeasureChart> = call
+                .args
+                .iter()
+                .map(|&a| measure_chart(module, a))
+                .collect();
+            let deficits: Vec<u64> = parts
+                .iter()
+                .filter_map(|p| match p {
+                    MeasureChart::Deficit(d) => Some(*d),
+                    _ => None,
+                })
+                .collect();
+            Some(if parts.contains(&MeasureChart::PointMass) {
+                MeasureChart::PointMassMix
+            } else if let Some(bad) = parts.iter().find(|p| {
+                matches!(
+                    p,
+                    MeasureChart::NoReference
+                        | MeasureChart::MixedDimension
+                        | MeasureChart::PointMassMix
+                )
+            }) {
+                *bad
+            } else if deficits.windows(2).any(|w| w[0] != w[1]) {
+                MeasureChart::MixedDimension
+            } else {
+                MeasureChart::Deficit(deficits.first().copied().unwrap_or(0))
+            })
+        }
+        _ => None,
+    };
+    match (walked, own()) {
+        (None, own) => own,
+        (Some(MeasureChart::Deficit(a)), MeasureChart::Deficit(b)) => {
+            MeasureChart::Deficit(a.max(b))
+        }
+        (Some(w), _) => w,
+    }
+}
+
+/// The measure `M` of the binding `x = draw(M)` (`x ~ M`) that `node` names.
+fn drawn_law(module: &Module, node: NodeId) -> Option<NodeId> {
+    use flatppl_core::{CallHead, Node, RefNs};
+    let Node::Ref(r) = module.node(node) else {
+        return None;
+    };
+    if r.ns != RefNs::SelfMod {
+        return None;
+    }
+    let rhs = module.binding(module.binding_by_name(r.name)?).rhs;
+    match module.node(rhs) {
+        Node::Call(c) if matches!(c.head, CallHead::Builtin(h) if module.resolve(h) == "draw") => {
+            c.args.first().copied()
+        }
+        Node::Ref(_) => drawn_law(module, rhs),
+        _ => None,
+    }
+}
+
+/// The body of the callable `callee` names: a `functionof`/`kernelof`
+/// reification, through bindings. `None` where it does not resolve to one.
+fn applied_body(module: &Module, mut callee: NodeId) -> Option<NodeId> {
+    use flatppl_core::{Node, RefNs};
+    for _ in 0..64 {
+        match module.node(callee) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                callee = module.binding(module.binding_by_name(r.name)?).rhs;
+            }
+            Node::Call(c) if c.inputs.is_some() => return c.args.first().copied(),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// One step of a uniform affine map, outermost first. `Mul` and `Div` carry a
+/// scalar; `Add`, `Sub` and `RSub` carry a scalar or an array of the variate's
+/// shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AffineStep {
+    Neg,
+    Add(NodeId),
+    Sub(NodeId),
+    /// `c - u`.
+    RSub(NodeId),
+    Mul(NodeId),
+    Div(NodeId),
+}
+
+/// The steps of `body` as a uniform affine map of the input: `neg`, `add`, `sub`,
+/// and `mul` or `divide` by a scalar with the input in the numerator, each
+/// written plainly or broadcast (`.*`, `./`, `.+`, `.-`), composed. This is the
+/// one set of maps whose image of a `stdsimplex(n)` or `zerosum(n)` support keeps
+/// a reference measure (§03), read by the determinizer and the Stan emitter
+/// alike. `None` for any other body. The closures resolve an alias, tell the
+/// input, tell a node that reads the input, and tell a scalar.
+pub fn uniform_affine_steps(
+    module: &Module,
+    body: NodeId,
+    resolve: &dyn Fn(NodeId) -> NodeId,
+    is_input: &dyn Fn(NodeId) -> bool,
+    reads_input: &dyn Fn(NodeId) -> bool,
+    is_scalar: &dyn Fn(NodeId) -> bool,
+) -> Option<Vec<AffineStep>> {
+    use flatppl_core::{CallHead, Node};
+    let mut steps = Vec::new();
+    let mut node = resolve(body);
+    loop {
+        if is_input(node) {
+            return Some(steps);
+        }
+        let Node::Call(call) = module.node(node) else {
+            return None;
+        };
+        if !call.named.is_empty() {
+            return None;
+        }
+        let CallHead::Builtin(head) = call.head else {
+            return None;
+        };
+        let (op, args): (&str, &[NodeId]) = match (module.resolve(head), &call.args[..]) {
+            ("broadcast", [f, rest @ ..]) => match module.node(resolve(*f)) {
+                Node::Const(name) => (module.resolve(*name), rest),
+                _ => return None,
+            },
+            (h, args) => (h, args),
+        };
+        let reads: Vec<bool> = args.iter().map(|&a| reads_input(a)).collect();
+        let (step, next) = match (op, args, reads.as_slice()) {
+            ("neg", [u], [true]) => (AffineStep::Neg, *u),
+            ("add", [u, c], [true, false]) | ("add", [c, u], [false, true]) => {
+                (AffineStep::Add(*c), *u)
+            }
+            ("sub", [u, c], [true, false]) => (AffineStep::Sub(*c), *u),
+            ("sub", [c, u], [false, true]) => (AffineStep::RSub(*c), *u),
+            ("mul", [u, c], [true, false]) | ("mul", [c, u], [false, true]) if is_scalar(*c) => {
+                (AffineStep::Mul(*c), *u)
+            }
+            ("divide", [u, c], [true, false]) if is_scalar(*c) => (AffineStep::Div(*c), *u),
+            _ => return None,
+        };
+        steps.push(step);
+        node = resolve(next);
+    }
+}
+
 /// Ordered constructor parameter names for a built-in distribution (spec
 /// §08/§09 "Parameters" column), e.g. `Normal` → `["mu", "sigma"]`. Looked up
 /// across base builtins and every standard module's bindings. `None` if

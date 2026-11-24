@@ -424,9 +424,9 @@ fn pushfwd_elementwise_both_spellings_byte_equal() {
     // (pushfwd_matrix_affine_nonidentity_logdet) specifically because substring
     // matches can miss a sign/shape bug that a full structural pin catches. The
     // non-degenerate pin here is §06's OWN invariant — the two spellings of the
-    // same elementwise map must lower identically, since §06 nowhere distinguishes
-    // `pushfwd(g, M)` from `pushfwd(x -> broadcast(g, x), M)` and
-    // [`wrap_elementwise`] is their single emission site:
+    // same elementwise map must lower identically, `fn(g.(_))` and
+    // `fn(broadcast(g, _))`, since [`wrap_elementwise`] is their single emission
+    // site:
     //   f_inv(y)  = broadcast(log, y)                 (per-cell scalar inverse)
     //   logvol(y) = sum(broadcast(y -> log(y), y))    (diagonal log-det, per-cell
     //                                                  `log|g'(g⁻¹(yᵢ))| = log yᵢ`,
@@ -439,8 +439,10 @@ fn pushfwd_elementwise_both_spellings_byte_equal() {
     // (§06 → "Engine contract for `pushfwd` density evaluation"), so reproducing
     // `sum(broadcast(log, v))` from `broadcast(log, v)` would need the forward back —
     // the round trip the query-point spelling exists to remove.
-    let bare = pir("d = pushfwd(exp, iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
-         lp = logdensityof(d, [0.5, 0.6, 0.7])");
+    let bare = pir(
+        "d = pushfwd(fn(exp.(_)), iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
+         lp = logdensityof(d, [0.5, 0.6, 0.7])",
+    );
     let lambda = pir(
         "d = pushfwd(fn(broadcast(exp, _)), iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
          lp = logdensityof(d, [0.5, 0.6, 0.7])",
@@ -448,7 +450,7 @@ fn pushfwd_elementwise_both_spellings_byte_equal() {
     assert!(bare.contains("builtin_logdensityof"), "got:\n{bare}");
     assert_eq!(
         bare, lambda,
-        "the bare and broadcast spellings of the same elementwise map must lower identically"
+        "the dotted and broadcast spellings of the same elementwise map must lower identically"
     );
 }
 

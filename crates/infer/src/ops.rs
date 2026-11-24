@@ -6802,18 +6802,35 @@ fn pushfwd_codomain(
         }
         _ => None,
     };
+    // A one-argument function whose §07 domain is a scalar is no map of an
+    // array variate, bare or as a `bijection`'s forward: §04 broadcasting
+    // applies to calls, and a bare name is no call, so the elementwise map is
+    // written `fn(f.(_))`.
+    let forward = resolve_binding_refs(inf, f_node);
+    if let (Some(s), Node::Const(op)) = (&seed, inf.module.node(forward))
+        && crate::scalar_domain_function(inf.module.resolve(*op))
+        && matches!(&s[0].1, Type::Array { .. } | Type::TVector { .. })
+    {
+        let name = inf.module.resolve(*op).to_string();
+        inf.diags.push(crate::Diagnostic::error_at(
+            args[0].0,
+            format!(
+                "pushfwd's map `{name}` takes a scalar, and the base measure's variate is an \
+                 array. Write the elementwise map `fn({name}.(_))` (spec §04 \"Broadcasting\")"
+            ),
+        ));
+        return Ready(Some(Type::Failed(
+            format!("pushfwd through `{name}` of an array variate").into(),
+        )));
+    }
     // A built-in function as the map (`pushfwd(log, M)`, §06 recognizes the
     // maps by name) takes the ordinary call checks at M's domain, as a
-    // built-in `weighted` weight does. A one-argument function whose §07
-    // domain is a scalar types over an array variate as its written
-    // elementwise form `f.(_)`, the variate of `broadcast(f, x)`, as the
-    // determinizer reads the bare name per cell; §06 has no sentence for a
-    // bare scalar name over an array law. Any other name (an array domain:
-    // `inv`, `row_gram`, `sum`; both: `neg`; two arguments: `atan2`) takes
-    // the call check with the whole variate. A distribution name is no map
-    // (§06 takes a function) and keeps the rule below, as does a
-    // `bijection(…)` map.
-    use crate::catalogue::{ParamSig, Sig};
+    // built-in `weighted` weight does. Any other name than the scalar-domain
+    // ones above (an array domain: `inv`, `row_gram`, `sum`; both: `neg`; two
+    // arguments: `atan2`) takes the call check with the whole variate. A
+    // distribution name is no map (§06 takes a function) and keeps the rule
+    // below, as does a `bijection(…)` map.
+    use crate::catalogue::Sig;
     let builtin = match inf.module.node(resolved) {
         Node::Const(op)
             if !matches!(
@@ -6825,20 +6842,7 @@ fn pushfwd_codomain(
         }
         _ => None,
     };
-    let scalar_domain = builtin.is_some_and(|op| {
-        matches!(
-            crate::catalogue::builtin().base(inf.module.resolve(op)),
-            Some(Sig::Function { params, .. } | Sig::Structural { params, .. })
-                if matches!(params[..], [ParamSig::Scalar(_)])
-        )
-    });
     let sub = match (seed, builtin) {
-        (Some(s), Some(_)) if scalar_domain && matches!(&s[0].1, Type::Array { .. }) => {
-            let mut cells = vec![args[0].clone()];
-            cells.extend(s.iter().cloned());
-            broadcast_type(inf, id, &cells, &[])
-                .map(inf, |_, ty| Some(first_failed(&ty).unwrap_or(ty)))
-        }
         (Some(s), Some(op)) => {
             let application = Call {
                 head: CallHead::Builtin(op),

@@ -247,9 +247,9 @@ fn composition_gates_on_the_propagated_image() {
 fn elementwise_image_gate_is_the_cartesian_power() {
     // Over a vector variate an elementwise map carries its per-cell image in every
     // cell, so the image is `cartpow(image(g), n)` (§03: the set of n-element arrays
-    // over that set). Both spellings of the same map gate on the same set.
+    // over that set). Both written spellings of the same map gate on the same set.
     let base = "iid(Normal(mu = 0.0, sigma = 1.0), 3)";
-    for map in ["exp", "fn(broadcast(exp, _))"] {
+    for map in ["fn(exp.(_))", "fn(broadcast(exp, _))"] {
         let out = lp(&format!(
             "d = pushfwd({map}, {base})\nlp = logdensityof(d, [0.5, 0.6, 0.7])"
         ));

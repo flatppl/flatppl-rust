@@ -765,6 +765,17 @@ impl<'m> Emitter<'m> {
         if self.head(mix) == Some("ksuperpose") {
             return self.kmixture_lp(mix, norm, y);
         }
+        if flatppl_infer::measure_chart(self.m, mix) == flatppl_infer::MeasureChart::MixedDimension
+        {
+            return Err(Refusal::new(
+                RefusalKind::MixedReference,
+                Some(mix),
+                "superpose",
+                "the components of this superposition have reference measures of different \
+                 dimension (§03: a stdsimplex(n) or zerosum(n) support has n − 1 free \
+                 coordinates), so the superposition has no density",
+            ));
+        }
         let parts = self.parts(mix)?;
         let mut lps = Vec::new();
         let mut weights = Vec::new();

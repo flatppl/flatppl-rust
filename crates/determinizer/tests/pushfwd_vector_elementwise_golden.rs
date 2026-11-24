@@ -1,17 +1,9 @@
-//! A bare built-in map over a VECTOR variate is an elementwise map, and its
-//! Jacobian is DIAGONAL. The bare spelling used to take the SCALAR derivation and
-//! emit that op's scalar log-volume against an n-vector, so the two spellings,
-//! which lower to the same program, disagreed:
-//!
-//! ```text
-//! pushfwd(exp, MvNormal(…))            → sub(builtin_logdensityof(MvNormal, …, log(y)), log(y))
-//! pushfwd(x -> broadcast(exp, x), …)   → sub(…, sum(broadcast(logvol, broadcast(log, y))))
-//! ```
-//!
-//! The first subtracts a VECTOR from a scalar where the diagonal log-det is
-//! `Σᵢ log yᵢ`; `is_flatpdl` does not flag `sub(scalar, vector)`, so it exited 0 on
-//! a wrong number. The vector dispatch now precedes the bare/lambda split, and both
-//! spellings emit through one builder (`invert::wrap_elementwise`).
+//! An elementwise map over a VECTOR variate has a DIAGONAL Jacobian. Its two
+//! written spellings, `fn(exp.(_))` and `x -> broadcast(exp, x)`, lower through one
+//! builder (`invert::wrap_elementwise`), so the volume term is `Σᵢ log|g'(yᵢ)|`.
+//! A bare scalar-domain name over a vector (`pushfwd(exp, MvNormal(…))`) is no map
+//! of a vector: inference reports it, and the determinizer refuses it, naming the
+//! written form.
 //!
 //! The load-bearing assertion is that the two spellings are BYTE-IDENTICAL — the
 //! failure mode is them drifting, which a pair of separately hand-written
@@ -48,7 +40,7 @@ fn refusal(src: &str) -> String {
 }
 
 #[test]
-fn bare_and_broadcast_spellings_are_byte_identical_over_a_vector_base() {
+fn dotted_and_broadcast_spellings_are_byte_identical_over_a_vector_base() {
     // Over an `iid` base and over `MvNormal` — the second confirms the dispatch keys
     // on the variate domain being a vector, not on how the product was built.
     for (base, point) in [
@@ -59,14 +51,14 @@ fn bare_and_broadcast_spellings_are_byte_identical_over_a_vector_base() {
         ),
     ] {
         let bare = lp(&format!(
-            "d = pushfwd(exp, {base})\nlp = logdensityof(d, {point})"
+            "d = pushfwd(fn(exp.(_)), {base})\nlp = logdensityof(d, {point})"
         ));
         let broadcast = lp(&format!(
             "d = pushfwd(x -> broadcast(exp, x), {base})\nlp = logdensityof(d, {point})"
         ));
         assert_eq!(
             bare, broadcast,
-            "`{base}`: the bare and broadcast spellings lower to the same program"
+            "`{base}`: the dotted and broadcast spellings lower to the same program"
         );
         // And that the shared form is the DIAGONAL log-det, not a scalar Jacobian:
         // the volume term reduces the per-cell terms with `sum`.
@@ -84,7 +76,7 @@ fn the_scalar_inverse_is_never_applied_to_the_whole_vector() {
     // vector). Neither spelling may do that — the per-cell application is a
     // `broadcast`. `MvNormal` keeps the base density a single
     // `builtin_logdensityof`, so the only `sum` in the emission is the log-det.
-    for map in ["exp", "x -> broadcast(exp, x)"] {
+    for map in ["fn(exp.(_))", "x -> broadcast(exp, x)"] {
         let out = lp(&format!(
             "d = pushfwd({map}, MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])))\n\
              lp = logdensityof(d, [0.5, 0.5])"
@@ -117,13 +109,13 @@ fn scalar_base_still_takes_the_scalar_derivation() {
 }
 
 #[test]
-fn bare_domain_restricted_map_reads_the_per_cell_support() {
-    // The bare spelling's §06 domain restriction is now checked against the ELEMENT
-    // support, which is what the map actually sees: `log` over a vector of positive
-    // cells is defined per cell. Both spellings must agree on that too.
+fn dotted_domain_restricted_map_reads_the_per_cell_support() {
+    // The §06 domain restriction is checked against the ELEMENT support, which is
+    // what the map actually sees: `log` over a vector of positive cells is defined
+    // per cell. Both spellings must agree on that too.
     let base = "iid(Gamma(shape = 2.0, rate = 1.0), 3)";
     let bare = lp(&format!(
-        "d = pushfwd(log, {base})\nlp = logdensityof(d, [0.5, 0.6, 0.7])"
+        "d = pushfwd(fn(log.(_)), {base})\nlp = logdensityof(d, [0.5, 0.6, 0.7])"
     ));
     let broadcast = lp(&format!(
         "d = pushfwd(x -> broadcast(log, x), {base})\nlp = logdensityof(d, [0.5, 0.6, 0.7])"
@@ -136,7 +128,7 @@ fn bare_domain_restricted_map_reads_the_per_cell_support() {
 
     // And an out-of-domain element support still refuses in both spellings (§06
     // case 1: "refused rather than yielding a silently sub-probability measure").
-    for map in ["log", "x -> broadcast(log, x)"] {
+    for map in ["fn(log.(_))", "x -> broadcast(log, x)"] {
         let mut m = flatppl_syntax::parse(&format!(
             "d = pushfwd({map}, iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
              lp = logdensityof(d, [0.5, 0.6, 0.7])"
@@ -154,7 +146,7 @@ fn discrete_vector_base_gate_applies_every_scalar_function_per_cell() {
     // with `broadcast`; applying one to the vector itself is outside its domain, and the
     // emitted FlatPDL must infer clean. Scored through flatppl-js, the gate gives
     // -0.8925742052568393 at exp([1, 4]) and -inf at the off-lattice point [1, 4].
-    for map in ["exp", "x -> broadcast(exp, x)"] {
+    for map in ["fn(exp.(_))", "x -> broadcast(exp, x)"] {
         let out = lp(&format!(
             "d = pushfwd({map}, Multinomial(n = 5, p = [0.2, 0.8]))\n\
              lp = logdensityof(d, [1.0, 4.0])"
@@ -188,7 +180,7 @@ fn discrete_vector_base_carries_no_volume_term_either_way() {
     // and there is no volume element at all (§06 "Density convention"). That is why
     // the discrete goldens did not expose this defect — the term they would have
     // compared is absent. The preimage itself must still be elementwise.
-    for map in ["exp", "x -> broadcast(exp, x)"] {
+    for map in ["fn(exp.(_))", "x -> broadcast(exp, x)"] {
         let out = lp(&format!(
             "d = pushfwd({map}, Multinomial(n = 5, p = [0.2, 0.8]))\n\
              lp = logdensityof(d, [1.0, 4.0])"
@@ -214,18 +206,16 @@ fn a_matrix_variate_refuses_rather_than_taking_the_scalar_derivation() {
     // requires "The type of `x` must match the element type of set `S`". `is_flatpdl`
     // is phase/type-based and accepted both. §06 case 1 names no matrix-variate
     // forward map, so refuse.
-    for base in [
-        "Wishart(nu = 5.0, scale = rowstack([[1.0, 0.0], [0.0, 1.0]]))",
-        "LKJ(n = 2, eta = 1.5)",
-    ] {
-        let reason = refusal(&format!(
-            "d = pushfwd(exp, {base})\nlp = logdensityof(d, [[1.0, 0.0], [0.0, 1.0]])"
-        ));
-        assert!(
-            reason.contains("variate is a matrix"),
-            "`{base}` must refuse on the matrix variate, got: {reason}"
-        );
-    }
+    // `LKJ`'s support is lower-dimensional, and refuses for that first
+    // (`pushfwd_lower_dimensional_golden.rs`).
+    let base = "Wishart(nu = 5.0, scale = rowstack([[1.0, 0.0], [0.0, 1.0]]))";
+    let reason = refusal(&format!(
+        "d = pushfwd(fn(exp.(_)), {base})\nlp = logdensityof(d, [[1.0, 0.0], [0.0, 1.0]])"
+    ));
+    assert!(
+        reason.contains("variate is a matrix"),
+        "`{base}` must refuse on the matrix variate, got: {reason}"
+    );
 }
 
 #[test]
@@ -233,16 +223,37 @@ fn the_matrix_refusal_leaves_the_scalar_and_vector_ranks_alone() {
     // The regression half: the guard keys on rank 2, so rank 0 and rank 1 must still
     // lower. Without this the refusal could be unconditional and the test above would
     // still pass.
-    for (base, point) in [
-        ("Normal(mu = 0.0, sigma = 1.0)", "0.5"),
-        ("iid(Normal(mu = 0.0, sigma = 1.0), 3)", "[0.5, 0.6, 0.7]"),
+    for (map, base, point) in [
+        ("exp", "Normal(mu = 0.0, sigma = 1.0)", "0.5"),
+        (
+            "fn(exp.(_))",
+            "iid(Normal(mu = 0.0, sigma = 1.0), 3)",
+            "[0.5, 0.6, 0.7]",
+        ),
     ] {
         let out = lp(&format!(
-            "d = pushfwd(exp, {base})\nlp = logdensityof(d, {point})"
+            "d = pushfwd({map}, {base})\nlp = logdensityof(d, {point})"
         ));
         assert!(
             out.contains("builtin_logdensityof Normal"),
             "`{base}` must still lower:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn a_scalar_name_over_a_vector_refuses_naming_the_written_form() {
+    // A bare name is no call, so §04 broadcasting does not reach it.
+    for (name, base) in [
+        ("exp", "iid(Normal(mu = 0.0, sigma = 1.0), 3)"),
+        ("log", "Dirichlet(alpha = [2.0, 3.0, 4.0])"),
+    ] {
+        let reason = refusal(&format!(
+            "d = pushfwd({name}, {base})\nlp = logdensityof(d, [0.2, 0.3, 0.5])"
+        ));
+        assert!(
+            reason.contains(&format!("Write the elementwise map `fn({name}.(_))`")),
+            "`{name}` over `{base}`: {reason}"
         );
     }
 }

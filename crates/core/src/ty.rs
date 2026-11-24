@@ -207,6 +207,23 @@ pub enum ValueSet {
 }
 
 impl ValueSet {
+    /// The dimensions this set lacks against its scalar cell count: one per
+    /// `stdsimplex(n)`/`zerosum(n)` factor, whose §03 reference measure is the
+    /// coordinate Lebesgue measure of its n − 1 free coordinates. `None` for
+    /// such a factor repeated a dynamic number of times.
+    pub fn chart_deficit(&self) -> Option<u64> {
+        match self {
+            ValueSet::StdSimplex(_) | ValueSet::ZeroSum(_) => Some(1),
+            ValueSet::CartPow(inner, n) => match (inner.chart_deficit()?, n) {
+                (0, _) => Some(0),
+                (d, Dim::Static(n)) => Some(d * u64::from(*n)),
+                (_, Dim::Dynamic) => None,
+            },
+            ValueSet::CartProd(parts) => parts.iter().map(ValueSet::chart_deficit).sum(),
+            _ => Some(0),
+        }
+    }
+
     /// The **natural extent** of a type: the maximal set its values inhabit
     /// (`(%scalar real)` → `reals`, a 1-D real array → `cartpow(reals, n)`,
     /// a measure → its domain's extent). `Unknown` for non-value types

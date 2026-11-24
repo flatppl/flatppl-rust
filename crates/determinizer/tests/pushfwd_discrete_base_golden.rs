@@ -193,7 +193,7 @@ fn pushfwd_over_discrete_vector_variate_base_emits_no_volume_term() {
     // product measures": the product of the per-component references) — again no
     // volume element.
     let discrete = lp(
-        "d = pushfwd(exp, Multinomial(n = 5, p = [0.2, 0.8]))\nlp = logdensityof(d, [1.0, 4.0])",
+        "d = pushfwd(fn(exp.(_)), Multinomial(n = 5, p = [0.2, 0.8]))\nlp = logdensityof(d, [1.0, 4.0])",
     );
     assert!(
         discrete.contains("builtin_logdensityof Multinomial"),

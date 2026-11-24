@@ -1,6 +1,7 @@
 //! `pushfwd(f, M)` with a built-in function named as the map (§06: engines
 //! recognize the bijections by name): the variate's type is the call of `f`
 //! at M's domain, the rule `weighted` already applies to a built-in weight.
+//! A name whose §07 domain is a scalar is no map of an array variate.
 
 use flatppl_core::{Dim, ScalarType, Type};
 use flatppl_infer::{Severity, infer};
@@ -45,27 +46,70 @@ fn a_builtin_map_of_an_integer_base_keeps_its_integer_type() {
     assert_eq!(d, Some(Type::Scalar(ScalarType::Integer)));
 }
 
+/// The error messages inference reports for `source`.
+fn errors(source: &str) -> Vec<String> {
+    let mut module = flatppl_syntax::parse(source).unwrap();
+    infer(&mut module)
+        .into_iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message)
+        .collect()
+}
+
 #[test]
-fn a_builtin_map_over_a_vector_law_applies_per_cell() {
-    // §06 has no sentence for a bare scalar name over an array law; the
-    // determinizer reads it elementwise, and inference types it the same way:
-    // the variate of `broadcast(f, x)`.
+fn a_scalar_builtin_map_over_an_array_law_is_an_error() {
+    // A bare name is no call, so §04 broadcasting does not apply to it: the
+    // elementwise map is written `fn(f.(_))`, and the error names that form.
+    // A `bijection`'s forward is the same map.
+    for (source, name) in [
+        ("M = pushfwd(exp, iid(Normal(0, 1), 3))", "exp"),
+        (
+            "M = pushfwd(exp, MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])))",
+            "exp",
+        ),
+        ("M = pushfwd(log, Dirichlet([1.0, 2.0]))", "log"),
+        ("M = pushfwd(exp, iid(Normal(0, 1), [2, 3]))", "exp"),
+        (
+            "M = pushfwd(bijection(exp, log, fn(sum(_))), iid(Normal(0, 1), 3))",
+            "exp",
+        ),
+        (
+            "b = bijection(log, exp, fn(neg(sum(log.(_)))))\nM = pushfwd(b, iid(Gamma(2, 1), 3))",
+            "log",
+        ),
+    ] {
+        let errors = errors(source);
+        let hint = format!("Write the elementwise map `fn({name}.(_))`");
+        assert!(
+            errors.iter().any(|m| m.contains(&hint)),
+            "{source}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn the_written_elementwise_map_types_per_cell() {
     let real = |n| Type::Array {
         shape: vec![Dim::Static(n)].into(),
         elem: Box::new(Type::Scalar(ScalarType::Real)),
     };
     for (source, want) in [
-        ("M = pushfwd(exp, iid(Normal(0, 1), 3))", real(3)),
+        ("M = pushfwd(fn(exp.(_)), iid(Normal(0, 1), 3))", real(3)),
+        ("M = pushfwd(fn(log.(_)), Dirichlet([1.0, 2.0]))", real(2)),
         (
-            "M = pushfwd(exp, MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])))",
-            real(2),
+            "M = pushfwd(bijection(fn(exp.(_)), fn(log.(_)), fn(sum(_))), iid(Normal(0, 1), 3))",
+            real(3),
         ),
-        ("M = pushfwd(exp, Dirichlet([1.0, 2.0]))", real(2)),
     ] {
         let (d, error) = domain(source);
         assert!(!error, "{source}");
         assert_eq!(d, Some(want), "{source}");
     }
+}
+
+#[test]
+fn an_array_domain_builtin_map_over_a_vector_law_takes_the_whole_variate() {
+    // `neg` has an array domain (§07), so it is called with the whole variate.
     let (d, error) = domain("M = pushfwd(neg, iid(Poisson(3.0), 3))");
     assert!(!error);
     assert_eq!(
@@ -73,21 +117,6 @@ fn a_builtin_map_over_a_vector_law_applies_per_cell() {
         Some(Type::Array {
             shape: vec![Dim::Static(3)].into(),
             elem: Box::new(Type::Scalar(ScalarType::Integer)),
-        })
-    );
-}
-
-#[test]
-fn a_builtin_map_over_a_matrix_law_types_as_its_elementwise_form() {
-    // Any array variate types as `exp.(_)` does; whether a matrix lowers is
-    // the determinizer's call (it refuses, as for the written form).
-    let (d, error) = domain("M = pushfwd(exp, iid(Normal(0, 1), [2, 3]))");
-    assert!(!error);
-    assert_eq!(
-        d,
-        Some(Type::Array {
-            shape: vec![Dim::Static(2), Dim::Static(3)].into(),
-            elem: Box::new(Type::Scalar(ScalarType::Real)),
         })
     );
 }
@@ -119,14 +148,8 @@ fn a_builtin_map_with_an_array_domain_takes_the_whole_variate() {
 
 #[test]
 fn a_two_argument_name_over_a_vector_law_is_an_arity_error() {
-    // Not a one-argument scalar function, so no per-cell reading: the call
-    // check reports the arity, as on main.
-    let mut module = flatppl_syntax::parse("M = pushfwd(atan2, iid(Normal(0, 1), 3))").unwrap();
-    let errors: Vec<String> = infer(&mut module)
-        .into_iter()
-        .filter(|d| d.severity == Severity::Error)
-        .map(|d| d.message)
-        .collect();
+    // Not a one-argument scalar function: the call check reports the arity.
+    let errors = errors("M = pushfwd(atan2, iid(Normal(0, 1), 3))");
     assert!(
         errors
             .iter()
@@ -151,8 +174,8 @@ fn a_distribution_name_as_the_map_keeps_main_typing() {
 
 #[test]
 fn a_builtin_map_over_a_nested_array_or_a_record_is_an_error() {
-    // A nested array fails as `exp.(_)` does (a cell is a vector); a record is
-    // no array, so the call check applies.
+    // A nested array is an array variate, and `exp.(_)` fails on it too (a
+    // cell is a vector); a record is no array, so the call check applies.
     let nested = "M = pushfwd(exp, iid(iid(Normal(0, 1), 2), 3))";
     let written = "M = pushfwd(fn(exp.(_)), iid(iid(Normal(0, 1), 2), 3))";
     for source in [nested, written, "M = pushfwd(exp, joint(a = Normal(0, 1)))"] {

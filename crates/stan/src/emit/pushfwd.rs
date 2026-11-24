@@ -11,7 +11,7 @@ use super::structure::Law;
 use super::{Emitter, Ex, P_ADD, P_ATOM, P_MUL, P_UNARY};
 use crate::refuse::{Refusal, RefusalKind, Result};
 use crate::stan_type::{bounds_of, number};
-use flatppl_core::{Node, NodeId, Phase, Ref, RefNs, Scalar, Type};
+use flatppl_core::{Node, NodeId, Phase, Ref, RefNs, Scalar};
 
 /// A coefficient of the map: its number when it folds, its Stan text, and
 /// whether that text is an integer in Stan. FlatPPL's `/` is real division,
@@ -663,8 +663,68 @@ impl<'m> Emitter<'m> {
         Ok((body, x, base))
     }
 
+    /// `pushfwd(f, M)` of a law on a lower-dimensional support has a density
+    /// only where §03 and §06 fix the image's reference measure: a uniform
+    /// scale and shift of a `stdsimplex(n)` or `zerosum(n)` support. The
+    /// support is read by `flatppl_infer::measure_chart`, as in the determinizer:
+    /// a map's base through any depth, `LKJ` and `LKJCholesky` by name.
+    fn lower_dimensional(&mut self, m: NodeId) -> Result<()> {
+        use flatppl_infer::MeasureChart;
+        let Some(c) = self.call(m).filter(|_| self.head(m) == Some("pushfwd")) else {
+            return Ok(());
+        };
+        let [f, base] = c.args[..] else {
+            return Ok(());
+        };
+        // A point mass beside a continuous law keeps the mixture refusals of its
+        // own law (`mixture.rs`), so it never reaches a volume element here.
+        let chart = match flatppl_infer::measure_chart(self.m, base) {
+            MeasureChart::Deficit(0) | MeasureChart::PointMass | MeasureChart::PointMassMix => {
+                return Ok(());
+            }
+            MeasureChart::Deficit(_) => true,
+            MeasureChart::NoReference | MeasureChart::MixedDimension => false,
+        };
+        if chart && self.uniform_affine(f)? {
+            return Ok(());
+        }
+        Err(Refusal::new(
+            RefusalKind::NonBijectivePushfwd,
+            Some(m),
+            "pushfwd",
+            "the image of a law on a lower-dimensional support has no density: §03 and §06 fix \
+             its reference measure only for a stdsimplex(n) or zerosum(n) support under a \
+             uniform scale and shift (a .* x .+ b, scalar a)",
+        ))
+    }
+
+    /// `true` when `f` is `neg` or one of the uniform affine maps the determinizer
+    /// derives (`flatppl_infer::uniform_affine_steps`), so one map takes one class.
+    fn uniform_affine(&mut self, f: NodeId) -> Result<bool> {
+        if let Node::Const(name) = self.m.node(self.resolve(f)) {
+            return Ok(self.name(*name) == "neg");
+        }
+        let Some(fun) = self.user_callee(f) else {
+            return Ok(false);
+        };
+        let (body, entries) = self.callable_parts(fun)?;
+        let [(_, x)] = entries[..] else {
+            return Ok(false);
+        };
+        Ok(flatppl_infer::uniform_affine_steps(
+            self.m,
+            body,
+            &|n| self.resolve(n),
+            &|n| matches!(self.m.node(n), Node::Ref(r) if *r == x),
+            &|n| self.reads(n, x),
+            &|n| self.shape(n).is_some_and(|s| s.rank == 0),
+        )
+        .is_some())
+    }
+
     /// The bijection of `pushfwd(f, M)` and M.
     fn bijection(&mut self, m: NodeId) -> Result<(Bijection, NodeId)> {
+        self.lower_dimensional(m)?;
         // A built-in name as the map (`pushfwd(log, M)`, §06: engines
         // recognize the maps by name) is the one-step chain of that map.
         if !self.derived.contains_key(&m)
@@ -673,21 +733,10 @@ impl<'m> Emitter<'m> {
             && c.named.is_empty()
             && let Node::Const(name) = self.m.node(self.resolve(f))
         {
-            let name = self.name(*name);
-            // Over an array variate a scalar map applies per cell, as its
-            // written form `fn(broadcast(name, _))` does, which this emitter
-            // does not write yet either. `neg` and a name outside the
+            // A scalar-domain name over an array variate is an inference
+            // error, written `fn(name.(_))`. `neg` and a name outside the
             // registry take the path of `fn(name(_))`.
-            let scalar_map = name == "sqrt" || STEPS.iter().any(|r| r.name == name);
-            if scalar_map
-                && !matches!(self.m.type_of(base), Some(Type::Measure { domain, .. })
-                    if matches!(**domain, Type::Scalar(_)))
-            {
-                return Err(Refusal::not_yet(
-                    Some(m),
-                    format!("pushfwd through `{name}` applied per cell of a law over arrays"),
-                ));
-            }
+            let name = self.name(*name);
             let step = match name {
                 "sqrt" => Step::Pow(0.5),
                 "neg" => Step::Affine(Affine {
