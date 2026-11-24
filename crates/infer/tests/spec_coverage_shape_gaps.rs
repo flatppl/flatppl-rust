@@ -732,14 +732,13 @@ fn cat_and_tile_preserve_kind_and_rank() {
     );
     let out = ir("a = [1.0, 2.0]\nx = tile(a, 3)");
     assert!(
-        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(tile"),
-        "tile(vector) should stay a rank-1 real vector, got:\n{out}"
+        out.contains("(%array 1 (6) (%scalar real))") && out.contains("(tile"),
+        "tile(vector) should infer six elements, got:\n{out}"
     );
-    let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nx = tile(A, [2, 2])");
+    let out = ir("a = rowstack([[1.0, 2.0], [3.0, 4.0]])\nx = tile(a, [2, 3])");
     assert!(
-        out.contains("(%array 1 (%dynamic) (%array 1 (%dynamic) (%scalar real)))")
-            && out.contains("(tile"),
-        "tile(matrix) should stay a rank-2 (nested) real matrix, got:\n{out}"
+        out.contains("(%array 2 (4 6) (%scalar real))") && out.contains("(tile"),
+        "tile(matrix) should infer the repeated axes, got:\n{out}"
     );
 }
 
@@ -828,13 +827,12 @@ fn aggregate_resolves_exact_einsum_dims() {
 fn partition_and_selectbins_infer() {
     let out = ir("xs = [1.0, 2.0, 3.0, 4.0]\np = partition(xs, 2)");
     assert!(
-        out.contains("(%array 1 (%dynamic) (%array 1 (%dynamic) (%scalar real)))")
-            && out.contains("(partition"),
+        out.contains("(%array 1 (2) (%array 1 (2) (%scalar real)))") && out.contains("(partition"),
         "partition should infer a vector of real sub-vectors, got:\n{out}"
     );
-    let out = ir("e = [0.0, 1.0, 2.0]\nc = [5.0, 7.0]\nr = selectbins(e, interval(0.0, 1.0), c)");
+    let out = ir("e = [0.0, 1.0, 2.0]\nc = [5.0, 7.0]\nr = selectbins(e, interval(0.0, 0.75), c)");
     assert!(
-        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(selectbins"),
+        out.contains("(%array 1 (1) (%scalar real))") && out.contains("(selectbins"),
         "selectbins should infer a shorter real count array, got:\n{out}"
     );
 }
@@ -895,7 +893,7 @@ fn ext_linalg_record_results_infer() {
     let out = ir(&format!("{pre}d = e.svd(A)"));
     assert!(
         out.contains("(%record (U (%array 2")
-            && out.contains("(S (%array 1 (%dynamic) (%scalar real)))")
+            && out.contains("(S (%array 1 (2) (%scalar real)))")
             && out.contains("(V (%array 2"),
         "svd should infer record(U: matrix, S: real vector, V: matrix), got:\n{out}"
     );

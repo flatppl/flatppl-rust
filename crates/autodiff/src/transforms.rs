@@ -23,6 +23,11 @@ pub(super) fn args(
     let (rule, fields): (&str, &[&str]) = match (op, module.resolve(*kernel)) {
         ("builtin_touniform", "Normal") => ("Normal CDF", normal),
         ("builtin_touniform", "Cauchy") => ("Cauchy CDF", cauchy),
+        ("builtin_touniform", "Exponential") => ("Exponential CDF", &["rate"]),
+        ("builtin_touniform", "Logistic") => ("Logistic CDF", &["mu", "s"]),
+        ("builtin_touniform", "LogNormal") => ("LogNormal CDF", normal),
+        ("builtin_tonormal", "LogNormal") => ("LogNormal to normal", normal),
+        ("builtin_fromnormal", "LogNormal") => ("LogNormal from normal", normal),
         ("builtin_tonormal", "Normal") => ("Normal to normal", normal),
         ("builtin_fromnormal", "Normal") => ("Normal from normal", normal),
         ("builtin_fromuniform", "Cauchy") => ("Cauchy quantile", cauchy),

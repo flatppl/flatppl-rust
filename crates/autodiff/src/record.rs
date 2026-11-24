@@ -20,11 +20,7 @@ pub(super) fn is_differentiable(ty: &Type) -> bool {
             nrows: Dim::Static(_),
             ..
         } => table::columns(ty).is_some_and(|columns| fields_are_differentiable(&columns)),
-        _ => {
-            tensor::real_shape_of(ty).is_some()
-                || tensor::nested_vector_type(ty).is_some()
-                || tensor::vector_of_arrays(ty).is_some()
-        }
+        _ => tensor::real_shape_of(ty).is_some() || tensor::array_of_arrays(ty).is_some(),
     }
 }
 

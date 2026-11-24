@@ -110,7 +110,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: logistic_logpdf,
             sample: Some(logistic_sample),
-            touniform: None,
+            touniform: Some(logistic_cdf),
             broadcast: Broadcast::Elementwise,
         },
     ),
@@ -128,7 +128,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: exponential_logpdf,
             sample: Some(exponential_sample),
-            touniform: None,
+            touniform: Some(exponential_cdf),
             broadcast: Broadcast::Elementwise,
         },
     ),
@@ -191,7 +191,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: lognormal_logpdf,
             sample: Some(lognormal_sample),
-            touniform: None,
+            touniform: Some(lognormal_cdf),
             broadcast: Broadcast::Elementwise,
         },
     ),
@@ -936,8 +936,10 @@ pub(crate) fn lower_transport(
     }
     if !matches!(
         (head, ctor.as_str()),
-        ("builtin_tonormal" | "builtin_fromnormal", "Normal")
-            | ("builtin_fromuniform", "Cauchy" | "Exponential" | "Logistic")
+        (
+            "builtin_tonormal" | "builtin_fromnormal",
+            "Normal" | "LogNormal"
+        ) | ("builtin_fromuniform", "Cauchy" | "Exponential" | "Logistic")
     ) {
         return Err(EmitError::at(
             id,
@@ -1007,6 +1009,28 @@ pub(crate) fn lower_transport(
             let sigma = scalar_param(e, "sigma")?;
             let scaled = e.mul(&sigma, &x);
             Ok(e.add(&mu, &scaled))
+        }
+        ("builtin_tonormal", "LogNormal") => {
+            let mu = scalar_param(e, "mu")?;
+            let sigma = scalar_param(e, "sigma")?;
+            let zero = e.scalar(0.0);
+            let positive = e.compare("GT", &x, &zero);
+            let one = e.scalar(1.0);
+            let safe = e.select(&positive, &x, &one);
+            let log_x = e.log(&safe);
+            let difference = e.sub(&log_x, &mu);
+            let normal = e.div(&difference, &sigma);
+            let outside = e.scalar(f64::NEG_INFINITY);
+            let result = e.select(&positive, &normal, &outside);
+            let nan = e.compare("NE", &x, &x);
+            Ok(e.select(&nan, &x, &result))
+        }
+        ("builtin_fromnormal", "LogNormal") => {
+            let mu = scalar_param(e, "mu")?;
+            let sigma = scalar_param(e, "sigma")?;
+            let scaled = e.mul(&sigma, &x);
+            let exponent = e.add(&mu, &scaled);
+            Ok(e.exp(&exponent))
         }
         ("builtin_fromuniform", "Exponential") => {
             let rate = scalar_param(e, "rate")?;
@@ -1578,6 +1602,36 @@ fn cauchy_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
 /// §08 Logistic, verbatim: with `u = (x - mu) / s`, `log f = -u - log(s) -
 /// 2 * log(1 + exp(-u))`.
+fn lognormal_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
+    let zero = e.scalar(0.0);
+    let positive = e.compare("GT", x, &zero);
+    let one = e.scalar(1.0);
+    let safe = e.select(&positive, x, &one);
+    let log_x = e.log(&safe);
+    let cdf = normal_cdf(e, p, &log_x)?;
+    let result = e.select(&positive, &cdf, &zero);
+    let nan = e.compare("NE", x, x);
+    Ok(e.select(&nan, x, &result))
+}
+
+fn logistic_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
+    let mu = p.get(e, "mu")?;
+    let scale = p.get(e, "s")?;
+    let difference = e.sub(x, &mu);
+    let z = e.div(&difference, &scale);
+    Ok(e.invlogit(&z))
+}
+
+fn exponential_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
+    let rate = p.get(e, "rate")?;
+    let zero = e.scalar(0.0);
+    let nonnegative = e.max(x, &zero);
+    let scaled = e.mul(&rate, &nonnegative);
+    let negative = e.neg(&scaled);
+    let survival_delta = e.expm1(&negative);
+    Ok(e.neg(&survival_delta))
+}
+
 fn logistic_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let s = p.get(e, "s")?;

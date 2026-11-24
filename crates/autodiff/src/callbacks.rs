@@ -13,7 +13,10 @@ use flatppl_core::{
 
 use crate::{Query, affine_scan, metric, probability_scan, recurrence, tensor};
 
-pub(super) fn legalize(module: &Module, query: &Query<'_>) -> Option<Module> {
+pub(super) fn legalize(
+    module: &Module,
+    query: &Query<'_>,
+) -> Option<(Module, HashMap<NodeId, NodeId>)> {
     // Avoid cloning the arena when no supported expansion occurs.
     if !(0..module.node_count()).any(|index| {
         let id = NodeId::from_usize(index);
@@ -23,7 +26,7 @@ pub(super) fn legalize(module: &Module, query: &Query<'_>) -> Option<Module> {
         {
             return true;
         }
-        if normal_row_operands(module, id).is_some() {
+        if normal_row_operands(module, id).is_some() || retained_spline(module, id).is_some() {
             return true;
         }
         expect_builtin_call(module, id, "broadcast")
@@ -41,17 +44,21 @@ pub(super) fn legalize(module: &Module, query: &Query<'_>) -> Option<Module> {
         module: &mut module,
         visited: HashSet::new(),
         rewritten: HashMap::new(),
+        splines: HashMap::new(),
         inputs: &query.inputs,
         changed: false,
     };
     walker.binding(query.output, 0);
-    walker.changed.then_some(module)
+    let changed = walker.changed || !walker.splines.is_empty();
+    let splines = walker.splines;
+    changed.then_some((module, splines))
 }
 
 struct Walker<'a> {
     module: &'a mut Module,
     visited: HashSet<BindingId>,
     rewritten: HashMap<NodeId, NodeId>,
+    splines: HashMap<NodeId, NodeId>,
     inputs: &'a HashSet<BindingId>,
     changed: bool,
 }
@@ -99,7 +106,7 @@ impl Walker<'_> {
                     }
                     rebuilt
                 };
-                lift_broadcast(self.module, self.inputs, current)
+                let replacement = lift_broadcast(self.module, self.inputs, current)
                     .or_else(|| lift_matrix_vector_map(self.module, self.inputs, current))
                     .or_else(|| expand_static_cells(self.module, self.inputs, current))
                     .or_else(|| metric::lower(self.module, current))
@@ -107,13 +114,43 @@ impl Walker<'_> {
                     .or_else(|| affine_scan::square_scan(self.module, self.inputs, current))
                     .or_else(|| probability_scan::projection(self.module, self.inputs, current))
                     .or_else(|| affine_scan::residual_projection(self.module, self.inputs, current))
-                    .unwrap_or(current)
+                    .unwrap_or(current);
+                if let Some(expanded) = expand_spline(self.module, replacement) {
+                    self.splines.insert(replacement, expanded);
+                }
+                replacement
             }
             _ => node,
         };
         self.rewritten.insert(node, replacement);
         replacement
     }
+}
+
+fn retained_spline(module: &Module, node: NodeId) -> Option<(String, Vec<NodeId>)> {
+    let Node::Call(call) = module.node(node) else {
+        return None;
+    };
+    let CallHead::User(callee) = call.head else {
+        return None;
+    };
+    if call.inputs.is_some() || !call.named.is_empty() {
+        return None;
+    }
+    let (module, member) = flatppl_determinizer::standard_function(module, callee)?;
+    (module == "splines" && !member.starts_with("thinplate_")).then(|| (member, call.args.to_vec()))
+}
+
+fn expand_spline(module: &mut Module, node: NodeId) -> Option<NodeId> {
+    let (member, args) = retained_spline(module, node)?;
+    let expected = module.type_of(node)?.clone();
+    let (result, _) = flatppl_determinizer::expand_spline(module, &args, &member)?;
+    let result = if member == "bspline_penalty" {
+        build_call(module, "rowstack", &[result])
+    } else {
+        result
+    };
+    annotate_equivalent(module, result, &expected)
 }
 
 fn normal_row_operands(module: &Module, node: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
@@ -464,6 +501,22 @@ impl Scope<'_> {
         layout: EventLayout,
         width: u32,
     ) -> Option<Vec<Cell>> {
+        if let Some(root) = resolve_unpromoted(self.module, self.inputs, value)
+            && let Some(call) = expect_builtin_call(self.module, root, "addaxes")
+            && let [operand, leading, trailing] = *call.args
+            && let Some(Type::Array {
+                shape: input_shape, ..
+            }) = self.module.type_of(operand)
+            && input_shape.len() < shape.len()
+        {
+            let input_shape = input_shape.to_vec();
+            let mut cells = self.nested_components(operand, &input_shape, layout, width)?;
+            for cell in &mut cells {
+                cell.value = build_call(self.module, "addaxes", &[cell.value, leading, trailing]);
+                cell.shape = shape.to_vec();
+            }
+            return Some(cells);
+        }
         let m = &mut *self.module;
         if let Some(root) = resolve_unpromoted(m, self.inputs, value)
             && let Some(whole) = repeated_value(m, root, shape)
@@ -672,6 +725,13 @@ impl Scope<'_> {
             "in" => return self.membership(&call.args),
             "logsumexp" => return self.logsumexp(&call.args),
             "sum" => return self.sum(&call.args),
+            "l2norm" => return self.euclidean_norm(&call.args),
+            "mul"
+                if matches!(call.args.as_ref(), [left, _]
+                if expect_builtin_call(self.module, self.resolve_structure(*left), "transpose").is_some()) =>
+            {
+                return self.inner_product(&call.args);
+            }
             "polynomial" => return self.polynomial(&call.args),
             "builtin_touniform"
             | "%log_cdf_difference"
@@ -1251,6 +1311,51 @@ impl Scope<'_> {
         let mut terms = self.vector(values)?.cells.into_iter();
         let first = terms.next()?;
         terms.try_fold(first, |a, b| self.pointwise_call("add", vec![a, b]))
+    }
+
+    fn inner_product(&mut self, args: &[NodeId]) -> Option<Cell> {
+        let [left, right] = *args else {
+            return None;
+        };
+        let transpose =
+            expect_builtin_call(self.module, self.resolve_structure(left), "transpose")?;
+        let [left] = *transpose.args else {
+            return None;
+        };
+        let left = self.vector(left)?.into_vector()?;
+        let right = self.vector(right)?.into_vector()?;
+        self.sum_products(left, right)
+    }
+
+    fn euclidean_norm(&mut self, args: &[NodeId]) -> Option<Cell> {
+        let [input] = *args else {
+            return None;
+        };
+        let input = self.vector(input)?.into_vector()?;
+        let squares = self.sum_products(input.clone(), input)?;
+        // Match l2norm's zero subgradient without evaluating sqrt's derivative
+        // at zero on diagonal pairs or at coincident observations.
+        let is_zero = self.pointwise_call("iszero", vec![squares.clone()])?;
+        self.shared.insert(squares.value);
+        self.shared.insert(is_zero.value);
+        let one = Cell::scalar(crate::real(self.module, 1.0));
+        let zero = Cell::scalar(crate::real(self.module, 0.0));
+        let safe = self.pointwise_call("ifelse", vec![is_zero.clone(), one, squares])?;
+        let norm = self.pointwise_call("sqrt", vec![safe])?;
+        self.pointwise_call("ifelse", vec![is_zero, zero, norm])
+    }
+
+    fn sum_products(&mut self, left: Vec<Cell>, right: Vec<Cell>) -> Option<Cell> {
+        if left.len() != right.len() {
+            return None;
+        }
+        let mut operands = left.into_iter().zip(right);
+        let (left, right) = operands.next()?;
+        let first = self.pointwise_call("mul", vec![left, right])?;
+        operands.try_fold(first, |sum, (left, right)| {
+            let product = self.pointwise_call("mul", vec![left, right])?;
+            self.pointwise_call("add", vec![sum, product])
+        })
     }
 
     fn density(&mut self, args: &[NodeId]) -> Option<Cell> {

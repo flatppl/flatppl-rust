@@ -1,6 +1,5 @@
 data {
-  int<lower=0> N;
-  array[2, N] int y;
+  array[2, 3] int y;
 }
 parameters {
   vector[3] q;

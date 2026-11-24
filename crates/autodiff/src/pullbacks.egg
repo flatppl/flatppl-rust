@@ -5,9 +5,11 @@
   (Bar)
   (ZeroOut)
   (GammaShape)
+  (BetaShape i64)
   (Fill Expr i64)
   (MeanFill Expr i64)
   (LogSumExp i64)
+  (CumulativeProduct i64)
   (CumulativeExtreme i64)
   (CumulativeExtremeForward i64)
   (Pick Expr i64)
@@ -23,11 +25,18 @@
   (DropAxes Expr)
   (ArrayPullback Expr)
   (Scatter Expr i64)
-  (BesselOrder Expr Expr)
+  (ArrayShapePullback i64)
+  (ArrayShapePushforward)
+  (BesselOrder String Expr Expr)
+  (AirySlope Expr)
+  (BesselKOrder String Expr Expr)
+  (BesselYOrder Expr Expr)
+  (SpectralProduct i64 i64)
   (ForwardCall String i64)
   (Insert i64)
   (Int i64)
   (Real f64)
+  (ParticleScore i64)
   (MathDot Expr Expr)
   (SampleDegrees)
   (ProductPartials)
@@ -45,6 +54,12 @@
   (IdentityLike i64)
   (DetCofactors)
   (MatrixExpFrechet Expr Expr)
+  (KronPart i64 i64)
+  (FactorSolvePart i64 i64)
+  (FactorizationPart i64)
+  (SpectrumPart i64)
+  (EigenProjectionPart i64)
+  (ComplexExponentialPart i64 i64)
   (TriangleHalf Expr)
   (Symmetric Expr)
   (Unary String Expr)
@@ -131,18 +146,56 @@
   (Binary "mul" (Bar) (SpecialBinary "polygamma" (Binary "add" (Arg 0) (Int 1)) (Arg 1)))
   :ruleset pullbacks)
 
-; DLMF 10.6.1. Project the principal branch after shifting the order so
-; the same formula also differentiates the real projection along z < 0.
-(rewrite (Pullback "real Bessel J" 2 1)
-  (Binary "mul" (Bar) (Binary "mul" (Real 0.5)
-    (Binary "sub"
-      (Unary "real" (SpecialBinary "bessel_j" (Binary "sub" (Arg 0) (Real 1.0)) (Arg 1)))
-      (Unary "real" (SpecialBinary "bessel_j" (Binary "add" (Arg 0) (Real 1.0)) (Arg 1)))))) :ruleset pullbacks)
+(rewrite (Pullback "bessel_y" 2 1)
+  (Binary "mul" (Bar) (Binary "mul" (Real 0.5) (Binary "sub"
+      (SpecialBinary "bessel_y" (Binary "sub" (Arg 0) (Real 1.0)) (Arg 1))
+      (SpecialBinary "bessel_y" (Binary "add" (Arg 0) (Real 1.0)) (Arg 1))))) :ruleset pullbacks)
+(rewrite (Pullback "bessel_k" 2 1)
+  (Binary "mul" (Bar) (Unary "neg" (Binary "mul" (Real 0.5) (Binary "add"
+      (SpecialBinary "bessel_k" (Binary "sub" (Arg 0) (Real 1.0)) (Arg 1))
+      (SpecialBinary "bessel_k" (Binary "add" (Arg 0) (Real 1.0)) (Arg 1)))))) :ruleset pullbacks)
+(rewrite (Pullback "bessel_k_scaled" 2 1)
+  (Binary "mul" (Bar) (Binary "sub" (Out) (Binary "mul" (Real 0.5) (Binary "add"
+      (SpecialBinary "bessel_k_scaled" (Binary "sub" (Arg 0) (Real 1.0)) (Arg 1))
+      (SpecialBinary "bessel_k_scaled" (Binary "add" (Arg 0) (Real 1.0)) (Arg 1)))))) :ruleset pullbacks)
+(rewrite (Pullback "log_bessel_i" 2 1)
+  (Binary "mul" (Bar)
+    (Binary "add"
+      (Ternary "ifelse" (Unary "iszero" (Arg 0)) (Real 0.0)
+        (Binary "divide" (Arg 0) (Arg 1)))
+      (Ternary "ifelse" (Unary "iszero" (Arg 1)) (Real 0.0)
+        (Unary "exp" (Binary "sub"
+          (SpecialBinary "log_bessel_i" (Binary "add" (Arg 0) (Real 1.0)) (Arg 1))
+          (Out))))))
+  :ruleset pullbacks)
+(rewrite (Pullback "log_bessel_k" 2 1)
+  (Unary "neg" (Binary "mul" (Bar) (Binary "mul" (Real 0.5)
+    (Binary "add"
+      (Unary "exp" (Binary "sub" (SpecialBinary "log_bessel_k" (Binary "sub" (Arg 0) (Real 1.0)) (Arg 1)) (Out)))
+      (Unary "exp" (Binary "sub" (SpecialBinary "log_bessel_k" (Binary "add" (Arg 0) (Real 1.0)) (Arg 1)) (Out))))))) :ruleset pullbacks)
 
-(rewrite (Pullback "bounded real Bessel J" 2 0)
-  (Binary "mul" (Bar) (BesselOrder (Arg 0) (Arg 1))) :ruleset pullbacks)
-(rewrite (Pullback "bounded real Bessel J" 2 1)
-  (Pullback "real Bessel J" 2 1) :ruleset pullbacks)
+(rewrite (Pullback "bounded log Bessel I" 2 0)
+  (Binary "mul" (Bar) (BesselOrder "i-log" (Arg 0) (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "bounded log Bessel I" 2 1)
+  (Pullback "log_bessel_i" 2 1) :ruleset pullbacks)
+(rewrite (Pullback "bounded Bessel Y" 2 0)
+  (Binary "mul" (Bar) (BesselYOrder (Arg 0) (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "bounded Bessel Y" 2 1)
+  (Pullback "bessel_y" 2 1) :ruleset pullbacks)
+(rewrite (Pullback "bounded Bessel K" 2 0)
+  (Binary "mul" (Bar) (BesselKOrder "bessel_k" (Arg 0) (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "bounded Bessel K" 2 1)
+  (Pullback "bessel_k" 2 1) :ruleset pullbacks)
+(rewrite (Pullback "bounded scaled Bessel K" 2 0)
+  (Binary "mul" (Bar) (BesselKOrder "bessel_k_scaled" (Arg 0) (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "bounded scaled Bessel K" 2 1)
+  (Pullback "bessel_k_scaled" 2 1) :ruleset pullbacks)
+(rewrite (Pullback "bounded log Bessel K" 2 0)
+  (Binary "mul" (Bar) (BesselKOrder "log_bessel_k" (Arg 0) (Arg 1))) :ruleset pullbacks)
+(rewrite (Pullback "bounded log Bessel K" 2 1)
+  (Pullback "log_bessel_k" 2 1) :ruleset pullbacks)
+
+(rewrite (Pullback "airy" 1 0) (Binary "mul" (Bar) (AirySlope (Arg 0))) :ruleset pullbacks)
 
 ; Normal log density argument order is (mu, sigma, observation).
 ; R is an internal template term for the standardized residual.
@@ -173,6 +226,15 @@
 (rewrite (Pullback "addaxes" 3 0) (DropAxes (Bar)) :ruleset pullbacks)
 (rewrite (Pullback "array" 3 0) (ArrayPullback (Bar)) :ruleset pullbacks)
 (rewrite (Pullback "fill" 2 0) (Unary "sum" (Bar)) :ruleset pullbacks)
+(rewrite (Pullback "tile" 2 0) (ArrayShapePullback 0) :ruleset pullbacks)
+(rewrite (Pullback "splitblocks" 2 0) (ArrayShapePullback 0) :ruleset pullbacks)
+(rewrite (Pullback "joinblocks" 1 0) (ArrayShapePullback 0) :ruleset pullbacks)
+(rewrite (Pullback "partition" 2 0) (ArrayShapePullback 0) :ruleset pullbacks)
+(rewrite (Pullback "bandedmat" 2 0) (ArrayShapePullback 0) :ruleset pullbacks)
+(rewrite (Pullback "blockdiagmat" 1 0) (ArrayShapePullback 0) :ruleset pullbacks)
+(rewrite (Pullback "blockdiag literal" arity slot) (ArrayShapePullback slot) :ruleset pullbacks)
+(rewrite (Pullback "selectbins" 3 2) (ArrayShapePullback 2) :ruleset pullbacks)
+(rewrite (Pullback "filter all" 1 0) (Bar) :ruleset pullbacks)
 (rewrite (Pullback "get" arity 0) (Scatter (Bar) 1) :ruleset pullbacks)
 (rewrite (Pullback "get0" arity 0) (Scatter (Bar) 0) :ruleset pullbacks)
 (rewrite (Pullback "matrix product" 2 0)
@@ -196,6 +258,14 @@
 (rewrite (Pushforward "array" 3 0) (ForwardCall "array" 0) :ruleset pullbacks)
 (rewrite (Pushforward "fill" 2 0) (ForwardCall "fill" 0) :ruleset pullbacks)
 (rewrite (Pushforward "addaxes" 3 0) (ForwardCall "addaxes" 0) :ruleset pullbacks)
+(rewrite (Pushforward "tile" 2 0) (ArrayShapePushforward) :ruleset pullbacks)
+(rewrite (Pushforward "splitblocks" 2 0) (ArrayShapePushforward) :ruleset pullbacks)
+(rewrite (Pushforward "joinblocks" 1 0) (ForwardCall "joinblocks" 0) :ruleset pullbacks)
+(rewrite (Pushforward "partition" 2 0) (ArrayShapePushforward) :ruleset pullbacks)
+(rewrite (Pushforward "bandedmat" 2 0) (ArrayShapePushforward) :ruleset pullbacks)
+(rewrite (Pushforward "blockdiagmat" 1 0) (ForwardCall "blockdiagmat" 0) :ruleset pullbacks)
+(rewrite (Pushforward "selectbins" 3 2) (ForwardCall "selectbins" 2) :ruleset pullbacks)
+(rewrite (Pushforward "filter all" 1 0) (Bar) :ruleset pullbacks)
 (rewrite (Pushforward "get" arity 0) (ForwardCall "get" 0) :ruleset pullbacks)
 (rewrite (Pushforward "get0" arity 0) (ForwardCall "get0" 0) :ruleset pullbacks)
 (rewrite (Pushforward "matrix product" 2 slot) (ForwardCall "mul" slot) :ruleset pullbacks)
@@ -791,6 +861,8 @@
 ; A prefix sum's adjoint is a suffix sum. Extrema route each lane through its first winner.
 (rewrite (Pullback "cumsum" 1 0) (Unary "reverse" (Unary "cumsum" (Unary "reverse" (Bar)))) :ruleset pullbacks)
 (rewrite (Pushforward "cumsum" 1 0) (Unary "cumsum" (Bar)) :ruleset pullbacks)
+(rewrite (Pullback "cumprod" 1 0) (CumulativeProduct 0) :ruleset pullbacks)
+(rewrite (Pushforward "cumprod" 1 0) (CumulativeProduct 1) :ruleset pullbacks)
 (rewrite (Pullback "reverse" 1 0) (Unary "reverse" (Bar)) :ruleset pullbacks)
 (rewrite (Pushforward "reverse" 1 0) (Unary "reverse" (Bar)) :ruleset pullbacks)
 (rewrite (Pullback "cummax" 1 0) (CumulativeExtreme 1) :ruleset pullbacks)
@@ -858,3 +930,96 @@
   :ruleset pullbacks)
 (rewrite (Pushforward "row maximum" 1 0)
   (RowReduce "sum" (MapBinary "mul" (Bar) (RowMaximumWeights))) :ruleset pullbacks)
+
+(rewrite (Pullback "CrystalBall log density" 5 0)
+  (Binary "mul" (Bar) (ParticleScore 0)) :ruleset pullbacks)
+
+(rewrite (Pullback "CrystalBall log density" 5 1)
+  (Binary "mul" (Bar) (ParticleScore 1)) :ruleset pullbacks)
+
+(rewrite (Pullback "CrystalBall log density" 5 2)
+  (Binary "mul" (Bar) (ParticleScore 2)) :ruleset pullbacks)
+
+(rewrite (Pullback "CrystalBall log density" 5 3)
+  (Binary "mul" (Bar) (ParticleScore 3)) :ruleset pullbacks)
+
+(rewrite (Pullback "CrystalBall log density" 5 4)
+  (Binary "mul" (Bar) (ParticleScore 4)) :ruleset pullbacks)
+
+(rewrite (Pullback "DoubleSidedCrystalBall log density" 8 0)
+  (Binary "mul" (Bar) (ParticleScore 0)) :ruleset pullbacks)
+
+(rewrite (Pullback "DoubleSidedCrystalBall log density" 8 1)
+  (Binary "mul" (Bar) (ParticleScore 1)) :ruleset pullbacks)
+
+(rewrite (Pullback "DoubleSidedCrystalBall log density" 8 2)
+  (Binary "mul" (Bar) (ParticleScore 2)) :ruleset pullbacks)
+
+(rewrite (Pullback "DoubleSidedCrystalBall log density" 8 3)
+  (Binary "mul" (Bar) (ParticleScore 3)) :ruleset pullbacks)
+
+(rewrite (Pullback "DoubleSidedCrystalBall log density" 8 4)
+  (Binary "mul" (Bar) (ParticleScore 4)) :ruleset pullbacks)
+
+(rewrite (Pullback "DoubleSidedCrystalBall log density" 8 5)
+  (Binary "mul" (Bar) (ParticleScore 5)) :ruleset pullbacks)
+
+(rewrite (Pullback "DoubleSidedCrystalBall log density" 8 6)
+  (Binary "mul" (Bar) (ParticleScore 6)) :ruleset pullbacks)
+
+(rewrite (Pullback "DoubleSidedCrystalBall log density" 8 7)
+  (Binary "mul" (Bar) (ParticleScore 7)) :ruleset pullbacks)
+
+(rewrite (Pullback "RelativisticBreitWigner log density" 3 0)
+  (Binary "mul" (Bar) (ParticleScore 0)) :ruleset pullbacks)
+
+(rewrite (Pullback "RelativisticBreitWigner log density" 3 1)
+  (Binary "mul" (Bar) (ParticleScore 1)) :ruleset pullbacks)
+
+(rewrite (Pullback "RelativisticBreitWigner log density" 3 2)
+  (Binary "mul" (Bar) (ParticleScore 2)) :ruleset pullbacks)
+
+(rewrite (Pullback "BifurcatedNormal log density" 4 0)
+  (Binary "mul" (Bar) (ParticleScore 0)) :ruleset pullbacks)
+
+(rewrite (Pullback "BifurcatedNormal log density" 4 1)
+  (Binary "mul" (Bar) (ParticleScore 1)) :ruleset pullbacks)
+
+(rewrite (Pullback "BifurcatedNormal log density" 4 2)
+  (Binary "mul" (Bar) (ParticleScore 2)) :ruleset pullbacks)
+
+(rewrite (Pullback "BifurcatedNormal log density" 4 3)
+  (Binary "mul" (Bar) (ParticleScore 3)) :ruleset pullbacks)
+
+(rewrite (Pullback "Argus log density" 4 0)
+  (Binary "mul" (Bar) (ParticleScore 0)) :ruleset pullbacks)
+
+(rewrite (Pullback "Argus log density" 4 1)
+  (Binary "mul" (Bar) (ParticleScore 1)) :ruleset pullbacks)
+
+(rewrite (Pullback "Argus log density" 4 2)
+  (Binary "mul" (Bar) (ParticleScore 2)) :ruleset pullbacks)
+
+(rewrite (Pullback "Argus log density" 4 3)
+  (Binary "mul" (Bar) (ParticleScore 3)) :ruleset pullbacks)
+
+(rewrite (Pullback "Landau log density" 3 0)
+  (Binary "mul" (Bar) (ParticleScore 0)) :ruleset pullbacks)
+
+(rewrite (Pullback "Landau log density" 3 1)
+  (Binary "mul" (Bar) (ParticleScore 1)) :ruleset pullbacks)
+
+(rewrite (Pullback "Landau log density" 3 2)
+  (Binary "mul" (Bar) (ParticleScore 2)) :ruleset pullbacks)
+
+(rewrite (Pullback "Voigtian log density" 4 0)
+  (Binary "mul" (Bar) (ParticleScore 0)) :ruleset pullbacks)
+
+(rewrite (Pullback "Voigtian log density" 4 1)
+  (Binary "mul" (Bar) (ParticleScore 1)) :ruleset pullbacks)
+
+(rewrite (Pullback "Voigtian log density" 4 2)
+  (Binary "mul" (Bar) (ParticleScore 2)) :ruleset pullbacks)
+
+(rewrite (Pullback "Voigtian log density" 4 3)
+  (Binary "mul" (Bar) (ParticleScore 3)) :ruleset pullbacks)

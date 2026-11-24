@@ -46,7 +46,7 @@ pub(super) fn visit<'a>(
         ));
     }
     let root = outer.query.key(outer.module, *body)?;
-    let mut plan = Plan::new(outer.module, outer.query);
+    let mut plan = Plan::new(outer.module, outer.query, outer.splines);
     let interior_active = plan.visit(root, depth + 1)?;
     let breakpoints = find_cuts(outer.module, outer.query, *body, axes)?;
     let mut active_cuts = Vec::new();

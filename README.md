@@ -134,13 +134,13 @@ including live parameter gradients. Sampling these truncated laws is not yet
 implemented and is explicitly refused.
 
 StableHLO emission restricts lowering to avoid known Enzyme limitations by
-default. This mode preserves zero-factor product derivatives and avoids known
+default. This mode preserves zero-factor product and cumulative product derivatives and avoids known
 selection-adjoint failures. It retains source tensor operations but skips
 pointwise packet packing.
 It shares identical gathers and their slice lowerings within each region to
 avoid rebuilding the same tensor.
 It requires static tensor shapes and deterministic queries, and refuses `probit`
-and real `cumprod`. Pass `--restrict-enzyme-compatible=false` for unrestricted emission,
+and complex `cumprod`. Pass `--restrict-enzyme-compatible=false` for unrestricted emission,
 including sampling queries. The Rust API exposes the same choice through
 `EmitOptions::restrict_enzyme_compatible`, which defaults to `true`.
 `--target cpu|gpu` (`EmitOptions::target`, default `cpu`) picks a lowering

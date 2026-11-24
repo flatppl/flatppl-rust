@@ -15,9 +15,9 @@
                 // vector of non-negative REAL singular values (spec §09).
                 Binding(name: "svd",
                     sig: Function(params: [Matrix], names: ["A"], result: Record([
-                        ("U", MatrixElem(rows: Dyn, cols: Dyn, elem: RealOrComplexOfArg(0))),
-                        ("S", Vector(len: Dyn, elem: Real)),
-                        ("V", MatrixElem(rows: Dyn, cols: Dyn, elem: RealOrComplexOfArg(0))),
+                        ("U", MatrixElem(rows: Axis(0, 0), cols: Min(Axis(0, 0), Axis(0, 1)), elem: RealOrComplexOfArg(0))),
+                        ("S", Vector(len: Min(Axis(0, 0), Axis(0, 1)), elem: Real)),
+                        ("V", MatrixElem(rows: Axis(0, 1), cols: Min(Axis(0, 0), Axis(0, 1)), elem: RealOrComplexOfArg(0))),
                     ]))),
                 // eigen(A) → record(values, vectors): values vector, vectors matrix.
                 // A real matrix can have a complex spectrum, so both fields

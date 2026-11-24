@@ -845,7 +845,7 @@ impl Emitter<'_> {
     ) -> Result<Value, EmitError> {
         if matches!(
             name,
-            "linsolve" | "quantile" | "conv" | "crosscorr" | "cross"
+            "linsolve" | "quantile" | "conv" | "crosscorr" | "cross" | "quadform"
         ) {
             let [_, _] = crate::ops::args_exact(id, args)?;
         } else {

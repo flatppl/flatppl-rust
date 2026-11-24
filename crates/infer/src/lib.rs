@@ -487,6 +487,43 @@ pub fn infer_module(module: &mut Module, bundle: &ModuleBundle, level: Level) ->
     trace::Inferencer::new(module, level, &session).run()
 }
 
+/// Recover known empty extents in a private compiler copy of an already
+/// inferred and determinized module. Portable inference and FlatPIR keep
+/// derived zero extents dynamic.
+#[doc(hidden)]
+pub fn specialize_empty_axes(module: &Module) -> Option<Module> {
+    use flatppl_core::graph::expect_builtin_call;
+    use flatppl_core::{Dim, Idx, Phase};
+
+    if !(0..module.node_count()).any(|index| {
+        let id = NodeId::from_usize(index);
+        expect_builtin_call(module, id, "filter").is_some()
+            && module.phase_of(id) == Some(Phase::Fixed)
+            && matches!(module.type_of(id), Some(Type::Array { shape, .. })
+                if shape.as_ref() == [Dim::Dynamic])
+    }) {
+        return None;
+    }
+    let mut specialized = module.clone();
+    let bundle = ModuleBundle::new();
+    let session = InferSession::new(&bundle);
+    let mut infer = trace::Inferencer::new(&mut specialized, Level::Shape, &session);
+    infer.concrete_empty_axes = true;
+    if infer
+        .run()
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error)
+    {
+        return None;
+    }
+    (0..specialized.node_count())
+        .any(|index| {
+            matches!(specialized.type_of(NodeId::from_usize(index)),
+                Some(Type::Array { shape, .. }) if shape.contains(&Dim::Static(0)))
+        })
+        .then_some(specialized)
+}
+
 /// Infer a local expression with substituted input types, without replacing the
 /// module's annotations. The module must already contain its dependencies.
 /// This preserves array nesting and vector orientation when lowering a callable
@@ -1526,4 +1563,21 @@ mod int_domain_div_mod_tests {
             );
         }
     }
+}
+
+/// Indices of source bins that intersect a fixed interval.
+/// Interior bins are right-open and the last bin is closed.
+pub fn selected_bins(
+    edges: &[f64],
+    lo: f64,
+    lo_open: bool,
+    hi: f64,
+) -> impl Iterator<Item = usize> + '_ {
+    let count = edges.len().saturating_sub(1);
+    edges.windows(2).enumerate().filter_map(move |(i, edge)| {
+        let (a, b) = (edge[0], edge[1]);
+        let starts = a <= hi;
+        let ends = if i + 1 == count { b >= lo } else { b > lo };
+        (lo <= hi && starts && ends && !(lo_open && b <= lo)).then_some(i)
+    })
 }

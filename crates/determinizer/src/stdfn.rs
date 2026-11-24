@@ -27,7 +27,7 @@
 //! lowers or refuses the member itself.
 //!
 //! A member this pass does implement, but whose call shape it cannot read (invalid
-//! arguments, wrong arity, a non-literal degree), is likewise left alone.
+//! arguments, wrong arity, or a shape outside the portable profile), is likewise left alone.
 
 use std::collections::{HashMap, HashSet};
 
@@ -37,6 +37,7 @@ use crate::density::{build_call, resolve_ref};
 use crate::refuse::RefuseError;
 
 mod distances;
+mod orthogonal;
 mod pyhf;
 mod spline_basis;
 mod spline_interpolation;
@@ -52,12 +53,6 @@ pub fn expand_spline(m: &mut Module, args: &[NodeId], member: &str) -> Option<(N
         _ => spline_basis::lower(m, args, member),
     }
 }
-
-/// Largest `polynomials` degree this pass will unroll. The lowering emits the
-/// three-term recursion node by node, so the emitted subtree grows linearly in
-/// the degree; a runaway literal would otherwise inflate the module without
-/// bound. Well past any degree a model realistically writes.
-const MAX_POLY_DEGREE: i64 = 128;
 
 /// Barrier polynomials $\chi_\ell$ for [`blatt_weisskopf`], ascending in $z$.
 ///
@@ -373,7 +368,7 @@ fn lower_member_function(
         }
         ("particle-physics", "wignerd") => {
             let [j, m1, m2, cosbeta] = arity::<4>(args)?;
-            let doubled = [j, m1, m2].map(|n| literal_int(m, n).map(|n| 2 * n));
+            let doubled = [j, m1, m2].map(|n| literal_int(m, n).and_then(|n| n.checked_mul(2)));
             wignerd(m, doubled, cosbeta)
         }
         ("particle-physics", "wignerd_doublearg") => {
@@ -383,7 +378,7 @@ fn lower_member_function(
         }
         ("particle-physics", "wignerD") => {
             let [j, m1, m2, alpha, cosbeta, gamma] = arity::<6>(args)?;
-            let doubled = [j, m1, m2].map(|n| literal_int(m, n).map(|n| 2 * n));
+            let doubled = [j, m1, m2].map(|n| literal_int(m, n).and_then(|n| n.checked_mul(2)));
             wigner_big_d(m, doubled, [alpha, cosbeta, gamma])
         }
         ("particle-physics", "wignerD_doublearg") => {
@@ -393,8 +388,7 @@ fn lower_member_function(
         }
         ("polynomials", name @ ("legendre" | "hermite" | "laguerre" | "chebyshev")) => {
             let [n, x] = arity::<2>(args)?;
-            let degree = literal_degree(m, n)?;
-            orthogonal_polynomial(m, name, degree, x)
+            orthogonal::lower(m, name, n, x)
         }
         ("distances", "euclidean") => arity::<2>(args).map(|[u, v]| {
             let d = sub(m, u, v);
@@ -424,10 +418,6 @@ fn arity<const N: usize>(args: &[NodeId]) -> Option<[NodeId; N]> {
     args.try_into().ok()
 }
 
-/// A non-negative integer degree written as a literal, directly or through one
-/// `(%ref self …)` hop. §09 requires a non-negative integer; a computed degree is
-/// declined (this pass runs before constant folding, so `1 + 1` is not a literal
-/// here).
 /// A literal integer, written as a literal or as the negation of one (§11 "Literal
 /// values" spells a negative literal `neg(<magnitude>)`).
 fn literal_int(m: &Module, id: NodeId) -> Option<i64> {
@@ -443,15 +433,6 @@ fn literal_int(m: &Module, id: NodeId) -> Option<i64> {
         }
         _ => None,
     }
-}
-
-fn literal_degree(m: &Module, id: NodeId) -> Option<i64> {
-    let node = resolve_ref(m, id).0;
-    let n = match m.node(node) {
-        Node::Lit(Scalar::Int(n)) => *n,
-        _ => return None,
-    };
-    (0..=MAX_POLY_DEGREE).contains(&n).then_some(n)
 }
 
 // -- node builders ---------------------------------------------------------
@@ -752,23 +733,35 @@ fn breakup_momentum(m: &mut Module, [mass, ma, mb]: [NodeId; 3]) -> NodeId {
 
 /// §09 `blatt_weisskopf`: with $z = (dp)^2$, $F_\ell = \sqrt{z^\ell/\chi_\ell(z)}$.
 ///
-/// Only a LITERAL $\ell$ lowers: the barrier polynomial is selected by $\ell$, and
-/// FlatPPL has no control flow to select one at run time. §09 defines the function
-/// for $0 \leq \ell \leq 7$; an $\ell$ outside that range is declined, as is a
-/// computed one.
+/// The angular momentum is discrete. Literal labels select one polynomial;
+/// a runtime label selects among the eight polynomials in the defined domain.
 fn blatt_weisskopf(m: &mut Module, [l, p, d]: [NodeId; 3]) -> Option<NodeId> {
-    let node = resolve_ref(m, l).0;
-    let ell = match m.node(node) {
-        Node::Lit(Scalar::Int(n)) => *n,
-        _ => return None,
-    };
-    let chi_coeffs = *BARRIER_CHI.get(usize::try_from(ell).ok()?)?;
-
+    let literal = literal_int(m, l);
     let dp = mul(m, d, p);
     let z = mul(m, dp, dp);
+    let ratio = if let Some(ell) = literal {
+        let ell = usize::try_from(ell).ok()?;
+        barrier_ratio(m, ell, z, BARRIER_CHI.get(ell)?)
+    } else {
+        let mut ratio = lit(m, f64::NAN);
+        for (ell, coefficients) in BARRIER_CHI.iter().enumerate().rev() {
+            let label = m.alloc(Node::Lit(Scalar::Int(ell as i64)));
+            let matches = build_call(m, "equal", &[l, label]);
+            let selected = barrier_ratio(m, ell, z, coefficients);
+            ratio = build_call(m, "ifelse", &[matches, selected, ratio]);
+        }
+        ratio
+    };
+    Some(sqrt(m, ratio))
+}
+
+fn barrier_ratio(m: &mut Module, ell: usize, z: NodeId, chi_coeffs: &[f64]) -> NodeId {
     // chi(z) by Horner, descending.
-    let mut chi = lit(m, *chi_coeffs.last().unwrap());
-    for &c in chi_coeffs[..chi_coeffs.len() - 1].iter().rev() {
+    let (leading, coefficients) = chi_coeffs
+        .split_last()
+        .expect("nonempty barrier polynomial");
+    let mut chi = lit(m, *leading);
+    for &c in coefficients.iter().rev() {
         let t = mul(m, z, chi);
         let c = lit(m, c);
         chi = add(m, c, t);
@@ -777,8 +770,7 @@ fn blatt_weisskopf(m: &mut Module, [l, p, d]: [NodeId; 3]) -> Option<NodeId> {
     for _ in 0..ell {
         z_pow = mul(m, z_pow, z);
     }
-    let ratio = divide(m, z_pow, chi);
-    Some(sqrt(m, ratio))
+    divide(m, z_pow, chi)
 }
 
 // -- particle-physics: resonances and rotations ----------------------------
@@ -788,7 +780,6 @@ fn blatt_weisskopf(m: &mut Module, [l, p, d]: [NodeId; 3]) -> Option<NodeId> {
 /// $\Gamma(\sigma) = \Gamma \frac{m}{\sqrt\sigma} \frac{p(\sigma)}{p_0}
 /// (F_\ell(p(\sigma))/F_\ell(p_0))^2$, where $p(\sigma)$ is `breakup_momentum` at
 /// $\sqrt\sigma$, $p_0$ its on-shell value at $m$, and $F_\ell$ `blatt_weisskopf`.
-/// Only a literal $\ell$ lowers, as for `blatt_weisskopf`.
 fn resonance_breitwigner(
     m: &mut Module,
     [sigma, mass, width, ma, mb, l, d]: [NodeId; 7],
@@ -834,8 +825,8 @@ const MAX_TWO_J: i64 = 40;
 fn wignerd(m: &mut Module, doubled: [Option<i64>; 3], cosbeta: NodeId) -> Option<NodeId> {
     let [two_j, two_m1, two_m2] = [doubled[0]?, doubled[1]?, doubled[2]?];
     if !(0..=MAX_TWO_J).contains(&two_j)
-        || two_m1.abs() > two_j
-        || two_m2.abs() > two_j
+        || !(-two_j..=two_j).contains(&two_m1)
+        || !(-two_j..=two_j).contains(&two_m2)
         || (two_j + two_m1) % 2 != 0
         || (two_j + two_m2) % 2 != 0
     {
@@ -915,70 +906,6 @@ fn wigner_big_d(
     let angle = neg(m, angle);
     let phase = build_call(m, "cis", &[angle]);
     Some(mul(m, phase, small))
-}
-
-// -- polynomials -----------------------------------------------------------
-
-/// §09 `polynomials` members at a LITERAL degree, emitted as the unrolled
-/// three-term recursion rather than precomputed coefficients: the recursions
-/// carry only small integer literals, so no rational coefficient has to be
-/// rounded into the emitted module.
-///
-/// * `legendre`: $P_0 = 1$, $P_1 = x$, $(k+1)P_{k+1} = (2k+1)xP_k - kP_{k-1}$.
-/// * `hermite` (physicist's): $H_0 = 1$, $H_1 = 2x$, $H_{k+1} = 2xH_k - 2kH_{k-1}$.
-/// * `laguerre`: $L_0 = 1$, $L_1 = 1 - x$, $(k+1)L_{k+1} = (2k+1-x)L_k - kL_{k-1}$.
-/// * `chebyshev` (first kind): $T_0 = 1$, $T_1 = x$, $T_{k+1} = 2xT_k - T_{k-1}$.
-fn orthogonal_polynomial(m: &mut Module, name: &str, degree: i64, x: NodeId) -> Option<NodeId> {
-    let mut prev = lit(m, 1.0);
-    if degree == 0 {
-        return Some(prev);
-    }
-    let mut cur = match name {
-        "legendre" | "chebyshev" => x,
-        "hermite" => scale(m, x, 2.0),
-        "laguerre" => {
-            let one = lit(m, 1.0);
-            sub(m, one, x)
-        }
-        _ => return None,
-    };
-    for k in 1..degree {
-        let kf = k as f64;
-        let next = match name {
-            "legendre" => {
-                let a = scale(m, x, 2.0 * kf + 1.0);
-                let a = mul(m, a, cur);
-                let b = scale(m, prev, kf);
-                let t = sub(m, a, b);
-                let denom = lit(m, kf + 1.0);
-                divide(m, t, denom)
-            }
-            "hermite" => {
-                let a = scale(m, x, 2.0);
-                let a = mul(m, a, cur);
-                let b = scale(m, prev, 2.0 * kf);
-                sub(m, a, b)
-            }
-            "laguerre" => {
-                let lead = lit(m, 2.0 * kf + 1.0);
-                let lead = sub(m, lead, x);
-                let a = mul(m, lead, cur);
-                let b = scale(m, prev, kf);
-                let t = sub(m, a, b);
-                let denom = lit(m, kf + 1.0);
-                divide(m, t, denom)
-            }
-            "chebyshev" => {
-                let a = scale(m, x, 2.0);
-                let a = mul(m, a, cur);
-                sub(m, a, prev)
-            }
-            _ => return None,
-        };
-        prev = cur;
-        cur = next;
-    }
-    Some(cur)
 }
 
 // -- distances -------------------------------------------------------------

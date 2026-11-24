@@ -150,7 +150,7 @@ pub(crate) fn lower_builtin(
         // §07 "Identities": `identity(x)` "returns `x` unchanged". Domain
         // "any", so no operand check beyond the one `lower_node` already makes
         // — a value with no tensor form refuses there, not here.
-        "identity" => {
+        "identity" | "fixed" => {
             let [a] = args_exact(id, args)?;
             e.lower_node(a)
         }
@@ -920,53 +920,61 @@ fn lower_cross(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Em
     Ok(e.sub(&left, &right))
 }
 
-/// §07 `diag(A, k)` — "extracts the $k$th diagonal of $\mathbf{A}$ as a vector
-/// … when called as `diag(A)`, `k` defaults to `0`".
-///
-/// PARTIAL against that entry, in two ways, each refused rather than
-/// approximated:
-///
-/// - **`k` must be the literal `0`.** [`Emitter::diag`] masks with
-///   `row == col`; a super- or sub-diagonal needs a shifted mask and a shorter
-///   result, which is a different lowering rather than a parameter of this one.
-/// - **`A` must be SQUARE**, though §07's domain is "matrices". `Emitter::diag`
-///   row-sums an `n`-column mask, so on an `m`x`n` operand with `m > n` it
-///   returns `m` entries — zeros for the rows the diagonal never reaches —
-///   instead of the `min(m, n)` §07 defines. Refusing keeps that from being
-///   silently answered.
+/// Extract a fixed offset diagonal from the trailing matrix axes.
 fn lower_diag(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
-    let (a_id, k_id) = match args {
-        [a] => (*a, None),
-        [a, k] => (*a, Some(*k)),
+    let (a, k) = match args {
+        [a] => (*a, 0),
+        [a, k] => {
+            let offset = match e.node(*k) {
+                Node::Lit(Scalar::Int(k)) => *k,
+                _ => {
+                    let value = e.lower_node(*k)?;
+                    match e.fixed_scalar_at(&value, 0) {
+                        Some(Scalar::Int(k)) => k,
+                        _ => {
+                            return Err(EmitError::at(
+                                id,
+                                "`diag`: the offset must be a fixed integer",
+                            ));
+                        }
+                    }
+                }
+            };
+            (*a, offset)
+        }
         _ => {
             return Err(EmitError::at(
                 id,
-                format!("`diag`: expected 1 or 2 argument(s), got {}", args.len()),
+                "`diag` expects a matrix and an optional offset",
             ));
         }
     };
-    if let Some(k) = k_id {
-        let k_val = literal_index(e, id, k).map_err(|_| {
-            EmitError::at(
-                id,
-                "`diag`: the diagonal offset `k` must be an integer literal",
-            )
-        })?;
-        if k_val != 0 {
-            return Err(EmitError::at(
-                id,
-                format!(
-                    "`diag`: only the MAIN diagonal (`k = 0`, §07's default) lowers, got k = \
-                     {k_val} — a §07 super- or sub-diagonal needs a shifted mask and a shorter \
-                     result than this lowering produces"
-                ),
-            ));
-        }
-    }
-    let a = e.lower_node(a_id)?;
-    square_dim(id, &e.cell_ty(&a), "diag")?;
+    let a = e.lower_node(a)?;
+    let (rows, cols) = matrix_dims(id, &e.cell_ty(&a), "diag")?;
     require_inexact_matrix(id, &a, "diag")?;
-    Ok(e.diag(&a))
+    if rows == cols && k == 0 {
+        return Ok(e.diag(&a));
+    }
+    let (row, col) = if k < 0 {
+        (rows.min(k.unsigned_abs()), 0)
+    } else {
+        (0, cols.min(k.unsigned_abs()))
+    };
+    let length = (rows - row).min(cols - col);
+    let MlirTy::Ranked(dims) = &a.ty else {
+        unreachable!()
+    };
+    let mut end = dims
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| EmitError::at(id, "`diag` requires fixed batch dimensions"))?;
+    let mut start = vec![0; end.len()];
+    let axis = end.len() - 2;
+    start[axis..].copy_from_slice(&[row, col]);
+    end[axis..].copy_from_slice(&[row + length, col + length]);
+    let square = e.slice(&a, &start, &end, &vec![1; end.len()]);
+    Ok(e.diag(&square))
 }
 
 fn lower_diagmat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {

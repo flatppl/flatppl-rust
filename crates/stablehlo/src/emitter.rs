@@ -2752,7 +2752,12 @@ impl<'m> Emitter<'m> {
         if n == 1 {
             return a.clone();
         }
-        if self.target.serial_scans() {
+        // Enzyme differentiates the static slice/concatenate/multiply scan
+        // without taping a loop or dividing by a zero-valued prefix.
+        let enzyme_product = self.restrict_enzyme_compatible
+            && a.elem == ElemKind::Real
+            && combine_op == "stablehlo.multiply";
+        if self.target.serial_scans() && !enzyme_product {
             self.prefix_scan_loop(combine_op, identity_lit, a, &dims)
         } else {
             self.prefix_scan_doubling(combine_op, identity_lit, a, &dims)
@@ -5050,7 +5055,10 @@ impl<'m> Emitter<'m> {
             }
         };
         let positional;
-        let rest = if matches!(fname.as_str(), "linsolve" | "conv" | "crosscorr" | "cross") {
+        let rest = if matches!(
+            fname.as_str(),
+            "linsolve" | "conv" | "crosscorr" | "cross" | "quadform"
+        ) {
             let named = match self.node(id) {
                 Node::Call(c) => c.named.as_ref(),
                 _ => &[],
@@ -5068,6 +5076,7 @@ impl<'m> Emitter<'m> {
                 let (first, second) = match fname.as_str() {
                     "linsolve" => ("A", "b"),
                     "cross" => ("a", "b"),
+                    "quadform" => ("A", "x"),
                     _ => ("v", "kernel"),
                 };
                 positional = [
@@ -5128,6 +5137,16 @@ impl<'m> Emitter<'m> {
                 | "cumprod"
                 | "cummax"
                 | "cummin"
+                | "reverse"
+                | "row_gram"
+                | "col_gram"
+                | "quadform"
+                | "self_outer"
+                | "softmax"
+                | "logsoftmax"
+                | "l2norm"
+                | "l1unit"
+                | "l2unit"
         ) {
             self.lower_broadcast_reduction(id, &fname, rest)
         } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {

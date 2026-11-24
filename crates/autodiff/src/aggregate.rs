@@ -73,11 +73,15 @@ pub(super) fn visit<'a>(
         sites,
         count,
         product,
+        empty,
     }) = read(outer.module, args)
     else {
         return Ok(None);
     };
-    let mut plan = Plan::new(outer.module, outer.query);
+    if empty {
+        return Ok(Some(false));
+    }
+    let mut plan = Plan::new(outer.module, outer.query, outer.splines);
     let root = outer.query.key(outer.module, body)?;
     let mut inputs = Vec::with_capacity(sites.len());
     let mut targets = Vec::with_capacity(sites.len());
@@ -239,6 +243,7 @@ struct Aggregate {
     sites: Vec<Site>,
     count: u64,
     product: Option<Product>,
+    empty: bool,
 }
 
 fn read(module: &Module, args: &[NodeId]) -> Option<Aggregate> {
@@ -311,7 +316,8 @@ fn read(module: &Module, args: &[NodeId]) -> Option<Aggregate> {
     {
         return None;
     }
-    let product = if reducer == "prod" {
+    let empty = extents.values().any(|dim| *dim == Dim::Static(0));
+    let product = if reducer == "prod" && !empty {
         if extents.len() != axes.len() + 1 {
             return None;
         }
@@ -366,6 +372,7 @@ fn read(module: &Module, args: &[NodeId]) -> Option<Aggregate> {
         sites,
         count,
         product,
+        empty,
     })
 }
 

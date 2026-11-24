@@ -199,6 +199,7 @@ struct ImportedCallFrame {
 pub(crate) struct Inferencer<'m, 's> {
     pub(crate) module: &'m mut Module,
     pub(crate) level: Level,
+    pub(crate) concrete_empty_axes: bool,
     body_memos: BodyMemos,
     /// Spans the dependency bundle; read by the `RefNs::Module` arm to resolve
     /// cross-module references.
@@ -303,6 +304,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         Inferencer {
             module,
             level,
+            concrete_empty_axes: false,
             session,
             body_memos: HashMap::new(),
             diags: Vec::new(),
