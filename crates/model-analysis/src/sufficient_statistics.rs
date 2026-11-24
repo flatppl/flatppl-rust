@@ -711,6 +711,8 @@ struct Reducer {
     shared_normal_scale: HashMap<NodeId, NodeId>,
     rule: Option<(&'static str, Option<GroupPartition>)>,
     fallback: &'static str,
+    /// A parameter has the gather shape, so grouping's reason outranks later families'.
+    grouped_claim: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -751,6 +753,7 @@ impl Reducer {
             shared_normal_scale: HashMap::new(),
             rule: None,
             fallback: "",
+            grouped_claim: false,
         }
     }
 
@@ -1547,6 +1550,7 @@ impl Reducer {
             .and_then(|_| report::family(m, id, &self.boundary));
         self.rule = None;
         self.fallback = "unsupported representation, support proof, or numerical range";
+        self.grouped_claim = false;
         let reduced = (self.policy != ReductionPolicy::Disabled)
             .then(|| self.reduce(m, id))
             .flatten();

@@ -379,6 +379,11 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
     let root = resolve_record_field(m, f.observed, &r.boundary);
     let literal = call(m, root, "vector").map(|c| c.args.to_vec());
     r.fallback = "parameters need shared scalars or fixed, in-range gather selectors";
+    // A gather-shaped parameter makes this grouping's factor, in range or not.
+    r.grouped_claim = f
+        .parameters
+        .iter()
+        .any(|&(_, value)| gather_parts(m, value, r).is_some());
     let parameters = f
         .parameters
         .iter()

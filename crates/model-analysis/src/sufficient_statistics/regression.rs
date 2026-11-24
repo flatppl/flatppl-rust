@@ -69,6 +69,12 @@ pub(super) fn bounds(m: &Module, id: NodeId, reducer: &Reducer) -> Option<(f64, 
     }
     let (name, args) = operation(m, id)?;
     match (name, args) {
+        // A field of a prepared data record, not a subset of an array.
+        ("get", [_, key])
+            if reducer.preparing && matches!(m.node(*key), Node::Lit(Scalar::Str(_))) =>
+        {
+            crate::fixed_values::proven_finite_bounds(m, id, &reducer.boundary)
+        }
         ("get" | "get0" | "fill", [array, ..]) => bounds(m, *array, reducer),
         ("neg", [value]) => bounds(m, *value, reducer).map(|(lo, hi)| (-hi, -lo)),
         ("vector" | "rowstack" | "colstack" | "cat", values) => values
@@ -78,6 +84,10 @@ pub(super) fn bounds(m: &Module, id: NodeId, reducer: &Reducer) -> Option<(f64, 
                 let (a, b) = bound?;
                 Some((lo.min(a), hi.max(b)))
             }),
+        // A prepared derived column has its values in hand.
+        _ if reducer.preparing => {
+            crate::fixed_values::proven_finite_bounds(m, id, &reducer.boundary)
+        }
         _ => None,
     }
 }
@@ -397,11 +407,28 @@ fn factor(
 }
 
 pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Expr> {
+    // A gather mean such as `mu[g]` keeps grouping's reason, the more specific one.
+    let earlier = reducer.fallback;
+    let result = candidate(reducer, m, id);
+    if result.is_none() && reducer.grouped_claim {
+        reducer.fallback = earlier;
+    }
+    result
+}
+
+fn candidate(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Expr> {
     let f = per_cell_with_invariants(m, id, &reducer.boundary)?;
-    if m.resolve(f.constructor) != "Normal"
-        || !data_only(m, f.observed, &reducer.allowed, &reducer.boundary)
-        || !finite_data(m, f.observed, reducer)
-    {
+    if m.resolve(f.constructor) != "Normal" {
+        return None;
+    }
+    // From here the factor is a regression candidate: each refusal names its own
+    // reason for `--explain-reductions`.
+    if !data_only(m, f.observed, &reducer.allowed, &reducer.boundary) {
+        reducer.fallback = "observations depend on a scoring input";
+        return None;
+    }
+    if !finite_data(m, f.observed, reducer) {
+        reducer.fallback = "regression observations are not proven finite";
         return None;
     }
     let shape = data_shape(m.type_of(f.observed)?)?;
@@ -422,7 +449,11 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
         .iter()
         .find(|(name, _)| m.resolve(*name) == "sigma")?
         .1;
+    reducer.fallback =
+        "the noise scale is not a shared scalar or fixed row scales within the supported range";
     let (sigma, row_scales) = row_scales(reducer, m, sigma, count)?;
+    reducer.fallback =
+        "the mean is not a sum of fixed, proven-finite design columns times coefficients";
     if m.type_of(mu).and_then(real_shape).as_deref() != Some(&[count]) {
         return None;
     }
@@ -436,6 +467,8 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
     key.extend(design.terms.iter().map(|t| t.column));
     key.extend(design.offsets.iter().map(|(id, _)| *id));
     if let Some(scales) = row_scales {
+        reducer.fallback =
+            "the data and design magnitudes are too large for the narrowest row noise scale";
         let response = design
             .offsets
             .iter()
@@ -471,6 +504,7 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
             .iter()
             .any(|&id| !data_only(m, id, &Default::default(), &reducer.boundary))
     {
+        reducer.fallback = "a design that depends on a runtime input needs explicit preparation";
         return None;
     }
     let (inverse_center, relative_scales) = if let Some(scales) = row_scales {
