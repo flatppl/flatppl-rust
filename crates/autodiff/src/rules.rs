@@ -399,6 +399,17 @@ impl Template {
                 let slot = usize::try_from(self.int(*slot)?).ok()?;
                 math::identity(emitter, *values.step.args.get(slot)?)?
             }
+            ("MatrixExpFrechet", [base, direction]) => {
+                let base = self.emit(*base, emitter, values)?;
+                let direction = self.emit(*direction, emitter, values)?;
+                math::matrix_exp_frechet(
+                    emitter,
+                    values.step.node,
+                    values.step.args[0],
+                    base,
+                    direction,
+                )?
+            }
             ("DetCofactors", []) => math::cofactors(emitter, values.step.args[0])?,
             ("TriangleHalf", [value]) => {
                 let value = self.emit(*value, emitter, values)?;

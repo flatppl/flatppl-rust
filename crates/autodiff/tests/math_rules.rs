@@ -49,6 +49,24 @@ outputs = det(A)
 }
 
 #[test]
+fn matrix_exponential_derivatives_roundtrip_standard_module_calls() {
+    for (mode, output) in
+        [gradient, jvp, vjp]
+            .into_iter()
+            .zip(["sum(e.matexp(A))", "e.matexp(A = A)", "e.matexp(A)"])
+    {
+        let module = lower(&format!(
+            "e = standard_module(\"ext-linear-algebra\", \"0.1\")\n\
+             A = elementof(cartpow(reals, [2, 2]))\n\
+             inputs = A\noutputs = {output}"
+        ));
+        let mut derivative = mode(&module, &["A"]).unwrap();
+        flatppl_autodiff::prepare_source(&mut derivative);
+        lower(&flatppl_syntax::print(&derivative));
+    }
+}
+
+#[test]
 fn solve_derivatives_keep_matrix_and_vector_shapes() {
     let module = lower(
         "

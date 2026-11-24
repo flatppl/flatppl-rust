@@ -43,6 +43,7 @@
   (PolynomialBasis)
   (IdentityLike i64)
   (DetCofactors)
+  (MatrixExpFrechet Expr Expr)
   (TriangleHalf Expr)
   (Symmetric Expr)
   (Unary String Expr)

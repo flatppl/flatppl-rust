@@ -1113,6 +1113,9 @@ enum Prepared<'a> {
 
 fn special_op(module: &Module, callee: NodeId) -> Option<&'static str> {
     let (module, member) = flatppl_determinizer::standard_function(module, callee)?;
+    if module == "ext-linear-algebra" && member == "matexp" {
+        return Some("matrix exponential");
+    }
     if module != "special-functions" {
         return None;
     }
@@ -1620,6 +1623,13 @@ impl<'a> Step<'a> {
             return Err(Error::new(
                 Some(self.node),
                 "sample moment pullback requires at least two real cells",
+            ));
+        }
+        if self.op == "matrix exponential" && math::matrix_exp_size(module, self.args[0]).is_none()
+        {
+            return Err(Error::new(
+                Some(self.node),
+                "matrix exponential differentiation requires a fixed real square matrix with supported block dimensions",
             ));
         }
         if self.op == "diag" && math::square_size(module, self.args[0]).is_none() {

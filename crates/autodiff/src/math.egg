@@ -61,6 +61,12 @@
 (rewrite (Pushforward "diagmat" 1 0) (ForwardCall "diagmat" 0) :ruleset pullbacks)
 
 ; Cofactors are polynomial derivatives, including at singular matrices.
+; Under the real Frobenius pairing the adjoint replaces A with A^T.
+(rewrite (Pullback "matrix exponential" 1 0)
+  (MatrixExpFrechet (Unary "transpose" (Arg 0)) (Bar)) :ruleset pullbacks)
+(rewrite (Pushforward "matrix exponential" 1 0)
+  (MatrixExpFrechet (Arg 0) (Bar)) :ruleset pullbacks)
+
 (rewrite (Pullback "det" 1 0) (Binary "mul" (Bar) (DetCofactors)) :ruleset pullbacks)
 (rewrite (Pushforward "det" 1 0) (MathDot (Bar) (DetCofactors)) :ruleset pullbacks)
 (constructor InverseTranspose () Expr :unextractable)
