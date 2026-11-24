@@ -27,7 +27,8 @@ pub use ordered_scan::{
     plan_ordered_scan_index_with_rules,
 };
 pub use policy::{
-    RuleInfo, RulePolicy, RuleSelector, UnknownRuleSelector, available_rules, available_rulesets,
+    RuleInfo, RulePolicy, RuleSelector, UnknownRuleSelector, available_passes, available_rules,
+    available_rulesets,
 };
 
 /// The shared language and each emitter have separate rule schedules.
@@ -140,7 +141,11 @@ fn optimise_query(
     sufficient_statistics: bool,
     rules: &RulePolicy,
 ) -> Option<Module> {
-    let pruned = demand::prune(module, roots, profile, bundle);
+    let pruned = if rules.disables_pass("demand-prune") {
+        None
+    } else {
+        demand::prune(module, roots, profile, bundle)
+    };
     project::optimise(
         pruned.as_ref().unwrap_or(module),
         roots,

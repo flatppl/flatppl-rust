@@ -716,8 +716,11 @@ impl<'a> Project<'a> {
                     .collect::<Option<Vec<_>>>()?;
                 self.concats.push((i, witness, args));
             }
-            if let Some((head, vector)) =
-                concat::fixed_stack_vector(m, id, |n| self.cuts.resolve(m, n))
+            // Stan reads a written literal matrix as data. An inserted axis
+            // would compute it in `transformed data` instead.
+            if self.profile != Profile::Stan
+                && let Some((head, vector)) =
+                    concat::fixed_stack_vector(m, id, |n| self.cuts.resolve(m, n))
             {
                 let source = self.project(vector, depth + 1)?;
                 self.facts.push(fact(

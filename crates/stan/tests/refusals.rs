@@ -3319,3 +3319,14 @@ fn an_iid_of_an_iid_of_a_multinomial_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("a nested iid of this law"), "{r}");
 }
+
+#[test]
+fn a_refusal_in_an_optimised_value_is_located_in_the_written_binding() {
+    let model = "m = elementof(cartpow(reals, [4, 3]))\n\
+                 z = sum(sum(transpose(transpose(m))))\n\
+                 lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))\n\
+                 inputs = m\noutputs = lp\n";
+    let (r, located) = refuse_located(model, Some("lp"));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert_eq!(located.as_deref(), Some("z"), "{r}");
+}
