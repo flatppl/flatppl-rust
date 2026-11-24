@@ -6,6 +6,8 @@ use crate::node::{CallHead, Node, Ref, RefNs};
 use crate::ty::{Mass, Phase, Type, ValueSet};
 use std::collections::{HashMap, HashSet};
 
+mod serialization;
+
 /// The trailing ` · <mass>` annotation for a measure/kernel type in
 /// [`Module::display_type`]. An unknown or not-yet-inferred mass adds no
 /// annotation (it would only be noise).

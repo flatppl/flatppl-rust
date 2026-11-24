@@ -55,7 +55,8 @@ pub fn print(module: &Module) -> String {
 /// Render `module` as canonical FlatPPL text at the given [`Syntax`] level
 /// (no trailing newline).
 pub fn print_with(module: &Module, syntax: Syntax) -> String {
-    let printer = Printer::new(module, syntax);
+    let module = module.for_serialization();
+    let printer = Printer::new(&module, syntax);
     let mut out = String::new();
     for (idx, (_, binding)) in module.bindings().enumerate() {
         if idx > 0 {
@@ -70,6 +71,13 @@ pub fn print_with(module: &Module, syntax: Syntax) -> String {
     out
 }
 
+/// Render one right-hand side in full syntax at `column`, without adding
+/// declarations or surrounding statement syntax.
+#[doc(hidden)]
+pub fn print_expression(module: &Module, id: NodeId, column: usize) -> String {
+    Printer::new(module, Syntax::Full).body_w(id, column)
+}
+
 /// Apply assignment rewrites to the original source while retaining its
 /// statement forms. `assignments` comes from `parse_with_assignment_spans`.
 /// The rewritten module retains the original binding IDs.
@@ -79,7 +87,8 @@ pub fn print_assignment_rewrites(
     original: &Module,
     rewritten: &Module,
 ) -> String {
-    let printer = Printer::new(rewritten, Syntax::Full);
+    let rewritten = rewritten.for_serialization();
+    let printer = Printer::new(&rewritten, Syntax::Full);
     let mut out = String::with_capacity(source.len());
     let mut cursor = 0;
     let mut references = HashSet::new();
@@ -88,8 +97,8 @@ pub fn print_assignment_rewrites(
         if original.binding(binding).rhs == rhs {
             continue;
         }
-        // A decomposition's temporary is available in FlatPIR. Its name
-        // has no declaration in the original source.
+        // Decomposition and serialization can introduce temporary bindings
+        // that have no declaration in the original source.
         references.clear();
         rewritten.collect_referenced_names(rhs, &mut references);
         if references.iter().any(|&name| {

@@ -59,6 +59,7 @@ pub(crate) fn write_verified(module: &Module) -> Result<(String, Vec<Sexpr>)> {
 /// Unguarded: an annotated module can render text past a reader resource guard
 /// (see [`try_write`]). Use [`try_write`] whenever the text will be read back.
 pub fn write(module: &Module) -> String {
+    let module = module.for_serialization();
     let mut out = String::from("(%module");
 
     // Public interface: `(%public name …)`. ALWAYS emitted, even when empty, so
@@ -79,7 +80,7 @@ pub fn write(module: &Module) -> String {
     // One `(%bind …)` stanza per binding, in source order, blank-line separated.
     for (id, binding) in module.bindings() {
         out.push_str("\n\n  ");
-        out.push_str(&render_bind(module, id, binding));
+        out.push_str(&render_bind(&module, id, binding));
     }
 
     out.push(')');

@@ -19,4 +19,4 @@ mod token;
 
 pub use error::{Error, Result};
 pub use parser::{parse, parse_with_assignment_spans};
-pub use printer::{Syntax, print, print_assignment_rewrites, print_with};
+pub use printer::{Syntax, print, print_assignment_rewrites, print_expression, print_with};

@@ -434,10 +434,8 @@ impl<'m> Lowerer<'m> {
 
     /// A binding's right-hand side as FlatPPL text, with the relation it
     /// binds under (`∼` for a `draw`, whose measure is then the text): the
-    /// source slice when the source is at hand, the canonical print of that
-    /// one binding otherwise. The canonical printer recurses, so the slice
-    /// is what keeps a fallback row safe on a deep expression; a module
-    /// without source text is a programmatic caller's.
+    /// source slice when the source is at hand, an expression in canonical
+    /// syntax otherwise.
     fn rhs_text(&self, id: BindingId) -> (Rel, String) {
         let rhs = self.m.binding(id).rhs;
         let (rel, node) = match self.m.node(rhs) {
@@ -450,22 +448,8 @@ impl<'m> Lowerer<'m> {
         {
             return (rel, slice.trim().to_string());
         }
-        let name = self.m.resolve(self.m.binding(id).name);
-        let mut only = self.m.clone();
-        only.retain_bindings(&[id].into_iter().collect());
-        let text = flatppl_syntax::print(&only);
-        // Drop doc-comment lines and the `name =` / `name ~` prefix.
-        let body: Vec<&str> = text
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('%'))
-            .collect();
-        let joined = body.join("\n");
-        let trimmed = joined.trim();
-        let rest = trimmed
-            .strip_prefix(name)
-            .and_then(|r| r.strip_prefix(" = ").or_else(|| r.strip_prefix(" ~ ")))
-            .unwrap_or(trimmed);
-        (rel, rest.to_string())
+        let column = self.m.resolve(self.m.binding(id).name).chars().count() + " = ".len();
+        (rel, flatppl_syntax::print_expression(self.m, node, column))
     }
 
     fn kind(&self, rhs: NodeId) -> Kind {
@@ -3328,6 +3312,34 @@ mod tests {
         // A shallower one lowers normally.
         let shallow = rows("m = superpose(Normal(0, 1), Normal(1, 1), Normal(2, 1))");
         assert!(row_named(&shallow, "m").diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_fallback_for_a_shared_measure_prints_only_the_rhs() {
+        use flatppl_core::graph::build_call;
+
+        let mut module = flatppl_syntax::parse("sample ~ Normal(0.0, 1.0)").unwrap();
+        let binding = module.bindings().next().unwrap().0;
+        let one = module.alloc(Node::Lit(Scalar::Real(1.0)));
+        let mut location = one;
+        for _ in 0..6 {
+            location = build_call(&mut module, "add", &[location, location]);
+        }
+        for _ in 0..DEFAULT_MAX_DEPTH {
+            location = build_call(&mut module, "add", &[location, one]);
+        }
+        let normal = build_call(&mut module, "Normal", &[location, one]);
+        let draw = build_call(&mut module, "draw", &[normal]);
+        module.set_binding_rhs(binding, draw);
+
+        let rows = lower_module(&module);
+        let sample = row_named(&rows, "sample");
+        assert_eq!(sample.statement.rel, Rel::Sim);
+        let Math::Code(text) = &sample.statement.rhs else {
+            panic!("expected source fallback: {:?}", sample.statement.rhs);
+        };
+        assert!(text.starts_with("Normal("));
+        assert!(!text.contains(['=', '~']), "{text}");
     }
 
     #[test]

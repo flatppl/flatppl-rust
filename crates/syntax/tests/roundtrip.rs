@@ -19,6 +19,31 @@ use flatppl_core::{CallHead, Node};
 use flatppl_syntax::{Syntax, parse, print, print_with};
 
 #[test]
+fn assignment_rewrites_keep_source_when_a_shared_rhs_needs_declarations() {
+    use flatppl_core::{Scalar, graph::build_call};
+    use flatppl_syntax::{parse_with_assignment_spans, print_assignment_rewrites};
+
+    let source = "x = 1.0  # keep this assignment\ny = 3.0\n";
+    let (original, assignments) = parse_with_assignment_spans(source).unwrap();
+    let mut rewritten = original.clone();
+    let mut bindings = original.bindings();
+    let (x, binding) = bindings.next().unwrap();
+    let (y, _) = bindings.next().unwrap();
+    let mut shared = binding.rhs;
+    for _ in 0..6 {
+        shared = build_call(&mut rewritten, "add", &[shared, shared]);
+    }
+    rewritten.set_binding_rhs(x, shared);
+    let new_value = rewritten.alloc(Node::Lit(Scalar::Real(4.0)));
+    rewritten.set_binding_rhs(y, new_value);
+
+    assert_eq!(
+        print_assignment_rewrites(source, &assignments, &original, &rewritten),
+        "x = 1.0  # keep this assignment\ny = 4.0\n"
+    );
+}
+
+#[test]
 fn nonfinite_ir_values_print_as_existing_expressions() {
     for (value, expression) in [
         (f64::NAN, "divide(0.0, 0.0)"),

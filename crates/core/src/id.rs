@@ -162,6 +162,10 @@ pub struct Interner {
 }
 
 impl Interner {
+    pub(crate) fn contains_name(&self, name: &str) -> bool {
+        self.lookup.contains_key(name)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
