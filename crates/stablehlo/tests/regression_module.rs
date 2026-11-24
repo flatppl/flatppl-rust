@@ -159,3 +159,132 @@ fn guarded_scores_keep_outer_scalar_parameter_cells() {
         assert!(mlir.contains(") : (tensor<i32>) ->"), "{law}\n{mlir}");
     }
 }
+
+#[test]
+fn a_bernoulli_regression_on_a_repeated_fixed_design_counts_its_rows() {
+    let law = |rows: &str| {
+        format!(
+            "reg = standard_module(\"regression\", \"0.1\")\nx = rowstack({rows})\n\
+             alpha = elementof(reals)\nbeta = elementof(cartpow(reals, 2))\ninputs = (alpha, beta)\n\
+             outputs = logdensityof(reg.BernoulliLogitGLM(x, alpha, beta), [1, 0, 1, 1, 0, 0])\n"
+        )
+    };
+    // The row likelihood runs once per distinct design row.
+    let scored_rows = |ir: &str, rows: &str| {
+        ir.lines()
+            .any(|line| line.contains("stablehlo.log_plus_one") && line.ends_with(rows))
+    };
+    let repeated = emit(&law(
+        "[[1.0, 0.5], [1.0, 0.5], [1.0, 0.5], [1.0, 1.5], [1.0, 1.5], [1.0, 1.5]]",
+    ));
+    assert!(scored_rows(&repeated, "tensor<2xf32>"), "{repeated}");
+    let distinct = emit(&law(
+        "[[1.0, 0.5], [1.0, 1.5], [1.0, 2.5], [1.0, 3.5], [1.0, 4.5], [1.0, 5.5]]",
+    ));
+    assert!(scored_rows(&distinct, "tensor<6xf32>"), "{distinct}");
+    assert!(!scored_rows(&distinct, "tensor<2xf32>"), "{distinct}");
+}
+
+#[test]
+fn a_large_fixed_design_is_proven_finite_when_emitted() {
+    // 4200 design elements, above the bound for newly folded tables.
+    let rows: Vec<String> = (0..2100)
+        .map(|i| format!("[1.0, {}]", f64::from(i) / 1000.0))
+        .collect();
+    let response: Vec<&str> = (0..2100)
+        .map(|i| if i % 3 == 0 { "1" } else { "0" })
+        .collect();
+    let ir = emit(&format!(
+        "reg = standard_module(\"regression\", \"0.1\")\nx = rowstack([{}])\n\
+         alpha = elementof(reals)\nbeta = elementof(cartpow(reals, 2))\ninputs = (alpha, beta)\n\
+         outputs = logdensityof(reg.BernoulliLogitGLM(x, alpha, beta), [{}])\n",
+        rows.join(", "),
+        response.join(", ")
+    ));
+    assert!(!ir.contains("tensor<2100x2xi1>"), "{ir}");
+}
+
+#[test]
+fn a_coefficient_product_is_checked_without_a_second_dot_reader() {
+    // Enzyme-compatible emission lowers a product of two inputs to a
+    // one-element dot.
+    let ir = emit_with_restrictions(
+        "reg = standard_module(\"regression\", \"0.1\")\n\
+         x = rowstack([[1.0, 0.5, 0.2, 0.1], [0.3, 1.5, 0.4, 0.2], [0.6, 0.1, 2.5, 0.3]])\n\
+         z = elementof(cartpow(reals, 4))\ns = elementof(cartpow(posreals, 4))\n\
+         t = elementof(posreals)\nbeta = z .* s .* t\ninputs = (z, s, t)\n\
+         outputs = logdensityof(reg.BernoulliLogitGLM(x, 0.0, beta), [1, 0, 1])\n",
+        true,
+    );
+    let definition = |ssa: &str| {
+        ir.lines()
+            .find(|line| line.trim_start().starts_with(&format!("{ssa} = ")))
+            .unwrap_or_else(|| panic!("{ssa}\n{ir}"))
+    };
+    let operands = |line: &str| -> Vec<String> {
+        line.split_once(" = ")
+            .map(|(_, rhs)| {
+                rhs.split([' ', ','])
+                    .filter(|t| t.starts_with('%'))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // Every one-element dot of the chain keeps its single reader: the next
+    // product or the predictor.
+    let dots: Vec<String> = ir
+        .lines()
+        .filter(|line| line.contains("stablehlo.dot_general") && line.contains("batching_dims"))
+        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+        .collect();
+    assert_eq!(dots.len(), 2, "{ir}");
+    for dot in &dots {
+        let readers = ir
+            .lines()
+            .filter(|line| operands(line).contains(dot))
+            .count();
+        assert_eq!(readers, 1, "{dot}\n{ir}");
+    }
+    // The coefficient check reads the same product as a multiply.
+    let check = ir
+        .lines()
+        .find(|line| line.contains("stablehlo.abs") && line.ends_with("tensor<4xf32>"))
+        .unwrap_or_else(|| panic!("{ir}"));
+    assert!(
+        definition(&operands(check)[0]).contains("stablehlo.multiply"),
+        "{ir}"
+    );
+    assert!(
+        ir.contains("flatppl.runtime_status") && ir.contains("dense<9>"),
+        "{ir}"
+    );
+}
+
+// The portable stage turns these broadcast laws into §09 regression laws, which
+// require finite coefficients. A non-finite coefficient reports status 9.
+#[test]
+fn recognised_link_laws_check_their_coefficients() {
+    for (written, module) in [
+        (
+            "Bernoulli.(invlogit.(alpha .+ x * beta))",
+            "reg.BernoulliLogitGLM(x, alpha, beta)",
+        ),
+        (
+            "Poisson.(exp.(alpha .+ x * beta))",
+            "reg.PoissonLogGLM(x, alpha, beta)",
+        ),
+    ] {
+        let score = |law: &str| {
+            emit(&format!(
+                "{PREFIX}inputs=(x,alpha,beta)\noutputs=logdensityof({law},[1, 0, 1])"
+            ))
+        };
+        let recognised = score(written);
+        assert!(
+            recognised.contains("flatppl.runtime_status") && recognised.contains("dense<9>"),
+            "{written}\n{recognised}"
+        );
+        assert_eq!(recognised, score(module), "{written}");
+    }
+}

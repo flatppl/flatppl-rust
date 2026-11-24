@@ -84,7 +84,19 @@ impl fmt::Display for ReductionReport {
 
 // Recognize candidates without normalizing or allocating expressions. This
 // keeps tracing from changing emission, including source and FlatPIR output.
-pub(super) fn family(m: &Module, id: NodeId, boundary: &HashSet<Symbol>) -> Option<Symbol> {
+pub(super) fn family(m: &Module, id: NodeId, boundary: &HashSet<Symbol>) -> Option<String> {
+    // A §09 regression law scores its response cells with one family.
+    if let Some(density) = call(m, id, "builtin_logdensityof")
+        && let Some(&kernel) = density.args.first()
+        && let Node::Const(s) = m.node(kernel)
+    {
+        return match m.resolve(*s) {
+            "NormalGLM" => Some("Normal".into()),
+            "BernoulliLogitGLM" => Some("Bernoulli".into()),
+            "PoissonLogGLM" => Some("Poisson".into()),
+            _ => None,
+        };
+    }
     let sum = call(m, id, "sum")?;
     let [arg] = *sum.args else { return None };
     let c = call(m, resolve(m, arg, boundary), "broadcast")?;
@@ -101,7 +113,7 @@ pub(super) fn family(m: &Module, id: NodeId, boundary: &HashSet<Symbol>) -> Opti
         *call(m, body, "builtin_logdensityof")?.args.first()?
     };
     match m.node(kernel) {
-        Node::Const(s) => Some(*s),
+        Node::Const(s) => Some(m.resolve(*s).into()),
         _ => None,
     }
 }

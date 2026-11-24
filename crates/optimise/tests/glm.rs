@@ -1,9 +1,9 @@
 use flatppl_optimise::{Dtype, Profile, Target, optimise};
 
-// A profile that seeds no data boundary keeps the broadcast law, so its own
-// reductions of the broadcast form still apply.
+// The portable stage rewrites the broadcast law for every target that lowers
+// from it. The StableHLO stage runs on a lowered query and has no such law.
 #[test]
-fn profiles_without_a_data_boundary_keep_the_broadcast_law() {
+fn the_portable_stage_recognises_a_regression_law() {
     let source = "X = rowstack([[1.0, 0.5], [1.0, 1.5], [1.0, 2.5]])
 alpha = elementof(reals)
 beta = elementof(cartpow(reals, 2))
@@ -21,8 +21,10 @@ outputs = logdensityof(law, [1.0, 2.0, 3.0])
         "{diagnostics:?}"
     );
     let outputs = module.intern("outputs");
+    let portable = optimise(&module, Some(&[outputs]), Profile::Portable).expect("rewrite");
+    let text = flatppl_syntax::print(&portable);
+    assert!(text.contains("NormalGLM(X, alpha, beta, sigma)"), "{text}");
     for profile in [
-        Profile::Portable,
         Profile::StableHlo {
             target: Target::Cpu,
             dtype: Dtype::F64,

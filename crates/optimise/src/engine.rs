@@ -414,7 +414,11 @@ fn has_candidates(terms: &[Term], facts: &[Fact], profile: Profile) -> bool {
             }
             ("ifelse", [c, a, b]) => a == b || boolean(*c) || (boolean(*a) && boolean(*b)),
             ("mul", [x, y]) if hlo || stan => is_transposed(*x, *y) || is_transposed(*y, *x),
-            ("broadcast.Normal" | "broadcast.Bernoulli" | "broadcast.Poisson", _) if stan => true,
+            ("broadcast.Normal" | "broadcast.Bernoulli" | "broadcast.Poisson", _)
+                if stan || profile == Profile::Portable =>
+            {
+                true
+            }
             _ if !hlo => false,
             ("tile", [_, counts]) => matches!(terms[*counts], Term::Integer(1)) || unit_counts.contains(counts),
             ("addaxes", [x, left, right]) => {

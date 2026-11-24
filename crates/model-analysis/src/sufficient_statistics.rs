@@ -1568,7 +1568,7 @@ impl Reducer {
             let decision = ReductionDecision {
                 binding: self.binding.clone(),
                 node: id,
-                family: m.resolve(family).into(),
+                family,
                 outcome,
             };
             self.report.as_mut().unwrap().decisions.push(decision);

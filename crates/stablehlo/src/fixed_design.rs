@@ -126,6 +126,22 @@ impl Emitter<'_> {
         Some(result)
     }
 
+    /// A §09 Bernoulli regression on a fixed design counts its rows the same
+    /// way. `z` is the emitted linear predictor, `y` the fixed response.
+    pub(crate) fn reduce_regression_design(&mut self, z: &Value, y: &Value) -> Option<Value> {
+        if self.target != crate::Target::Cpu
+            || self.fold_design_scans
+            || !self.call_frame.is_empty()
+            || !matches!(element_count(&y.ty), Some(2..=MAX_FOLDED_ELEMENTS))
+            || self.batch_rank(y) != 0
+            || self.batch_rank(z) != 0
+            || self.fixed_scalar_at(y, 0).is_none()
+        {
+            return None;
+        }
+        self.count_bernoulli_rows(z, y)
+    }
+
     fn count_bernoulli_rows(&mut self, z: &Value, y: &Value) -> Option<Value> {
         let rows = element_count(&y.ty)?;
         let mut design = Design::default();

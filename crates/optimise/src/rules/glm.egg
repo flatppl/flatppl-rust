@@ -1,14 +1,14 @@
 (ruleset glm)
 
 ; FlatPPL §09 module regression: each GLM law is the broadcast law of its
-; linear predictor `alpha .+ x * beta`. A target seeds `data-boundary` for a
-; design it reads as data. Its extraction cost decides which form it keeps.
+; linear predictor `alpha .+ x * beta`. Every target lowers the module law.
+; A design need of a target, such as Stan's data, sits in its emitter.
 ; Shapes of real terms in any phase. The value relations of the schema hold
 ; only for terms whose values other rules may erase.
 (relation shape-real (Expr))
 (relation shape-real-vector (Expr i64))
 (relation glm-linear (Expr Expr Expr Expr))
-(rule ((= eta (B "mul" x b)) (data-boundary x) (real-matrix x n k)
+(rule ((= eta (B "mul" x b)) (real-matrix x n k)
        (shape-real-vector b k) (shape-real-vector eta n))
       ((glm-linear eta x (Real 0) b)) :ruleset glm :name "glm.design")
 (rule ((= eta (B "broadcast.add" a lin)) (glm-linear lin x (Real 0) b)

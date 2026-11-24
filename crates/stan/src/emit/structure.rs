@@ -1,7 +1,7 @@
 //! Target decomposition and the `~` statements.
 
 use super::pattern;
-use super::{Emitter, Ex, Flat, P_ATOM, PriorField, RowSize};
+use super::{Emitter, Ex, Flat, P_ADD, P_ATOM, P_MUL, PriorField, RowSize};
 use crate::ManifestParam;
 use crate::refuse::{Refusal, RefusalKind, Result};
 use crate::stan_type::StanType;
@@ -2883,6 +2883,11 @@ impl<'m> Emitter<'m> {
                 };
                 let member = self.name(r.name);
                 let args = self.law_args(member, m)?;
+                if module == "regression"
+                    && let Some(law) = self.regression_on_parameters(m, member, &args)?
+                {
+                    return Ok(law);
+                }
                 self.table_law_in(m, member, Some(&module), &args, false)
             }
             // `locscale(normalize(truncate(D, I)), m, s)` with s > 0 is
@@ -4159,6 +4164,62 @@ impl<'m> Emitter<'m> {
             ));
         };
         self.law_from_row(m, name, row, pat, binds, broadcast)
+    }
+
+    /// Stan's GLM functions read the design matrix as data. A regression law
+    /// whose design is not data is the vectorized statement of its broadcast
+    /// law (§09), as the model would write it.
+    fn regression_on_parameters(
+        &mut self,
+        m: NodeId,
+        member: &str,
+        args: &[NodeId],
+    ) -> Result<Option<Law>> {
+        let (law, id, x, alpha, beta, sigma) = match (member, args) {
+            ("NormalGLM", &[x, alpha, beta, sigma]) => {
+                ("Normal", "normal", x, alpha, beta, Some(sigma))
+            }
+            ("BernoulliLogitGLM", &[x, alpha, beta]) => {
+                ("Bernoulli", "bernoulli_logit", x, alpha, beta, None)
+            }
+            ("PoissonLogGLM", &[x, alpha, beta]) => {
+                ("Poisson", "poisson_log", x, alpha, beta, None)
+            }
+            _ => return Ok(None),
+        };
+        if self.m.phase_of(self.resolve(x)) == Some(Phase::Fixed) {
+            return Ok(None);
+        }
+        let Some(row) = tables::law_rows_by_head(law, None)
+            .into_iter()
+            .find(|row| row.id == id)
+        else {
+            return Ok(None);
+        };
+        let design = self.expr(x)?;
+        let coefficients = self.expr(beta)?;
+        let product = Ex {
+            s: format!("{} * {}", design.at(P_MUL), coefficients.at(P_MUL + 1)),
+            prec: P_MUL,
+        };
+        let eta = if self.literal_number(alpha) == Some(0.0) {
+            product
+        } else {
+            let intercept = self.real(alpha)?;
+            Ex {
+                s: format!("{} + {}", intercept.at(P_ADD), product.at(P_ADD + 1)),
+                prec: P_ADD,
+            }
+        };
+        let mut binds = HashMap::new();
+        if let Some(sigma) = sigma {
+            binds.insert("mu".to_string(), pattern::Bound::Expr(eta));
+            binds.insert("sigma".to_string(), pattern::Bound::Node(sigma));
+        } else {
+            binds.insert("a".to_string(), pattern::Bound::Expr(eta));
+        }
+        let pat = pattern::parse(&row.pattern);
+        self.law_from_row(m, law, row, pat, binds, true).map(Some)
     }
 
     /// A law called with one record argument, its fields as the keyword
