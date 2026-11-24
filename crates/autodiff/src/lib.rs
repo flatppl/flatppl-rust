@@ -8,6 +8,7 @@ mod aggregate;
 mod callbacks;
 mod contract;
 mod fixed_scan;
+mod gamma_shape;
 mod integral;
 mod math;
 mod metric;

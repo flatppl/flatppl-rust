@@ -86,6 +86,9 @@ impl Template {
         bar: NodeId,
         masked: bool,
     ) -> Result<NodeId, Error> {
+        if matches!(self.dag.get(self.root), Term::App(head, _) if head == "GammaShape") {
+            return crate::gamma_shape::contribution(emitter, step, bar);
+        }
         let mut values = Values {
             step,
             bar,
@@ -462,7 +465,7 @@ struct Values<'a> {
     terms: HashMap<TermId, NodeId>,
 }
 
-fn special_call(
+pub(super) fn special_call(
     module: &mut Module,
     member: &str,
     mut args: Vec<NodeId>,

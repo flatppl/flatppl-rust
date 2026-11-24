@@ -4,6 +4,7 @@
   (Out)
   (Bar)
   (ZeroOut)
+  (GammaShape)
   (Fill Expr i64)
   (MeanFill Expr i64)
   (LogSumExp i64)
