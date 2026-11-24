@@ -218,6 +218,57 @@ outputs = (y, z)
 }
 
 #[test]
+fn directional_rules_preserve_nested_tuple_outputs() {
+    let module = lower(
+        "
+x = elementof(reals)
+pair = (x * x, x .* [1.0, 2.0])
+inputs = x
+outputs = (pair, x)
+",
+    );
+    let forward = flatppl_autodiff::jvp(&module, &["x"]).unwrap();
+    let text = flatppl_syntax::print(&forward);
+    assert!(
+        text.contains("outputs = (pair, x, (d_output_1, d_output_2), d_output_3)"),
+        "{text}"
+    );
+    let reverse = flatppl_autodiff::vjp(&module, &["x"]).unwrap();
+    let text = flatppl_syntax::print(&reverse);
+    assert!(
+        text.contains("inputs = (x, cotangent_1, cotangent_2, cotangent_3)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("cotangent_2 = elementof(cartpow(reals, 2))"),
+        "{text}"
+    );
+    assert!(text.contains("outputs = (pair, x, d_x)"), "{text}");
+}
+
+#[test]
+fn directional_rules_keep_a_promoted_tuple_as_one_named_input() {
+    let module = lower(
+        "
+pair = (2.0, (3.0, [1.0, 2.0]))
+inputs = pair
+outputs = (pair[1] * pair[2][1], pair[2][2])
+",
+    );
+    let forward = flatppl_autodiff::jvp(&module, &["pair"]).unwrap();
+    let text = flatppl_syntax::print(&forward);
+    assert!(text.contains("inputs = (pair, tangent_pair)"), "{text}");
+    let mut reparsed = flatppl_syntax::parse(&text).unwrap();
+    assert_inferred(&mut reparsed);
+
+    let reverse = flatppl_autodiff::vjp(&module, &["pair"]).unwrap();
+    let text = flatppl_syntax::print(&reverse);
+    assert!(text.contains("d_pair = ("), "{text}");
+    let mut reparsed = flatppl_syntax::parse(&text).unwrap();
+    assert_inferred(&mut reparsed);
+}
+
+#[test]
 fn conditional_masks_the_cotangent_before_it_reaches_a_singular_branch() {
     let module = lower(
         "

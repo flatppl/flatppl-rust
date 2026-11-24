@@ -272,7 +272,7 @@ enum Command {
     Autodiff {
         /// FlatPPL model with declared inputs and outputs.
         input: PathBuf,
-        /// Real scalar, fixed-shape real array, or record of these to differentiate (repeatable).
+        /// Query input to differentiate (repeatable). Supports reals, fixed-shape arrays, records, fixed-row tables, and fixed tuples.
         #[arg(long, required_unless_present = "empty_wrt")]
         wrt: Vec<String>,
         /// Differentiate with an explicitly empty selection of inputs.

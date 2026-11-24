@@ -66,17 +66,21 @@ Build the CLI with `--features autodiff` and request the derivative explicitly.
 flatppl autodiff query.flatppl --wrt theta -o gradient.flatppl
 ```
 
-The query declares `inputs` and one real scalar output. Repeat `--wrt` for each
-real scalar, fixed-shape array, or nonempty record with real leaves. The result
-lists the original value followed by gradients in the requested order. Each
-gradient has the shape of its input.
+Gradient mode requires one real scalar output. Repeat `--wrt` for each selected
+query input. Inputs can be real scalars, fixed-shape real arrays, records,
+fixed-row tables, or promoted fixed tuples of these. Each selected tuple
+position must support a derivative. Record and table derivatives contain the
+real fields in declaration order. Arrays retain their shape and tables retain
+their row count. The result lists the original value followed by gradients in
+the requested order.
 Use `--empty-wrt` for an empty selection, including queries with only discrete
 inputs. The gradient query then returns the primal alone.
 
-Use `--mode jvp` or `--mode vjp` for real scalar and fixed-shape array outputs.
-JVP adds one tangent argument per selected input and returns one tangent per
-output. VJP adds one cotangent argument per output and returns one cotangent
-per selected input. The original values precede the derivative results.
+Use `--mode jvp` or `--mode vjp` for structured outputs. Both modes preserve
+the original values and split nested tuple outputs into derivative components.
+JVP takes one tangent per selected input and returns the output tangents.
+VJP takes one cotangent per differentiable output component and returns one
+cotangent per selected input.
 
 AD runs after determinization and before optimization. Egglog rules cover
 pointwise arithmetic and conditionals, scalar broadcast callbacks, reductions,
@@ -105,6 +109,11 @@ Numerical AD integrates the derivative of the integrand and adds terms for
 moving bounds and supported scalar cutoffs. Reverse differentiation supports
 scalar, fixed-vector, fixed-matrix, and nested record captures. The Rust
 `*_with_options` entry points accept `NUMERICAL_SOURCE_OPTIONS`.
+
+Shape derivatives of the regularized incomplete gamma functions and their log
+forms also require `--numerical-integrals`. The real projection of Bessel J
+supports order derivatives when the declared bounds imply an order in
+`[0, 16]` and an argument in `[1/8, 4]`.
 Call `prepare_source_with_options` before printing. To compile the
 derivative directly to StableHLO, add `--ad-wrt` to the `stablehlo` command
 and optionally select `--ad-mode jvp` or `--ad-mode vjp`.

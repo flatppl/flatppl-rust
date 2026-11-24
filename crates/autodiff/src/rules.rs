@@ -174,13 +174,9 @@ impl Template {
                 let index = tensor::int(&mut emitter.module, self.int(*index)?);
                 build_call(&mut emitter.module, "get", &[bar, index])
             }
-            ("RecordPick" | "RecordEmbed", [slot]) => {
+            ("RecordPick", [slot]) => {
                 let slot = usize::try_from(self.int(*slot)?).ok()?;
-                if head == "RecordPick" {
-                    record::pick(emitter, values.step.node, values.bar, slot)?
-                } else {
-                    record::embed(emitter, values.step.node, values.bar, slot)?
-                }
+                record::pick(emitter, values.step.node, values.bar, slot, values.step.op)?
             }
             ("CatSlice" | "CatEmbed", [slot]) => {
                 let slot = usize::try_from(self.int(*slot)?).ok()?;

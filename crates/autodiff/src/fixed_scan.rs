@@ -354,7 +354,8 @@ impl Projection {
             Product::Forward(_) => Mode::Jvp,
             Product::Reverse { .. } => Mode::Vjp,
         };
-        let query = Query::read(&module, &names, mode)?;
+        let mut module = std::borrow::Cow::Owned(module);
+        let query = Query::read(&mut module, &names, mode)?;
         let root = query.key(&module, body)?;
         let mut plan = Plan::new(&module, &query);
         plan.visit(root, 0)?;
@@ -391,9 +392,7 @@ impl Projection {
                     .wrt
                     .iter()
                     .map(|input| match result.remove(&Key::Input(input.binding)) {
-                        Some(terms) => {
-                            Ok(combine_contributions(&mut inner, input.reference, terms))
-                        }
+                        Some(terms) => combine_contributions(&mut inner, input.reference, terms),
                         None => inner.zero_like(input.reference),
                     })
                     .collect::<Result<Vec<_>, Error>>()?

@@ -117,17 +117,19 @@ impl<'a> Scope<'a> {
         let contributions = reverse_values(emitter, &self.plan, rules, &[self.root], &[one], mode);
         emitter.inline = inline;
         let mut contributions = contributions?;
-        Ok(self
-            .plan
+        self.plan
             .query
             .wrt
             .iter()
             .filter_map(|input| {
                 let key = Key::Input(input.binding);
                 let terms = contributions.remove(&key)?;
-                Some((key, combine_contributions(emitter, input.reference, terms)))
+                Some(
+                    combine_contributions(emitter, input.reference, terms)
+                        .map(|value| (key, value)),
+                )
             })
-            .collect())
+            .collect()
     }
 
     pub(super) fn pullback(

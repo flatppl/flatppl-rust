@@ -181,3 +181,94 @@ outputs = (get0(cat(x, y), [2, 0, 2]), get(y, only), get0(y, all))
         lower(&flatppl_syntax::print(&derivative));
     }
 }
+
+#[test]
+fn real_table_derivatives_reparse_with_named_columns_and_row_projections() {
+    let module = lower(
+        "
+t = elementof(cartpow(cartprod(b = reals, a = reals), 3))
+i = elementof(integers)
+r = t[i]
+inputs = (t, i)
+outputs = (table(z = t.b, a = t.a[[2, 2, 1]]), r)
+",
+    );
+    for transformed in [jvp, vjp] {
+        let derivative = transformed(&module, &["t"]).unwrap();
+        let reparsed = lower(&flatppl_syntax::print(&derivative));
+        flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
+    }
+}
+
+#[test]
+fn record_products_only_add_overlapping_field_contributions() {
+    let input = lower(
+        "
+p = elementof(cartprod(z = reals, a = reals, m = reals, b = reals))
+inputs = p
+z = p.z
+a = p.a
+shared = z + a
+outputs = (shared + z, shared + shared, p.m + p.b)
+",
+    );
+    let derivative = vjp(&input, &["p"]).unwrap();
+    let printed = flatppl_syntax::print(&derivative);
+    // Four primal additions, two seed additions at shared and one at z.
+    assert_eq!(printed.matches(" + ").count(), 7, "{printed}");
+    assert!(!printed.contains("0.0"), "{printed}");
+    lower(&printed);
+}
+
+#[test]
+fn constructor_tangent_builds_each_nested_field_once() {
+    let input = lower(
+        "
+x = elementof(reals)
+y = elementof(reals)
+v = elementof(cartpow(reals, 2))
+inputs = (x, y, v)
+outputs = record(z = x, inner = record(y = y, unused = v), a = y, b = x)
+",
+    );
+    let derivative = jvp(&input, &["x", "y"]).unwrap();
+    let printed = flatppl_syntax::print(&derivative);
+    assert!(!printed.contains(" + "), "{printed}");
+    // Only the inactive vector field needs a zero.
+    assert_eq!(printed.matches("fill(").count(), 1, "{printed}");
+    lower(&printed);
+}
+
+#[test]
+fn table_matrix_cell_derivatives_preserve_nested_array_axes() {
+    let module = lower(
+        "
+t = elementof(cartpow(cartprod(block = cartpow(reals, [2, 2]), weight = reals), 2))
+inputs = t
+outputs = (t[2], t.block[[2, 2, 1]])
+",
+    );
+    for transformed in [jvp, vjp] {
+        let derivative = transformed(&module, &["t"]).unwrap();
+        let reparsed = lower(&flatppl_syntax::print(&derivative));
+        flatppl_determinizer::is_flatpdl(&reparsed).unwrap();
+    }
+}
+
+#[test]
+fn mixed_records_reparse_with_passive_fields_only_in_the_primal() {
+    let module = lower(
+        "
+p = elementof(cartprod(tag = integers, x = reals, meta = cartprod(flag = booleans), unused = cartpow(reals, 2)))
+z = ifelse(p.meta.flag, p.x * p.x, p.x)
+q = record(label = p.tag, result = z, nested = record(flag = p.meta.flag, x = p.x))
+inputs = p
+outputs = (q, p.tag, z)
+",
+    );
+    for transform in [jvp, vjp] {
+        let mut derivative = transform(&module, &["p"]).unwrap();
+        flatppl_autodiff::prepare_source(&mut derivative);
+        lower(&flatppl_syntax::print(&derivative));
+    }
+}
