@@ -262,5 +262,7 @@ pub(super) fn airy_slope(module: &mut Module, x: NodeId) -> NodeId {
     let polynomial = build_call(module, "add", &[c2, cubic_factor]);
     let correction = build_call(module, "mul", &[square, polynomial]);
     let near_origin = build_call(module, "add", &[constant, correction]);
-    build_call(module, "ifelse", &[small_x, near_origin, main])
+    let slope = build_call(module, "ifelse", &[small_x, near_origin, main]);
+    let undefined = build_call(module, "isnan", &[x]);
+    build_call(module, "ifelse", &[undefined, nan, slope])
 }

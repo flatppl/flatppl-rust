@@ -139,31 +139,14 @@ fn blatt_weisskopf_lowers_for_every_declared_angular_momentum() {
     }
 }
 
-// §09 declares `blatt_weisskopf` for l <= 7 only, and FlatPPL has no control flow
-// to pick a barrier polynomial at run time. Both an out-of-range literal and a
-// genuinely non-constant l must REFUSE, naming the member.
 #[test]
-fn blatt_weisskopf_refuses_an_undefined_or_non_constant_angular_momentum() {
-    for (label, prelude, arg) in [
-        (
-            "out of range",
-            format!("{HEP}\np = elementof(posreals)"),
-            "8",
-        ),
-        (
-            "non-constant",
-            format!("{HEP}\np = elementof(posreals)\nl = integer(p)"),
-            "l",
-        ),
-    ] {
-        let src = probe_model(&prelude, &format!("hep.blatt_weisskopf({arg}, p, 1.5)"));
-        let err = determinize(&parse_infer(&src))
-            .expect_err("an l this pass cannot read must refuse, not lower");
-        assert!(
-            format!("{err:?}").contains("blatt_weisskopf"),
-            "the {label} refusal must name the member: {err:?}"
-        );
-    }
+fn blatt_weisskopf_selects_runtime_momentum_and_rejects_an_out_of_range_literal() {
+    let prelude = format!("{HEP}\np = elementof(posreals)\nl = integer(p)");
+    let runtime = lower(&probe_model(&prelude, "hep.blatt_weisskopf(l, p, 1.5)"));
+    assert!(!runtime.contains("(%ref hep "), "{runtime}");
+    let src = probe_model(&prelude, "hep.blatt_weisskopf(8, p, 1.5)");
+    let error = determinize(&parse_infer(&src)).expect_err("invalid orbital momentum");
+    assert!(format!("{error:?}").contains("blatt_weisskopf"));
 }
 
 // The four `polynomials` members lower at a literal degree, emitted as the
@@ -402,9 +385,7 @@ lp = logdensityof(sig, 5.28)";
     );
 }
 
-// `resonance_breitwigner` and the four Wigner functions lower at literal angular
-// momenta, the same contract as `blatt_weisskopf`: a computed momentum, or one
-// outside |m| <= j with the parity of j, is refused, naming the member.
+// Wigner functions require fixed, admissible spin labels.
 #[test]
 fn breit_wigner_and_wigner_functions_lower_at_literal_momenta() {
     for expr in [
@@ -425,7 +406,7 @@ fn breit_wigner_and_wigner_functions_lower_at_literal_momenta() {
         ("hep.wignerd(1, 2, 0, p)", "wignerd"),
         ("hep.wignerd(n, 0, 0, p)", "wignerd"),
         (
-            "real(hep.resonance_breitwigner(p, 1.52, 0.09, 0.938, 0.493, n, 1.5))",
+            "real(hep.resonance_breitwigner(p, 1.52, 0.09, 0.938, 0.493, 8, 1.5))",
             "resonance_breitwigner",
         ),
     ] {

@@ -977,5 +977,7 @@ fn enzyme_restricted_real_cumprod_uses_static_multiplication() {
     )
     .unwrap();
     assert!(!hlo.contains("stablehlo.while"), "{hlo}");
-    assert_eq!(hlo.matches("stablehlo.multiply").count(), 3, "{hlo}");
+    // Each prefix stage shifts one partial product. Targets can lower the
+    // multiplication to multiply or a precision-qualified batched dot.
+    assert_eq!(hlo.matches("stablehlo.concatenate").count(), 3, "{hlo}");
 }

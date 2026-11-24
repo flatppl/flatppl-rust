@@ -77,7 +77,7 @@ fn nested_src(head: &str, set: &str) -> String {
 /// The whole family, not one head. Each of these lowered to its undotted form's value.
 #[test]
 fn unsupported_collection_domain_heads_refuse_under_a_broadcast() {
-    for head in ["l1norm", "l2norm", "linfnorm", "logsumexp", "lengthof"] {
+    for head in ["l1norm", "linfnorm", "logsumexp", "lengthof"] {
         let err = emit_err(&nested_src(head, "reals"));
         assert!(
             err.contains(&format!("`{head}` under a broadcast has no tensor form")),
@@ -92,8 +92,8 @@ fn unsupported_collection_domain_heads_refuse_under_a_broadcast() {
 /// `transpose.(v)` and `adjoint.(v)` returned `%arg0 : tensor<4xf32>` unchanged, and
 /// `self_outer.(v)` returned `tensor<4x4xf32>` — the undotted outer product.
 #[test]
-fn the_measured_linear_algebra_mislowerers_refuse() {
-    for head in ["transpose", "adjoint", "self_outer"] {
+fn unsupported_linear_algebra_heads_refuse() {
+    for head in ["transpose", "adjoint"] {
         let err = emit_err(&nested_src(head, "reals"));
         assert!(
             err.contains(&format!("`{head}` under a broadcast has no tensor form"))
@@ -108,9 +108,32 @@ fn the_measured_linear_algebra_mislowerers_refuse() {
 #[test]
 fn the_refusal_cites_the_heads_own_section() {
     assert!(
-        emit_err(&nested_src("l2norm", "reals")).contains("§07 \"Norms and normalization\""),
-        "`l2norm` belongs to §07's norms table"
+        emit_err(&nested_src("l1norm", "reals")).contains("§07 \"Norms and normalization\""),
+        "`l1norm` belongs to §07's norms table"
     );
+}
+
+#[test]
+fn supported_collection_heads_keep_the_outer_frame() {
+    for (head, return_type) in [
+        ("l2norm", "tensor<2xf32>"),
+        ("self_outer", "tensor<2x3x3xf32>"),
+    ] {
+        let hlo = flatppl_stablehlo::emit(
+            &determinize_abi(&nested_src(head, "reals")),
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions::default(),
+        )
+        .unwrap();
+        let signature = hlo
+            .lines()
+            .find(|line| line.contains("func.func @logdensity("))
+            .unwrap();
+        assert!(
+            signature.contains(&format!("-> {return_type}")),
+            "{signature}"
+        );
+    }
 }
 
 /// The gate must not spill onto the elementwise broadcasts, which are the emitter's

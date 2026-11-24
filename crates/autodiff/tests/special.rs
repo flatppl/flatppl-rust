@@ -152,3 +152,22 @@ outputs = {call}
         }
     }
 }
+
+#[test]
+fn scaled_bessel_i_only_masks_the_order_zero_cusp_at_the_origin() {
+    let module = lower(
+        r#"
+sf = standard_module("special-functions", "0.1")
+v = elementof(reals)
+z = elementof(reals)
+inputs = (v, z)
+outputs = real(sf.bessel_i_scaled(v, z))
+"#,
+    );
+    for transform in [gradient, jvp, vjp] {
+        let result = transform(&module, &["z"]).unwrap();
+        let printed = flatppl_syntax::print(&result);
+        assert!(printed.contains("iszero(v) && iszero(z)"), "{printed}");
+        lower(&printed);
+    }
+}
