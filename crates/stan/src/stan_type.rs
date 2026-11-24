@@ -23,6 +23,9 @@ pub(crate) struct StanType {
 pub(crate) struct Bounds {
     pub lower: Option<String>,
     pub upper: Option<String>,
+    /// `<offset=…, multiplier=…>`: an affine transform of an unconstrained
+    /// value. Stan admits it only without `lower`/`upper`.
+    pub affine: Option<(String, String)>,
 }
 
 impl StanType {
@@ -63,6 +66,9 @@ impl StanType {
 
 impl Bounds {
     fn render(&self) -> String {
+        if let (None, None, Some((offset, multiplier))) = (&self.lower, &self.upper, &self.affine) {
+            return format!("<offset={offset}, multiplier={multiplier}>");
+        }
         match (&self.lower, &self.upper) {
             (None, None) => String::new(),
             (Some(l), None) => format!("<lower={l}>"),
@@ -147,6 +153,7 @@ pub(crate) fn bounds_of(vs: &ValueSet) -> Bounds {
     let b = |l: Option<&str>, u: Option<&str>| Bounds {
         lower: l.map(str::to_string),
         upper: u.map(str::to_string),
+        affine: None,
     };
     match element_set(vs) {
         ValueSet::PosReals | ValueSet::NonNegReals | ValueSet::NonNegIntegers => b(Some("0"), None),
@@ -155,6 +162,7 @@ pub(crate) fn bounds_of(vs: &ValueSet) -> Bounds {
         ValueSet::Interval(lo, hi) => Bounds {
             lower: lo.is_finite().then(|| number(*lo)),
             upper: hi.is_finite().then(|| number(*hi)),
+            affine: None,
         },
         _ => Bounds::default(),
     }

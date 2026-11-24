@@ -994,7 +994,8 @@ impl<'m> Emitter<'m> {
             Some(ValueSet::RecordSet(s)) => s.to_vec(),
             _ => vec![],
         };
-        for f in fields {
+        for i in self.param_order(fields) {
+            let f = &fields[i];
             let ty = types
                 .iter()
                 .find(|(n, _)| *n == f.field)
@@ -1068,6 +1069,19 @@ impl<'m> Emitter<'m> {
                 }
                 t.support = Some(s);
                 t.bounds = Default::default();
+            }
+            // The non-centred parameterization of a location-scale law: the same
+            // parameter and density, sampled on the standardized scale.
+            if let Some(law) = f.law
+                && t.support.is_none()
+                && t.bounds.lower.is_none()
+                && t.bounds.upper.is_none()
+                && self.locscale_affine_deps(law, fields).is_some_and(|deps| {
+                    deps.iter()
+                        .all(|d| self.fields.contains_key(&fields[*d].field))
+                })
+            {
+                t.bounds.affine = Some(self.locscale_affine(law)?);
             }
             self.params.push(format!("{};", t.render(&stan)));
             self.record_decl(&stan, t);
@@ -2101,6 +2115,8 @@ impl<'m> Emitter<'m> {
                 self.flat = None;
                 (law?, true)
             }
+            // One law per cell, as for an iid of one law, with per-cell arguments.
+            Some("locscale") if self.locscale_iid(m) => (self.law(m, false)?, true),
             // A joint of different laws: one statement per component.
             Some("joint") if self.call(m).unwrap().named.is_empty() => match self.law(m, false) {
                 Ok(law) => (law, false),
@@ -3416,60 +3432,244 @@ impl<'m> Emitter<'m> {
         Ok(law)
     }
 
-    /// The law of `locscale(D, m, s)`: D's `locscale` row where it has one
-    /// (`StudentT`), else, for a location-scale family `D(a, b)`, the law
-    /// `D(m + s·a, s·b)` (the pushforward of x ↦ m + s·x), with s > 0 provable.
+    /// The law of `locscale(D, m, s)`: for a symmetric location-scale family
+    /// `D(a, b)` (StudentT standard: a = 0, b = 1), the law `D(m + s·a, |s|·b)`,
+    /// scalar or per cell of an `iid` (the pushforward of x ↦ m + s·x); else
+    /// D's `locscale` row where it has one.
     fn locscale_law(&mut self, m: NodeId, [d, loc, scale]: [NodeId; 3]) -> Result<Law> {
-        let row = self.table_law(m, "locscale", &[d, loc, scale], false);
+        if self.locscale_iid_args([d, loc, scale]) {
+            let inner = self.call(self.resolve(d)).unwrap().args[0];
+            return self.locscale_family_law(m, inner, loc, scale, true);
+        }
         let dr = self.resolve(d);
-        let family = self
-            .head(dr)
-            .filter(|h| matches!(*h, "Normal" | "Cauchy" | "Logistic" | "Laplace"));
-        let (Err(no_row), Some(family)) = (&row, family) else {
-            return row;
-        };
-        if no_row.kind.is_never() {
-            return row;
-        }
-        if !self.positive_value(scale) {
-            return Err(Refusal::not_yet(
-                Some(m),
-                "locscale with a scale of unknown sign",
-            ));
-        }
         let scalar = |me: &Self, x: NodeId| me.shape(x).is_some_and(|s| s.rank == 0);
-        if !scalar(self, loc) || !scalar(self, scale) {
-            return Err(Refusal::not_yet(
+        if matches!(
+            self.head(dr),
+            Some("Normal" | "Cauchy" | "Logistic" | "Laplace" | "StudentT")
+        ) && scalar(self, loc)
+            && scalar(self, scale)
+        {
+            return self.locscale_family_law(m, d, loc, scale, false);
+        }
+        let row = self.table_law(m, "locscale", &[d, loc, scale], false);
+        let family = matches!(
+            self.head(dr),
+            Some("Normal" | "Cauchy" | "Logistic" | "Laplace")
+        );
+        match &row {
+            Err(no_row) if family && !no_row.kind.is_never() => Err(Refusal::not_yet(
                 Some(m),
                 "locscale with an array location or scale",
-            ));
+            )),
+            _ => row,
         }
-        let params = self.law_args(family, dr)?;
-        let [a, b] = params[..] else {
-            return Err(Refusal::not_yet(Some(m), "locscale of this law"));
-        };
-        let (mv, sv, av, bv) = (
-            self.folded(loc)?,
-            self.folded(scale)?,
-            self.folded(a)?,
-            self.folded(b)?,
-        );
-        let location = fold_add(&mv, &fold_mul(&sv, &av));
-        let spread = fold_mul(&sv, &bv);
-        let names = flatppl_infer::distribution_param_names(family).unwrap_or_default();
-        let general = format!("{family}({})", names.join(", "));
-        let Some(row) = tables::law_rows_by_head(family, None)
-            .into_iter()
-            .find(|r| r.pattern == general)
-        else {
-            return Err(Refusal::not_yet(Some(m), "locscale of this law"));
-        };
-        let pat = pattern::parse(&row.pattern);
-        let mut binds = HashMap::new();
-        for (n, v) in names.iter().zip([location, spread]) {
-            binds.insert(n.to_string(), pattern::Bound::Expr(v.1));
+    }
+
+    /// `locscale(iid(D, J), loc, s)` with a scalar `s` and a vector `loc`: §07
+    /// `mul` scales every cell by `s`, so it is the uniform map `s .* x .+ loc`.
+    pub(super) fn locscale_iid_args(&self, [d, loc, scale]: [NodeId; 3]) -> bool {
+        self.head(self.resolve(d)) == Some("iid")
+            && self.shape(scale).is_some_and(|s| s.rank == 0)
+            && self.shape(loc).is_some_and(|s| s.rank == 1)
+    }
+
+    /// The order `declare_params` declares `fields` in: as given, except that a
+    /// field taking `<offset, multiplier>` follows the fields those name, since
+    /// Stan reads them in the declaration. No other field moves.
+    fn param_order(&self, fields: &[PriorField]) -> Vec<usize> {
+        let mut order = Vec::with_capacity(fields.len());
+        let mut pending: Vec<(usize, Vec<usize>)> = Vec::new();
+        for i in 0..fields.len() {
+            match fields[i]
+                .law
+                .and_then(|law| self.locscale_affine_deps(law, fields))
+            {
+                Some(deps) if !deps.iter().all(|d| order.contains(d)) => pending.push((i, deps)),
+                _ => order.push(i),
+            }
+            while let Some(k) = pending
+                .iter()
+                .position(|(_, d)| d.iter().all(|x| order.contains(x)))
+            {
+                order.push(pending.remove(k).0);
+            }
         }
-        self.law_from_row(m, family, row, pat, binds, false)
+        // A field naming itself, directly or through another deferred field.
+        order.extend(pending.into_iter().map(|(i, _)| i));
+        order
+    }
+
+    /// The prior fields named by the offset and multiplier of the law `law`
+    /// when it takes them: `locscale(iid(D(a, b), J), loc, s)` of a
+    /// location-scale family with `b > 0` and `s ≥ 0` provable (Stan's
+    /// multiplier must be positive; a parameter declared `lower=0` is, off its
+    /// boundary), naming only prior fields and fixed values (a model-block local
+    /// cannot appear in a parameter declaration).
+    fn locscale_affine_deps(&self, law: NodeId, fields: &[PriorField]) -> Option<Vec<usize>> {
+        let law = self.resolve(law);
+        if !self.locscale_iid(law) {
+            return None;
+        }
+        let [_, loc, scale] = self.call(law)?.args[..] else {
+            return None;
+        };
+        let d = self.resolve(self.call(law)?.args[0]);
+        let inner = self.resolve(self.call(d)?.args[0]);
+        let mut nodes = vec![loc, scale];
+        match self.head(inner)? {
+            "StudentT" => {}
+            "Normal" | "Cauchy" | "Logistic" | "Laplace" => {
+                let c = self.call(inner)?;
+                let [a, b] = c.args[..] else {
+                    return None;
+                };
+                if !self.positive_value(b) {
+                    return None;
+                }
+                nodes.extend([a, b]);
+            }
+            _ => return None,
+        }
+        if !self.nonnegative_value(scale) {
+            return None;
+        }
+        let mut deps = Vec::new();
+        let mut stack = nodes;
+        let mut seen = HashSet::new();
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            if let Node::Ref(r) = self.m.node(n)
+                && r.ns == RefNs::SelfMod
+            {
+                if let Some(k) = fields.iter().position(|f| f.binding == Some(r.name)) {
+                    deps.push(k);
+                    continue;
+                }
+                let b = self.m.binding_by_name(r.name)?;
+                if self.m.phase_of(self.m.binding(b).rhs) != Some(Phase::Fixed) {
+                    return None;
+                }
+                continue;
+            }
+            self.m.for_each_child(n, |c| stack.push(c));
+        }
+        Some(deps)
+    }
+
+    /// The `<offset, multiplier>` texts of [`Self::locscale_affine_deps`]'s law:
+    /// `loc + s·a` and `s·b` (`a = 0`, `b = 1` for StudentT).
+    fn locscale_affine(&mut self, law: NodeId) -> Result<(String, String)> {
+        let law = self.resolve(law);
+        let [d, loc, scale] = self.call(law).unwrap().args[..] else {
+            unreachable!("locscale_affine_deps checked the call");
+        };
+        let inner = self.resolve(self.call(self.resolve(d)).unwrap().args[0]);
+        let (lv, sv) = ((None, self.expr(loc)?, false), self.folded(scale)?);
+        let (location, spread) = if self.head(inner) == Some("StudentT") {
+            (lv, sv)
+        } else {
+            let c = self.call(inner).unwrap();
+            let (a, b) = (c.args[0], c.args[1]);
+            let (av, bv) = (self.folded(a)?, self.folded(b)?);
+            (fold_add(&lv, &fold_mul(&sv, &av)), fold_mul(&sv, &bv))
+        };
+        Ok((location.1.s, spread.1.s))
+    }
+
+    /// The `locscale` call `m` when it is [`Self::locscale_iid_args`]'s shape.
+    pub(super) fn locscale_iid(&self, m: NodeId) -> bool {
+        let m = self.resolve(m);
+        self.head(m) == Some("locscale") && self.call(m).is_some_and(|c| {
+            c.named.is_empty()
+                && matches!(c.args[..], [d, loc, scale] if self.locscale_iid_args([d, loc, scale]))
+        })
+    }
+
+    /// The law of `locscale(D, loc, s)` for a symmetric location-scale family D:
+    /// D(loc + s·a, |s|·b), per cell of a vector `loc` when `cells`. Each family
+    /// is symmetric about a, so z − a and a − z share a law, and
+    /// loc + s·z = (loc + s·a) + s·(z − a) has the spread |s|·b.
+    fn locscale_family_law(
+        &mut self,
+        m: NodeId,
+        d: NodeId,
+        loc: NodeId,
+        scale: NodeId,
+        cells: bool,
+    ) -> Result<Law> {
+        let inner = self.resolve(d);
+        let head = self.head(inner).unwrap_or("this law").to_string();
+        let known_sign = self.nonnegative_value(scale);
+        // Operands print in the order the row reads them (loc, s, a, b), which
+        // fixes the order Stan declares the data they name.
+        let spread_of = |sv: &Folded| -> Folded {
+            match (known_sign, sv.0) {
+                (true, _) => sv.clone(),
+                (false, Some(n)) => number_ex(n.abs()),
+                (false, None) => (None, Ex::atom(format!("abs({})", sv.1.s)), false),
+            }
+        };
+        match head.as_str() {
+            "Normal" | "Cauchy" | "Logistic" | "Laplace" => {
+                let params = self.law_args(&head, inner)?;
+                let [a, b] = params[..] else {
+                    return Err(Refusal::not_yet(Some(m), "locscale of this law"));
+                };
+                let lv = if cells {
+                    (None, self.expr(loc)?, false)
+                } else {
+                    self.folded(loc)?
+                };
+                let sv = self.folded(scale)?;
+                let spread_scale = spread_of(&sv);
+                let (av, bv) = (self.folded(a)?, self.folded(b)?);
+                let location = fold_add(&lv, &fold_mul(&sv, &av));
+                let spread = fold_mul(&spread_scale, &bv);
+                let names = flatppl_infer::distribution_param_names(&head).unwrap_or_default();
+                let general = format!("{head}({})", names.join(", "));
+                let row = tables::law_rows_by_head(&head, None)
+                    .into_iter()
+                    .find(|r| r.pattern == general)
+                    .ok_or_else(|| Refusal::not_yet(Some(m), "locscale of this law"))?;
+                let pat = pattern::parse(&row.pattern);
+                let binds = names
+                    .iter()
+                    .zip([location, spread])
+                    .map(|(n, v)| (n.to_string(), pattern::Bound::Expr(v.1)))
+                    .collect();
+                self.law_from_row(m, &head, row, pat, binds, cells)
+            }
+            // The `locscale(StudentT(nu), mu, sigma)` row takes loc and s as given.
+            "StudentT" if known_sign => self.table_law(m, "locscale", &[d, loc, scale], cells),
+            "StudentT" => {
+                let params = self.law_args(&head, inner)?;
+                let [nu] = params[..] else {
+                    return Err(Refusal::not_yet(Some(m), "locscale of this law"));
+                };
+                let row = tables::law_rows_by_head("locscale", None)
+                    .into_iter()
+                    .find(|r| r.pattern == "locscale(StudentT(nu), mu, sigma)")
+                    .ok_or_else(|| Refusal::not_yet(Some(m), "locscale of this law"))?;
+                let pat = pattern::parse(&row.pattern);
+                let (nv, lv) = (self.expr(nu)?, self.expr(loc)?);
+                let sv = self.folded(scale)?;
+                let binds = HashMap::from([
+                    ("nu".to_string(), pattern::Bound::Expr(nv)),
+                    ("mu".to_string(), pattern::Bound::Expr(lv)),
+                    ("sigma".to_string(), pattern::Bound::Expr(spread_of(&sv).1)),
+                ]);
+                self.law_from_row(m, &head, row, pat, binds, cells)
+            }
+            _ => Err(Refusal::not_yet(
+                Some(m),
+                format!(
+                    "locscale with a vector shift over an iid {head} law (only Normal, Cauchy, \
+                     Logistic, Laplace and StudentT bases)"
+                ),
+            )),
+        }
     }
 
     /// A positive literal, or a value of a positive set.
@@ -3624,6 +3824,11 @@ impl<'m> Emitter<'m> {
         if self.literal_number(one) != Some(1.0) || self.literal_number(zero) != Some(0.0) {
             return None;
         }
+        self.positive_finite_test(cond).map(|a| (cond, a))
+    }
+
+    /// `s > 0.0 && isfinite(s)`, either order of the two tests: `s`.
+    fn positive_finite_test(&self, cond: NodeId) -> Option<NodeId> {
         let cr = self.resolve(cond);
         if self.head(cr) != Some("land") {
             return None;
@@ -3646,7 +3851,63 @@ impl<'m> Emitter<'m> {
             (Some(a), Some(b), _, _) | (_, _, Some(b), Some(a)) => (a, b),
             _ => return None,
         };
-        self.m.structural_eq(a, b).then_some((cond, a))
+        self.m.structural_eq(a, b).then_some(a)
+    }
+
+    /// `ifelse(s > 0.0 && isfinite(s), s, …)` where that condition holds
+    /// ([`Self::constant_weight_law`]'s `true_conds`): the first branch, a
+    /// positive `s`.
+    fn positive_under_true_cond(&self, x: NodeId) -> bool {
+        let x = self.resolve(x);
+        if self.head(x) != Some("ifelse") {
+            return false;
+        }
+        let Some(&[cond, first, _]) = self.call(x).map(|c| &c.args[..]) else {
+            return false;
+        };
+        self.true_conds
+            .iter()
+            .any(|&t| self.m.structural_eq(t, cond))
+            && self
+                .positive_finite_test(cond)
+                .is_some_and(|s| self.m.structural_eq(s, first))
+    }
+
+    /// [`Self::positive_value`], a positive branch under a condition known to
+    /// hold, a value of a set that excludes negatives (`nonnegreals`,
+    /// `interval(0, …)`), including a record field's set, or a product,
+    /// quotient or sum of such: a scale whose sign is known.
+    fn nonnegative_value(&self, x: NodeId) -> bool {
+        let r = self.resolve(x);
+        self.positive_value(x)
+            || self.positive_under_true_cond(x)
+            || (matches!(self.head(r), Some("mul" | "divide" | "add"))
+                && self
+                    .call(r)
+                    .is_some_and(|c| c.args.iter().all(|&a| self.nonnegative_value(a))))
+            || self.m.valueset_of(r).is_some_and(nonnegative_set)
+            || self.field_set(r).is_some_and(nonnegative_set)
+    }
+
+    /// The set of the field `f` in the value set of `rec`, for `get(rec, "f")`:
+    /// inference types the field access `reals`, the record set keeps it.
+    fn field_set(&self, x: NodeId) -> Option<&ValueSet> {
+        if self.head(x) != Some("get") {
+            return None;
+        }
+        let [rec, field] = self.call(x)?.args[..] else {
+            return None;
+        };
+        let Node::Lit(Scalar::Str(f)) = self.m.node(field) else {
+            return None;
+        };
+        let Some(ValueSet::RecordSet(fields)) = self.m.valueset_of(self.resolve(rec)) else {
+            return None;
+        };
+        fields
+            .iter()
+            .find(|(n, _)| self.name(*n) == &**f)
+            .map(|(_, s)| s)
     }
 
     fn positive_value(&self, x: NodeId) -> bool {
@@ -4512,6 +4773,15 @@ pub(super) fn fold_add(x: &Folded, y: &Folded) -> Folded {
             },
             x.2 && y.2,
         ),
+    }
+}
+
+/// A set with no negative member.
+fn nonnegative_set(vs: &ValueSet) -> bool {
+    match vs {
+        ValueSet::PosReals | ValueSet::NonNegReals => true,
+        ValueSet::Interval(lo, _) => *lo >= 0.0,
+        _ => false,
     }
 }
 
