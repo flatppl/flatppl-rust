@@ -168,6 +168,89 @@ pub(crate) struct Bijection {
     pub logvol: NodeId,
 }
 
+/// What §03 fixes as the reference measure of a `pushfwd` base's support, which
+/// decides the maps whose image has a density (§06).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Carrier {
+    /// A full-dimensional support.
+    Full,
+    /// A support of `deficit` fewer dimensions than the variate has cells, under
+    /// the coordinate Lebesgue measure §03 gives `stdsimplex(n)` and `zerosum(n)`
+    /// (one per such factor). A uniform scale `a` scales each of the free
+    /// coordinates by `a`, so its volume term is `(cells − deficit)·log|a|`. §06
+    /// fixes no reference measure for the image under any other map.
+    Chart { deficit: u64 },
+    /// A lower-dimensional support with no reference measure in §03 (the
+    /// correlation sets of `LKJ` and `LKJCholesky`).
+    Unreferenced,
+    /// A superposition of laws whose reference measures differ in dimension: it
+    /// has no density of its own.
+    MixedDimension,
+    /// A point mass that is not a plain `Dirac(c)` at the top of the base (a map
+    /// of a `Dirac`, a wrapped `Dirac`).
+    PointMass,
+    /// A superposition or product that holds a point mass. Over a continuous variate a map of
+    /// it refuses (`crate::density::lower_pushfwd`); over a discrete one it takes
+    /// the counting path, which snaps the preimage to the lattice.
+    PointMassMix,
+}
+
+/// The [`Carrier`] of the base measure `base`, whose refined support is `support`:
+/// [`flatppl_infer::measure_chart`], which reads a map's base through any depth
+/// (a bijection keeps the dimension of its support), joined with `support`.
+pub(crate) fn carrier(m: &Module, base: NodeId, support: &ValueSet) -> Carrier {
+    use flatppl_infer::MeasureChart;
+    match (
+        flatppl_infer::measure_chart(m, base),
+        support.chart_deficit(),
+    ) {
+        (MeasureChart::Deficit(d), Some(own)) => match d.max(own) {
+            0 => Carrier::Full,
+            deficit => Carrier::Chart { deficit },
+        },
+        (MeasureChart::Deficit(_), None) | (MeasureChart::NoReference, _) => Carrier::Unreferenced,
+        (MeasureChart::MixedDimension, _) => Carrier::MixedDimension,
+        (MeasureChart::PointMass, _) => Carrier::PointMass,
+        (MeasureChart::PointMassMix, _) => Carrier::PointMassMix,
+    }
+}
+
+/// The refusal for a superposition whose components' reference measures differ in
+/// dimension, mapped or not.
+pub(crate) fn refuse_mixed_dimension(node: NodeId, m: &Module) -> RefuseError {
+    refuse(
+        node,
+        m,
+        "the components of this superposition have reference measures of different dimension \
+         (§03: a stdsimplex(n) or zerosum(n) support has n − 1 free coordinates), so the \
+         superposition has no density",
+    )
+}
+
+/// The refusal for a synthesised map of a superposition or product that holds a
+/// point mass, over a continuous variate.
+pub(crate) fn refuse_point_mass_mix(f: NodeId, m: &Module) -> RefuseError {
+    refuse(
+        f,
+        m,
+        "the base holds a point mass beside other components (in a superposition or a \
+         product): the inverse does not locate the atom exactly, and the map is not yet \
+         lowered component by component",
+    )
+}
+
+/// The refusal for a map of a law on a lower-dimensional support that §06 gives
+/// no density.
+pub(crate) fn refuse_lower_dimensional(f: NodeId, m: &Module) -> RefuseError {
+    refuse(
+        f,
+        m,
+        "the image of a law on a lower-dimensional support has no density: §03 and §06 fix \
+         its reference measure only for a stdsimplex(n) or zerosum(n) support under a uniform \
+         scale and shift (a .* x .+ b, scalar a)",
+    )
+}
+
 /// One op `gᵢ` in a scalar chain, carrying what its inverse and local logvol
 /// need: for a [`REGISTRY`] unary the shared entry, for the affine ops the independent
 /// operand `c`. Neither leg needs a node off the FORWARD body — both are built at
@@ -219,16 +302,28 @@ pub(crate) fn derive_bijection(
     f: NodeId,
     domain: &Type,
     support: &ValueSet,
+    carrier: Carrier,
 ) -> Result<Option<Bijection>, RefuseError> {
     // Resolve the self-ref alias chain (`pushfwd(g, M)` where `g = exp`).
     let (f_resolved, _) = resolve_ref(m, f);
+    match carrier {
+        Carrier::Unreferenced => return Err(refuse_lower_dimensional(f, m)),
+        Carrier::MixedDimension => return Err(refuse_mixed_dimension(f, m)),
+        // A point mass derives as a full-dimensional base; the density takes no
+        // volume element or refuses (`crate::density::lower_pushfwd`).
+        Carrier::Full | Carrier::PointMass | Carrier::PointMassMix | Carrier::Chart { .. } => {}
+    }
     // A MATRIX variate has no recognised forward map here: §06 case 1's set is
     // scalar, elementwise-over-a-vector, and matrix-VECTOR affine (`mu + L * x`).
     // Unrefused it took the scalar derivation, which emits one scalar log-volume
     // against the whole matrix — the rank-2 analogue of the vector defect the
     // dispatch below closes, where the log-det is the SUM over all r·c cells.
+    // A lower-dimensional matrix base (`iid(Dirichlet(…), k)`) takes no map.
     if domain_is_matrix(domain) {
-        if let Recognized::Lambda { body, ph } = recognise(m, f_resolved)
+        if matches!(
+            carrier,
+            Carrier::Full | Carrier::PointMass | Carrier::PointMassMix
+        ) && let Recognized::Lambda { body, ph } = recognise(m, f_resolved)
             && let Some(bij) = derive_array_affine(m, body, ph, domain)?
         {
             return Ok(Some(bij));
@@ -240,13 +335,14 @@ pub(crate) fn derive_bijection(
              map here except a scalar-scaled affine map (a * x + c)",
         ));
     }
-    // The VECTOR variate dispatch comes BEFORE the bare/lambda split, because the
-    // bare spelling of an elementwise map is still an elementwise map (§06 nowhere
-    // distinguishes `pushfwd(g, M)` from `pushfwd(x -> broadcast(g, x), M)` over a
-    // vector base) and its Jacobian is DIAGONAL. Reached after the split, a bare
-    // operator took the SCALAR derivation and emitted that op's scalar log-volume
-    // against an n-vector — `sub(<scalar>, log(y))` with a vector `log(y)` — where
-    // the log-det is `Σᵢ log|g'(yᵢ)|`.
+    if let Carrier::Chart { deficit } = carrier {
+        return derive_uniform_affine(m, f, f_resolved, domain, support, deficit);
+    }
+    // The VECTOR variate dispatch comes BEFORE the bare/lambda split: a bare name
+    // over a vector is either a scalar-domain name, which is no map of a vector
+    // (written `fn(g.(_))`), or an array-domain one such as `neg`, whose Jacobian
+    // is over the whole vector. Neither may take the SCALAR derivation, whose one
+    // scalar log-volume does not sum over the cells.
     if domain_is_vector(domain) {
         return derive_vector_bijection(m, f, f_resolved, domain, support);
     }
@@ -276,11 +372,13 @@ pub(crate) fn derive_bijection(
 ///   MvNormal construction, §08 `MvNormal`);
 /// * an elementwise affine map `x .* a .+ b` ([`derive_broadcast_affine`]);
 /// * an ELEMENTWISE unary map, whose diagonal Jacobian makes `logvol` the SUM of
-///   the per-cell scalar forward log-derivatives. Both its spellings land here: the
-///   bare operator (`pushfwd(exp, MvNormal)`) derives the per-cell map over the
-///   vector's ELEMENT domain and support, and `broadcast(g, x)` recurses on `g` the
-///   same way ([`derive_elementwise`]); both then go through [`wrap_elementwise`],
-///   so the two emit the identical term.
+///   the per-cell scalar forward log-derivatives: `broadcast(g, x)` recurses on `g`
+///   over the vector's ELEMENT domain and support ([`derive_elementwise`]) and goes
+///   through [`wrap_elementwise`];
+/// * `neg`, the one array-domain name in the registry, as its per-cell entry.
+///
+/// A scalar-domain name (`pushfwd(exp, MvNormal)`) refuses: it is no map of a
+/// vector, and inference reports it first.
 ///
 /// Anything else refuses rather than falling through to the scalar chain, whose
 /// per-op log-volume is not summed over the vector's axes and would silently
@@ -296,9 +394,12 @@ fn derive_vector_bijection(
     let elem_domain = vector_elem_domain(domain);
     let elem_sup = elem_support(support);
     match recognise(m, f_resolved) {
-        // The bare operator IS the per-cell map, so the §06 domain restriction is
-        // checked against the ELEMENT support — the same support the `broadcast`
-        // spelling's recursion reads.
+        Recognized::BareConst(name) if flatppl_infer::scalar_domain_function(&name) => {
+            Err(refuse_scalar_name_over_array(f, m, &name))
+        }
+        // An array-domain name (`neg`, §07) acts on the whole variate, and the only
+        // one in the registry acts cell by cell too, so its per-cell entry is checked
+        // against the ELEMENT support.
         Recognized::BareConst(name) => match bare_bijection(m, &name, f, &elem_sup)? {
             Some(per_cell) => Ok(Some(wrap_elementwise(m, &per_cell))),
             None => Ok(None),
@@ -326,6 +427,133 @@ fn derive_vector_bijection(
         }
         Recognized::Unrecognized => Ok(None),
     }
+}
+
+/// A scalar-domain name over an array variate. Inference reports it first; this
+/// keeps the determinizer from reading the name per cell on its own.
+pub(crate) fn refuse_scalar_name_over_array(f: NodeId, m: &Module, name: &str) -> RefuseError {
+    refuse(
+        f,
+        m,
+        &format!(
+            "pushfwd's map `{name}` takes a scalar, and the base measure's variate is an array. \
+             Write the elementwise map `fn({name}.(_))` (spec §04 \"Broadcasting\")"
+        ),
+    )
+}
+
+/// The maps of a law on a [`Carrier::Chart`] support whose image has a density:
+/// the uniform affine maps of [`flatppl_infer::uniform_affine_steps`] (`neg`,
+/// shifts, and a scalar scale, plain or broadcast, composed). Every other map
+/// refuses ([`refuse_lower_dimensional`]).
+fn derive_uniform_affine(
+    m: &mut Module,
+    f: NodeId,
+    f_resolved: NodeId,
+    domain: &Type,
+    support: &ValueSet,
+    deficit: u64,
+) -> Result<Option<Bijection>, RefuseError> {
+    let (body, ph) = match recognise(m, f_resolved) {
+        Recognized::BareConst(name) if flatppl_infer::scalar_domain_function(&name) => {
+            return Err(refuse_scalar_name_over_array(f, m, &name));
+        }
+        // The uniform scale −1: a volume term of 0 at any deficit.
+        Recognized::BareConst(name) if name == "neg" => {
+            return derive_bijection(m, f, domain, support, Carrier::Full);
+        }
+        Recognized::BareConst(_) => return Err(refuse_lower_dimensional(f, m)),
+        Recognized::Lambda { body, ph } => (body, ph),
+        Recognized::Unrecognized => return Ok(None),
+    };
+    let scalar = |m: &Module, c: NodeId| {
+        matches!(m.node(resolve_ref(m, c).0), Node::Lit(_))
+            || matches!(m.type_of(c), Some(Type::Scalar(_)))
+    };
+    let Some(steps) = flatppl_infer::uniform_affine_steps(
+        m,
+        body,
+        &|n| resolve_ref(m, n).0,
+        &|n| is_placeholder_ref(m, n, ph),
+        &|n| refs_placeholder(m, n, ph),
+        &|n| scalar(m, n),
+    ) else {
+        return Err(refuse_lower_dimensional(f, m));
+    };
+    use flatppl_infer::AffineStep;
+    for step in &steps {
+        if let AffineStep::Mul(a) | AffineStep::Div(a) = step
+            && has_static_zero(m, *a)
+        {
+            return Err(refuse(
+                *a,
+                m,
+                "elementwise affine forward map has a zero scale entry, which collapses the map \
+                 onto a hyperplane: it is not a bijection and has no density (§06 case 3) — refuse",
+            ));
+        }
+    }
+    // The inverse undoes the steps outermost first, cell by cell.
+    let f_inv = lambda(m, |m, y| {
+        steps.iter().fold(y, |acc, step| {
+            let (op, args) = match *step {
+                AffineStep::Neg => ("neg", vec![acc]),
+                AffineStep::Add(c) => ("sub", vec![acc, c]),
+                AffineStep::Sub(c) => ("add", vec![acc, c]),
+                AffineStep::RSub(c) => ("sub", vec![c, acc]),
+                AffineStep::Mul(c) => ("divide", vec![acc, c]),
+                AffineStep::Div(c) => ("mul", vec![acc, c]),
+            };
+            let op = bare_const(m, op);
+            let args: Vec<NodeId> = std::iter::once(op).chain(args).collect();
+            build_call(m, "broadcast", &args)
+        })
+    });
+    // Each of the cells − deficit free coordinates scales by the product of the scales.
+    let log_scale = |m: &mut Module| -> Option<NodeId> {
+        let terms: Vec<NodeId> = steps
+            .iter()
+            .filter_map(|step| match *step {
+                AffineStep::Mul(c) => Some((c, false)),
+                AffineStep::Div(c) => Some((c, true)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(c, inverse)| {
+                let abs = build_call(m, "abs", &[c]);
+                let log = build_call(m, "log", &[abs]);
+                if inverse {
+                    build_call(m, "neg", &[log])
+                } else {
+                    log
+                }
+            })
+            .collect();
+        (!terms.is_empty()).then(|| fold_add(m, &terms))
+    };
+    let logvol = match static_vector_len(domain) {
+        Some(n) => lambda(m, |m, _y| match log_scale(m) {
+            Some(term) => {
+                let free = real_lit(m, (n as u64).saturating_sub(deficit) as f64);
+                build_call(m, "mul", &[free, term])
+            }
+            None => real_lit(m, 0.0),
+        }),
+        // A dynamic length: every cell's term, less the deficit's.
+        None => lambda(m, |m, y| match log_scale(m) {
+            Some(term) => {
+                let per_cell = lambda(m, |_m, _c| term);
+                let cells = build_call(m, "broadcast", &[per_cell, y]);
+                let total = build_call(m, "sum", &[cells]);
+                let lost = real_lit(m, deficit as f64);
+                let lost = build_call(m, "mul", &[lost, term]);
+                build_call(m, "sub", &[total, lost])
+            }
+            None => real_lit(m, 0.0),
+        }),
+    };
+    Ok(Some(Bijection { f_inv, logvol }))
 }
 
 /// An elementwise location-scale map `x .* a .+ b` over a vector has the diagonal
@@ -1043,7 +1271,8 @@ fn interval_witness(lo: f64, hi: f64) -> Option<f64> {
 }
 
 /// The scalar per-cell operator of an elementwise forward map over a vector
-/// variate: the map ITSELF for the bare spelling (`pushfwd(exp, MvNormal)`), or
+/// variate: the map ITSELF for a bare name (only `neg`, an array-domain name in the
+/// registry, reaches here: a scalar-domain name over a vector refuses), or
 /// the [`elementwise_cell`] map for the lambda spelling (`x -> broadcast(exp, x)`,
 /// `x -> x .^ 3`).
 /// `None` for any other vector body — a matrix-affine map, or a coupled broadcast
@@ -2777,13 +3006,14 @@ fn derive_elementwise(
     // `log`/`pow` cell op). `None` → arm does not apply; `Err` → propagate (a
     // recognised-but-non-invertible `g`). A synthesised `pow` cell has no source
     // location, so its refusal points at the broadcast.
-    let g_bij = derive_bijection(m, cell, elem_domain, elem_support).map_err(|mut e| {
-        if cell != g {
-            e.node = body;
-            e.construct = name_construct(m, body);
-        }
-        e
-    })?;
+    let g_bij =
+        derive_bijection(m, cell, elem_domain, elem_support, Carrier::Full).map_err(|mut e| {
+            if cell != g {
+                e.node = body;
+                e.construct = name_construct(m, body);
+            }
+            e
+        })?;
     let Some(g_bij) = g_bij else {
         return Ok(None);
     };

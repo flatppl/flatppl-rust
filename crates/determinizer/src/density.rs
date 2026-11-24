@@ -3223,6 +3223,9 @@ fn lower_superpose(
         }
         c.args.to_vec()
     };
+    if flatppl_infer::measure_chart(m, node) == flatppl_infer::MeasureChart::MixedDimension {
+        return Err(crate::invert::refuse_mixed_dimension(node, m));
+    }
 
     let own_atoms = if atoms.is_empty() {
         let references: Option<Vec<_>> = inner_measures
@@ -5217,11 +5220,35 @@ fn lower_pushfwd(
                     "bijection expects 3 args (f, f_inv, logvol)",
                 ));
             }
+            // Its forward is the map: a scalar-domain name is no map of an array.
+            if let Node::Const(op) = *m.node(resolve_ref(m, bij.args[0]).0)
+                && flatppl_infer::scalar_domain_function(m.resolve(op))
+                && matches!(domain, Type::Array { .. } | Type::TVector { .. })
+            {
+                let name = m.resolve(op).to_string();
+                return Err(crate::invert::refuse_scalar_name_over_array(
+                    bij.args[0],
+                    m,
+                    &name,
+                ));
+            }
             (bij.args[1], bij.args[2], bij.args[0], false)
         } else {
             refuse_variate_kind_mismatch(m, &domain, v)?;
             // Not an explicit bijection: try analytic synthesis (§06 case 1).
-            match crate::invert::derive_bijection(m, bij_resolved, &domain, &support)? {
+            let carrier = crate::invert::carrier(m, m_inner, &support);
+            if reference_measure(&domain) == Some(Reference::Lebesgue) {
+                match carrier {
+                    crate::invert::Carrier::PointMass if point_mass_atom(m, m_inner).is_none() => {
+                        return Err(refuse_unwritten_point_mass(node, m));
+                    }
+                    crate::invert::Carrier::PointMassMix => {
+                        return Err(crate::invert::refuse_point_mass_mix(bij_resolved, m));
+                    }
+                    _ => {}
+                }
+            }
+            match crate::invert::derive_bijection(m, bij_resolved, &domain, &support, carrier)? {
                 Some(bij) => (bij.f_inv, bij.logvol, bij_resolved, true),
                 None => {
                     return Err(refuse(
@@ -5248,13 +5275,24 @@ fn lower_pushfwd(
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     // Decided AFTER the base has lowered, so a base that refuses for its own
     // reason reports that reason rather than this one.
-    let (density, lattice) = match reference_measure(&domain)
-        .ok_or_else(|| refuse_unproven_reference(node, m))?
-    {
+    let reference = reference_measure(&domain).ok_or_else(|| refuse_unproven_reference(node, m))?;
+    let atom = point_mass_atom(m, m_inner);
+    let (density, lattice) = match (reference, atom) {
+        // A point mass over a continuous variate: `pushfwd(f, Dirac(c))` is
+        // `Dirac(f(c))`, scored against the counting measure on its atom, so no
+        // volume element applies. The inverse need not return `c` exactly
+        // (`(1.2 − 1)/2 ≠ 0.1`), so the base is scored at `c` and the point is gated
+        // on the forward round trip `f(c) = v`, as the counting reference below
+        // snaps to the lattice.
+        (Reference::Lebesgue, Some(atom)) => {
+            let at_atom = on_lattice(m, bij_resolved, forward, v, atom, &domain, &parameter)?;
+            let density = crate::driver::substitute_in_tree(m, inner_density, preimage, atom);
+            (density, Some(at_atom))
+        }
         // Counting reference: no volume element (§06 "Density convention"). The
         // pushforward density IS the base's pmf at the preimage — SNAPPED to the
         // lattice, and gated on the snap being faithful.
-        Reference::Counting => {
+        (Reference::Counting, _) => {
             let snapped = snap_to_lattice(m, preimage, &domain);
             let lattice = on_lattice(m, bij_resolved, forward, v, snapped, &domain, &parameter)?;
             let at_atom = crate::driver::substitute_in_tree(m, inner_density, preimage, snapped);
@@ -5262,7 +5300,7 @@ fn lower_pushfwd(
         }
         // logvol_val = logvol(v) for a synthesised change of variables, logvol(preimage)
         // for an annotated one (see `logvol_in_query_point`).
-        Reference::Lebesgue => {
+        (Reference::Lebesgue, None) => {
             let at = if logvol_in_query_point { v } else { preimage };
             let logvol_val = if scalar_value(m, logvol_node) {
                 // §06 admits a scalar log-volume: the same value at every point.
@@ -5377,9 +5415,9 @@ fn on_lattice(
     domain: &Type,
     parameter: &[NodeId],
 ) -> Result<NodeId, RefuseError> {
-    // A bare scalar operator over a vector variate is the elementwise map (§06 case 1
-    // spells `pushfwd(g, M)` and `pushfwd(x -> broadcast(g, x), M)` alike), so its forward
-    // is `broadcast(g, snapped)`. `g(snapped)` applies a scalar-domain function to a vector.
+    // A bare operator over a vector variate is `neg`, the one array-domain name in
+    // the registry (a scalar-domain name refuses before this), and it acts cell by
+    // cell, so its forward is `broadcast(neg, snapped)`.
     let back = if parameter.is_empty()
         && variate_is_vector(domain)
         && matches!(m.node(resolve_ref(m, forward).0), Node::Const(_))
@@ -5487,6 +5525,25 @@ fn reference_measure(variate: &Type) -> Option<Reference> {
         Type::TVector { elem, .. } => reference_measure(elem),
         _ => None,
     }
+}
+
+/// The refusal for a map of a point mass written other than as `Dirac(c)` (a map or
+/// a wrapper of one): its pushforward is `Dirac(f(c))`, scored at an atom this pass
+/// reads only from a written `Dirac`.
+fn refuse_unwritten_point_mass(node: NodeId, m: &Module) -> RefuseError {
+    refuse(
+        node,
+        m,
+        "the base is a point mass that is not written as `Dirac(c)` (a map or a wrapper of \
+         one); its pushforward is the point mass at the image of the atom, which takes no \
+         volume element, and this pass reads the atom only from a written `Dirac`",
+    )
+}
+
+/// The atom `c` of a `Dirac(c)` base measure, through alias hops.
+fn point_mass_atom(m: &Module, measure: NodeId) -> Option<NodeId> {
+    let (base, _) = resolve_ref_chain(m, measure);
+    named_or_positional(m, expect_builtin_call(m, base, "Dirac")?, "value")
 }
 
 /// The variate domain and support of a change-of-variables base measure.
@@ -5621,14 +5678,44 @@ fn lower_locscale(
         }
         (c.args[0], c.args[1], c.args[2])
     };
-    let (domain, _) = measure_domain_and_support(m, m_inner);
+    let (domain, support) = measure_domain_and_support(m, m_inner);
+    // A vector `locscale` takes a matrix scale, which §06 gives no density over a
+    // lower-dimensional support (see `crate::invert::Carrier`).
+    match crate::invert::carrier(m, m_inner, &support) {
+        crate::invert::Carrier::Full => {}
+        crate::invert::Carrier::PointMass
+            if point_mass_atom(m, m_inner).is_some()
+                || reference_measure(&domain) != Some(Reference::Lebesgue) => {}
+        crate::invert::Carrier::PointMass => return Err(refuse_unwritten_point_mass(node, m)),
+        crate::invert::Carrier::PointMassMix
+            if reference_measure(&domain) != Some(Reference::Lebesgue) => {}
+        crate::invert::Carrier::PointMassMix => {
+            return Err(crate::invert::refuse_point_mass_mix(node, m));
+        }
+        crate::invert::Carrier::MixedDimension => {
+            return Err(crate::invert::refuse_mixed_dimension(node, m));
+        }
+        crate::invert::Carrier::Chart { .. } | crate::invert::Carrier::Unreferenced => {
+            return Err(crate::invert::refuse_lower_dimensional(node, m));
+        }
+    }
     let bij = crate::invert::derive_locscale(m, shift, scale, &domain)?;
     // §06 change-of-variables: logdensityof(m, f_inv(v)) − logvol(f_inv(v)). Both
     // applications go through the same reduce-or-refuse check as [`lower_pushfwd`]'s
     // tail — this shares that tail's shape, so it shares its residual-`%call` risk.
     let preimage = apply_change_of_variables(m, node, bij.f_inv, v, &[], "f_inv")?;
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
-    match reference_measure(&domain).ok_or_else(|| refuse_unproven_reference(node, m))? {
+    let reference = reference_measure(&domain).ok_or_else(|| refuse_unproven_reference(node, m))?;
+    match (reference, point_mass_atom(m, m_inner)) {
+        // A point mass: no volume element, the base scored at its atom and the
+        // point gated on the forward round trip, as in [`lower_pushfwd`].
+        (Reference::Lebesgue, Some(atom)) => {
+            let scaled = build_call(m, "mul", &[scale, atom]);
+            let back = build_call(m, "add", &[scaled, shift]);
+            let cond = lattice_test(m, v, back, &domain);
+            let at_atom = crate::driver::substitute_in_tree(m, inner_density, preimage, atom);
+            Ok(gate_density(m, cond, at_atom))
+        }
         // Counting reference: no volume element (§06 "Density convention"). An
         // affine map over a discrete base relabels its atoms and preserves their
         // mass; `log|scale|` would rescale it. See [`reference_measure`].
@@ -5637,7 +5724,7 @@ fn lower_locscale(
         // gives them — `(y − shift)/scale` need not land exactly on an integer — so
         // the preimage is snapped and gated on the round trip through §06's
         // `scale * x + shift`, built here from `shift`/`scale` directly.
-        Reference::Counting => {
+        (Reference::Counting, _) => {
             let snapped = snap_to_lattice(m, preimage, &domain);
             let scaled = build_call(m, "mul", &[scale, snapped]);
             let back = build_call(m, "add", &[scaled, shift]);
@@ -5646,7 +5733,7 @@ fn lower_locscale(
             // No image gate to share a witness with: `scale * x + shift` is onto.
             Ok(gate_density(m, cond, at_atom))
         }
-        Reference::Lebesgue => {
+        (Reference::Lebesgue, None) => {
             // Applied at `v`, the query point: `derive_locscale`'s logvol is the
             // synthesis convention (`crate::invert::Bijection`). It is CONSTANT in the
             // variate either way — `log|scale|` / `logabsdet(L)` ignore the argument —

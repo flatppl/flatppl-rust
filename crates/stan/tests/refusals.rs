@@ -1063,9 +1063,9 @@ fn a_bare_name_outside_its_domain_refuses_as_its_written_map() {
 }
 
 #[test]
-fn a_bare_name_over_a_vector_law_is_not_yet_like_its_written_form() {
-    // Over an array variate the name applies per cell; its written form
-    // `fn(broadcast(exp, _))` is not written by the emitter yet either.
+fn a_bare_name_over_a_vector_law_is_an_inference_error_and_its_written_form_not_yet() {
+    // A scalar-domain name is no map of an array variate: inference reports
+    // it, naming `fn(exp.(_))`, which the emitter does not write yet.
     let source = |map: &str| {
         posterior(
             &format!(
@@ -1076,15 +1076,150 @@ fn a_bare_name_over_a_vector_law_is_not_yet_like_its_written_form() {
         )
         .replace("record(y = 0.5)", "record(v = [1.2, 0.5, 2.0], y = 0.5)")
     };
-    let bare = refuse(&source("exp"));
-    assert_eq!(bare.kind, RefusalKind::NotYetSupported, "{bare}");
-    assert!(
-        bare.reason
-            .contains("pushfwd through `exp` applied per cell of a law over arrays"),
-        "{bare}"
+    let mut module = flatppl_syntax::parse(&source("exp")).expect("parse");
+    let diagnostics = flatppl_infer::infer_module(
+        &mut module,
+        &flatppl_infer::ModuleBundle::new(),
+        flatppl_infer::Level::Shape,
     );
-    let written = refuse(&source("fn(broadcast(exp, _))"));
-    assert_eq!(written.kind, RefusalKind::NotYetSupported, "{written}");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.severity == flatppl_infer::Severity::Error
+                && d.message
+                    .contains("Write the elementwise map `fn(exp.(_))`")),
+        "{diagnostics:?}"
+    );
+    for written in ["fn(broadcast(exp, _))", "fn(exp.(_))"] {
+        let written = refuse(&source(written));
+        assert_eq!(written.kind, RefusalKind::NotYetSupported, "{written}");
+    }
+}
+
+#[test]
+fn a_map_of_a_lower_dimensional_law_has_no_stan_form_but_a_uniform_scale() {
+    // §03/§06 fix the image's reference measure only for a uniform scale and
+    // shift of a stdsimplex or zerosum support; the rest has no density.
+    let source = |map: &str, base: &str, v: &str| {
+        posterior(
+            &format!("mu ~ Normal(0, 1)\nv ~ pushfwd({map}, {base})\ny ~ Normal(mu, 1)"),
+            "lawof(record(mu = mu))",
+            "kernelof(record(v = v, y = y), mu = mu)",
+        )
+        .replace("record(y = 0.5)", &format!("record(v = {v}, y = 0.5)"))
+    };
+    let dirichlet = "Dirichlet([2.0, 3.0, 4.0])";
+    let point = "[1.4, 1.6, 2.0]";
+    let lkj = "rowstack([[2.0, 0.0], [0.0, 2.0]])";
+    for (map, base, v) in [
+        ("fn(exp.(_))", dirichlet, point),
+        ("fn([2.0, 3.0, 4.0] .* _)", dirichlet, point),
+        ("fn(2.0 * _)", "LKJ(2, 2.0)", lkj),
+        ("fn(2.0 * _)", "LKJCholesky(2, 2.0)", lkj),
+    ] {
+        let r = refuse(&source(map, base, v));
+        assert_eq!(
+            r.kind,
+            RefusalKind::NonBijectivePushfwd,
+            "{map} {base}: {r}"
+        );
+        assert!(r.reason.contains("lower-dimensional support"), "{r}");
+    }
+    for map in [
+        "fn(2.0 .* _ .+ 1.0)",
+        "fn(2.0 * _ + [1.0, 1.0, 1.0])",
+        "neg",
+    ] {
+        let r = refuse(&source(map, dirichlet, point));
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{map}: {r}");
+    }
+    // A measure that is no law reaches the check through a log-density target,
+    // and a wrapper that keeps the support does not hide it.
+    let target = |m: &str| {
+        format!(
+            "y = elementof(cartpow(reals, 3))\nM = {m}\nlp = logdensityof(M, y)\n\
+             inputs = (y)\noutputs = (lp)\n"
+        )
+    };
+    for m in [
+        "pushfwd(fn(exp.(_)), Lebesgue(zerosum(3)))",
+        "pushfwd(fn(exp.(_)), Lebesgue(stdsimplex(3)))",
+        "pushfwd(fn(exp.(_)), normalize(Lebesgue(stdsimplex(3))))",
+        "pushfwd(fn(exp.(_)), logweighted(fn(-0.5 * sum(_ .^ 2)), Lebesgue(zerosum(3))))",
+    ] {
+        let r = refuse_with(&target(m), Some("lp"));
+        assert_eq!(r.kind, RefusalKind::NonBijectivePushfwd, "{m}: {r}");
+        assert!(r.reason.contains("lower-dimensional support"), "{r}");
+    }
+    let r = refuse_with(
+        &target("pushfwd(fn(2.0 .* _), Lebesgue(zerosum(3)))"),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    // The support is the inferred value set: through `iid` and a binding too.
+    let nested = |m: &str| {
+        format!(
+            "y = elementof(cartpow(cartpow(reals, 3), 2))\nM = {m}\n\
+             lp = logdensityof(M, y)\ninputs = (y)\noutputs = (lp)\n"
+        )
+    };
+    for (source, never) in [
+        (
+            nested("pushfwd(fn(broadcast(fn(exp.(_)), _)), iid(Dirichlet([2.0, 3.0, 4.0]), 2))"),
+            true,
+        ),
+        (
+            nested("pushfwd(fn(2.0 .* _), iid(Dirichlet([2.0, 3.0, 4.0]), 2))"),
+            false,
+        ),
+        (
+            target("pushfwd(fn(exp.(_)), D)").replace("y =", "D = Dirichlet([2.0, 3.0, 4.0])\ny ="),
+            true,
+        ),
+    ] {
+        let r = refuse_with(&source, Some("lp"));
+        if never {
+            assert_eq!(r.kind, RefusalKind::NonBijectivePushfwd, "{source}: {r}");
+        } else {
+            assert_eq!(r.kind, RefusalKind::NotYetSupported, "{source}: {r}");
+        }
+    }
+}
+
+#[test]
+fn a_map_of_a_mapped_simplex_law_keeps_the_determinizer_class() {
+    // A bijection keeps the dimension of its support, and the uniform affine set
+    // is the determinizer's (`flatppl_infer::uniform_affine_steps`).
+    let target = |y: &str, m: &str| {
+        format!(
+            "D = Dirichlet([2.0, 3.0, 4.0])\ny = elementof({y})\nM = {m}\n\
+             lp = logdensityof(M, y)\ninputs = (y)\noutputs = (lp)\n"
+        )
+    };
+    let v3 = "cartpow(reals, 3)";
+    for (m, kind) in [
+        (
+            "pushfwd(fn(3.0 .* _), pushfwd(fn(2.0 .* _), D))",
+            RefusalKind::NotYetSupported,
+        ),
+        ("pushfwd(fn(_ ./ 2.0), D)", RefusalKind::NotYetSupported),
+        (
+            "pushfwd(fn(exp.(_)), pushfwd(fn(2.0 .* _), D))",
+            RefusalKind::NonBijectivePushfwd,
+        ),
+        (
+            "pushfwd(fn(exp.(_)), pushfwd(neg, D))",
+            RefusalKind::NonBijectivePushfwd,
+        ),
+    ] {
+        let r = refuse_with(&target(v3, m), Some("lp"));
+        assert_eq!(r.kind, kind, "{m}: {r}");
+    }
+    let dims =
+        "superpose(weighted(0.5, iid(Normal(0.0, 1.0), 2)), weighted(0.5, Dirichlet([1.0, 1.0])))";
+    let r = refuse_with(&target("cartpow(reals, 2)", dims), Some("lp"));
+    assert_eq!(r.kind, RefusalKind::MixedReference, "{r}");
+    assert!(r.reason.contains("different dimension"), "{r}");
 }
 
 #[test]
