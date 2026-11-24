@@ -717,6 +717,14 @@ fn convert_scalar(value: Scalar, target: ElemKind, dtype: Dtype) -> Option<Scala
         })),
         (Scalar::Bool(x), ElemKind::Real) => Some(Scalar::Real(f64::from(x))),
         (Scalar::Bool(x), ElemKind::Int) => Some(Scalar::Int(i64::from(x))),
+        // Only integral values in the target width convert exactly.
+        (Scalar::Real(x), ElemKind::Int) if x.fract() == 0.0 => {
+            let (low, high) = match dtype {
+                Dtype::F32 => (f64::from(i32::MIN), f64::from(i32::MAX)),
+                Dtype::F64 => (-(2f64.powi(63)), 2f64.powi(63) - 1024.0),
+            };
+            (low..=high).contains(&x).then_some(Scalar::Int(x as i64))
+        }
         _ => None,
     }
 }
@@ -846,6 +854,8 @@ fn real_unary(op: &str, x: f64, dtype: Dtype) -> Option<f64> {
             match op {
                 "stablehlo.negate" => -x,
                 "stablehlo.abs" => x.abs(),
+                "stablehlo.floor" => x.floor(),
+                "stablehlo.ceil" => x.ceil(),
                 "stablehlo.log" => $log(x),
                 "stablehlo.exponential" => $exp(x),
                 "stablehlo.sqrt" => $sqrt(x),
@@ -961,6 +971,34 @@ mod tests {
                 e.constant_real(&sum),
                 Some(if matches!(dtype, Dtype::F32) { 0. } else { 1. })
             );
+        }
+    }
+
+    // A real converts exactly only when it is integral and fits the integer
+    // width of the dtype. Other values keep the runtime conversion.
+    #[test]
+    fn real_to_integer_converts_fold_only_exact_values() {
+        let module = Module::new();
+        for (dtype, low, too_wide) in [
+            (Dtype::F32, -2147483648.0, 2147483648.0),
+            (Dtype::F64, -9223372036854775808.0, 9223372036854775808.0),
+        ] {
+            let mut e = Emitter::new(&module, dtype);
+            for (x, expected) in [(-3.0, -3), (low, low as i64)] {
+                let real = e.scalar(x);
+                let converted = e.convert(&real, ElemKind::Int);
+                assert_eq!(e.constant_int(&converted), Some(expected), "{x}");
+            }
+            for x in [2.5, -0.5, too_wide] {
+                let real = e.scalar(x);
+                let converted = e.convert(&real, ElemKind::Int);
+                assert_eq!(e.constant_int(&converted), None, "{x}");
+                assert!(
+                    e.body.contains(&format!("stablehlo.convert {}", real.ssa)),
+                    "{x}:\n{}",
+                    e.body
+                );
+            }
         }
     }
 

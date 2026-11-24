@@ -334,6 +334,11 @@ impl Emitter<'_> {
     pub(crate) fn constant_like(&mut self, x: f64, v: &Value) -> Value {
         let out = self.const_lit_like(&float_literal(self.dtype, x), v);
         self.remember_constant(&out.ssa, [Scalar::Real(x)]);
+        // As in `constant`: finiteness predicates fold against a fixed infinity.
+        if x.is_infinite() {
+            self.constants
+                .insert(out.ssa.clone(), [Scalar::Real(x)].into());
+        }
         out
     }
 

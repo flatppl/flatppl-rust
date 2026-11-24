@@ -9143,11 +9143,24 @@ fn emit_sample_categorical_single_category_iid_has_expected_structure() {
         0,
         "n - 1 = 0 selects: the unroll never runs, in:\n{out}"
     );
-    assert_eq!(
-        out.matches("stablehlo.broadcast_in_dim").count(),
-        1,
-        "the degenerate guard's explicit broadcast of the scalar base to [4], \
-         in:\n{out}"
+    // The degenerate guard yields the base category for every lane. It folds
+    // to one fixed [4] count, while the key still advances once and returns.
+    assert!(
+        out.contains("stablehlo.constant dense<1> : tensor<4xi32>"),
+        "the degenerate guard's fixed base category over the [4] batch, in:\n{out}"
+    );
+    let generator = out
+        .lines()
+        .find(|line| line.contains("stablehlo.rng_bit_generator %key"))
+        .expect("one generator advancing the input key");
+    let advanced = generator.trim().split(',').next().expect("advanced key");
+    let returned = out
+        .lines()
+        .find(|line| line.trim().starts_with("return "))
+        .expect("a return");
+    assert!(
+        returned.contains(&format!(", {advanced} : tensor<4xi32>, tensor<2xui64>")),
+        "the advanced key {advanced} is returned, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
