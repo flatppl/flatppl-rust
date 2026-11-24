@@ -1545,14 +1545,21 @@ fn locscale_truncated_scale_of_unknown_sign_is_not_yet() {
 }
 
 #[test]
-fn locscale_scale_of_unknown_sign_is_not_yet() {
+fn locscale_vector_shift_over_a_non_family_base_is_not_yet() {
     let r = refuse(&posterior(
-        "m ~ Normal(0, 1)\nsigma ~ locscale(Cauchy(0, 1), 0, m)\ny ~ Normal(sigma, 1)",
-        "lawof(record(m = m, sigma = sigma))",
-        "kernelof(record(y = y), m = m, sigma = sigma)",
+        "mu ~ Normal(0, 5)\ntau ~ Exponential(1)\n\
+         theta ~ locscale(iid(Exponential(1.0), 3), fill(mu, 3), tau)\ny ~ Normal(theta[1], 1.0)",
+        "lawof(record(theta = theta, mu = mu, tau = tau))",
+        "kernelof(record(y = y), theta = theta, mu = mu, tau = tau)",
     ));
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("scale of unknown sign"), "{r}");
+    assert!(
+        r.reason.contains(
+            "locscale with a vector shift over an iid Exponential law (only Normal, Cauchy, \
+             Logistic, Laplace and StudentT bases)"
+        ),
+        "{r}"
+    );
 }
 
 #[test]

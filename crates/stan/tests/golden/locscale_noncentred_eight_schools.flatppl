@@ -1,0 +1,14 @@
+flatppl_compat = "0.1"
+# Eight schools with the non-centred `locscale(iid(Normal(0, 1), J), fill(mu, J), tau)`:
+# theta is declared `<offset, multiplier>` after mu and tau.
+J = 8
+ys = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
+sig = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
+mu ~ Normal(0, 5)
+tau ~ normalize(truncate(Cauchy(0, 5), interval(0, inf)))
+theta ~ locscale(iid(Normal(0, 1), J), fill(mu, J), tau)
+y ~ Normal.(theta, sig)
+Pi_prior = lawof(record(theta = theta, mu = mu, tau = tau))
+K_model = kernelof(record(y = y), theta = theta, mu = mu, tau = tau)
+L = likelihoodof(K_model, record(y = ys))
+Pi_post = bayesupdate(L, Pi_prior)
