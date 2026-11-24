@@ -74,7 +74,11 @@ impl Emitter<'_> {
         let count = self.convert(&requested, ElemKind::Int);
         let one = self.int_value_const(1);
         let last = self.sub(&count, &one);
-        let output = self.matrix_loop(maximum, 0, initial, |e, index, state| {
+        // Trips past a fixed budget only select the unchanged state.
+        let trips = self
+            .constant_int(&count)
+            .map_or(maximum, |n| n.clamp(0, maximum as i64) as u64);
+        let output = self.matrix_loop(trips, 0, initial, |e, index, state| {
             let state: Vec<_> = state
                 .iter()
                 .zip(initial)

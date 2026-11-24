@@ -10,13 +10,13 @@ module attributes {flatppl.runtime_status = 1 : i64} {
     %9 = stablehlo.compare EQ, %arg0, %0 : (tensor<f32>, tensor<f32>) -> tensor<i1>
     %10 = stablehlo.select %9, %8, %arg0 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
     %15 = stablehlo.log %10 : tensor<f32>
-    %52 = stablehlo.multiply %6, %15 : tensor<f32>
-    %54 = stablehlo.constant dense<"0x6058E53F"> : tensor<f32>
-    %55 = stablehlo.subtract %52, %10 : tensor<f32>
-    %56 = stablehlo.subtract %55, %54 : tensor<f32>
-    %99 = stablehlo.constant dense<0x7F800000> : tensor<f32>
-    %100 = stablehlo.negate %99 : tensor<f32>
-    %101 = stablehlo.select %9, %100, %56 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    return %101, %4 : tensor<f32>, tensor<i32>
+    %49 = stablehlo.multiply %6, %15 : tensor<f32>
+    %51 = stablehlo.constant dense<"0x6058E53F"> : tensor<f32>
+    %52 = stablehlo.subtract %49, %10 : tensor<f32>
+    %53 = stablehlo.subtract %52, %51 : tensor<f32>
+    %96 = stablehlo.constant dense<0x7F800000> : tensor<f32>
+    %97 = stablehlo.negate %96 : tensor<f32>
+    %98 = stablehlo.select %9, %97, %53 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    return %98, %4 : tensor<f32>, tensor<i32>
   }
 }

@@ -209,6 +209,26 @@ fn remaining_special_functions_lower_with_live_inputs() {
     }
 }
 
+// A fixed budget bounds the loop by its active trips: ceil(12 sqrt(1.5) + 64) = 79
+// series terms and ceil(16 1.5^(1/4) + 64) = 82 fraction terms. Live arguments
+// keep the static tape bound, which masks the trips past the runtime budget.
+#[test]
+fn a_fixed_budget_bounds_special_function_loops() {
+    let fixed = emit(&format!(
+        "{SF}\na = elementof(reals)\nv = sf.gammainc(1.5, 20.0)\ninputs = (a)\noutputs = (a, v)"
+    ));
+    for bound in ["dense<79> : tensor<i64>", "dense<82> : tensor<i64>"] {
+        assert!(fixed.contains(bound), "{bound}:\n{fixed}");
+    }
+    for bound in ["dense<16384> : tensor<i64>", "dense<4096> : tensor<i64>"] {
+        assert!(!fixed.contains(bound), "{bound}:\n{fixed}");
+    }
+    let live = emit(&format!(
+        "{SF}\nv = external(reals)\nx = external(reals)\ninputs = (v, x)\noutputs = sf.gammainc(v, x)"
+    ));
+    assert!(live.contains("dense<16384> : tensor<i64>"), "{live}");
+}
+
 #[test]
 fn complex_bessel_projections_preserve_broadcast_shape_and_aliases() {
     let source = format!(
