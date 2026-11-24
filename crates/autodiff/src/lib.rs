@@ -8,6 +8,7 @@ mod aggregate;
 mod callbacks;
 mod contract;
 mod fixed_scan;
+mod gamma_shape;
 mod integral;
 mod math;
 mod metric;
@@ -16,17 +17,20 @@ mod record;
 mod recurrence;
 mod rules;
 mod source;
+mod table;
 mod tensor;
 mod transforms;
+mod tuple;
 mod vector_scan;
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use flatppl_core::graph::{build_call, expect_builtin_call};
 use flatppl_core::{
-    Binding, BindingId, CallHead, DEFAULT_MAX_DEPTH, Dim, Module, Node, NodeId, Ref, RefNs, Scalar,
-    ScalarType, Symbol, Type,
+    Binding, BindingId, Call, CallHead, DEFAULT_MAX_DEPTH, Dim, Module, Node, NodeId, Phase, Ref,
+    RefNs, Scalar, ScalarType, Symbol, Type,
 };
 
 use flatppl_determinizer::LoweringOptions;
@@ -138,10 +142,11 @@ pub fn prepare_source_with_options(
 ///
 /// The module must declare a single real scalar `outputs` value. A query with
 /// no arguments may omit `inputs`. An empty selection returns just the primal.
-/// Each requested name must occur in `inputs` and denote a real scalar or a
-/// fixed-shape real array, including a fixed nonempty vector of real vectors,
-/// or a nonempty record of such values. Each derivative has the input's shape. All
-/// declared inputs are independent, including promoted fixed or derived
+/// Each requested name must occur in `inputs`. Supported values include real
+/// scalars, fixed-shape real arrays, records, fixed-row tables, and promoted
+/// fixed tuples of these. A selected tuple needs a derivative at every position.
+/// Record and table derivatives retain the names and shapes of the real fields.
+/// All declared inputs are independent, including promoted fixed or derived
 /// bindings. The returned module preserves the input signature and replaces
 /// `outputs` with `(value, derivative, ...)`.
 ///
@@ -167,10 +172,10 @@ pub fn gradient_with_options(
 
 /// Append one vector–Jacobian product per selected input.
 ///
-/// Append one cotangent input per original output. Results contain the original
-/// outputs followed by the input cotangents in request order. Selected inputs
-/// can be real scalars, fixed-shape arrays, or nonempty records of these values.
-/// Outputs can use the same real-valued scalars, arrays and records as inputs.
+/// Append one cotangent input per differentiable output, recursively splitting tuple outputs.
+/// Results contain the original outputs followed by the input cotangents in request order.
+/// Selected inputs follow the rules for [`gradient`].
+/// Outputs can also group these values in nested tuples.
 /// An empty selection appends the output cotangents and returns just the primals.
 pub fn vjp(module: &Module, wrt: &[&str]) -> Result<Module, Error> {
     vjp_with_options(module, wrt, &LoweringOptions::default())
@@ -192,10 +197,10 @@ pub fn vjp_with_options(
 /// Append one Jacobian–vector product per original output.
 ///
 /// Append one tangent input per selected input. Results contain the original
-/// outputs followed by their tangents. Selected inputs can be real scalars,
-/// fixed-shape arrays, or nonempty records of these values.
-/// Outputs can use the same real-valued scalars, arrays and records as inputs.
-/// An empty selection takes no tangents and returns one zero tangent per primal.
+/// outputs followed by their tangents for differentiable components.
+/// Selected inputs follow the rules for [`gradient`].
+/// Outputs can also group these values in nested tuples.
+/// An empty selection takes no tangents and returns zero tangents for the differentiable outputs.
 pub fn jvp(module: &Module, wrt: &[&str]) -> Result<Module, Error> {
     jvp_with_options(module, wrt, &LoweringOptions::default())
 }
@@ -226,16 +231,18 @@ fn transform(
     options: &LoweringOptions<'_>,
 ) -> Result<Module, Error> {
     check_flatpdl(module, options)?;
-    let query = Query::read(module, wrt, mode)?;
+    let mut module = Cow::Borrowed(module);
+    let mut query = Query::read(&mut module, wrt, mode)?;
     let legalized = if wrt.is_empty() {
         None
     } else {
-        callbacks::legalize(module, &query)
+        callbacks::legalize(&module, &query)
     };
-    let (module, query) = match legalized.as_ref() {
-        Some(legalized) => (legalized, Query::read(legalized, wrt, mode)?),
-        None => (module, query),
-    };
+    if let Some(legalized) = legalized {
+        module = Cow::Owned(legalized);
+        query = Query::read(&mut module, wrt, mode)?;
+    }
+    let module = module.as_ref();
     let roots: Vec<_> = query
         .results
         .iter()
@@ -297,18 +304,37 @@ fn transform(
         reverse(&mut emitter, &plan, &rules, &roots, &seeds, mode)?
     };
     let mut values: Vec<_> = query
-        .results
+        .output_items
         .iter()
         .map(|&node| emitter.primal(node))
         .collect();
     let mut expected: Vec<_> = query
-        .results
+        .output_items
         .iter()
         .map(|&node| module.type_of(node).unwrap().clone())
         .collect();
-    for (name, reference, value) in derived {
-        values.push(emitter.define(&name, value));
-        expected.push(module.type_of(reference).unwrap().clone());
+    if mode == Mode::Jvp {
+        let mut tangents = derived
+            .into_iter()
+            .map(|(name, _, value)| emitter.define(&name, value))
+            .collect::<Vec<_>>()
+            .into_iter();
+        for &node in &query.output_items {
+            if let Some(ty) = module.type_of(node).and_then(record::tangent_type) {
+                values.push(group_tangents(&mut emitter.module, &ty, &mut tangents));
+                expected.push(ty);
+            }
+        }
+    } else {
+        for (name, reference, value) in derived {
+            values.push(emitter.define(&name, value));
+            expected.push(
+                module
+                    .type_of(reference)
+                    .and_then(record::tangent_type)
+                    .unwrap(),
+            );
+        }
     }
     let result = build_abi(&mut emitter.module, &values);
     emitter.module.set_binding_rhs(query.output, result);
@@ -335,7 +361,7 @@ fn transform(
 }
 
 type Derived = Vec<(String, NodeId, NodeId)>;
-type Contributions = HashMap<Key, Vec<(NodeId, bool)>>;
+type Contributions = HashMap<Key, Vec<(record::Cotangent, bool)>>;
 
 fn reverse(
     emitter: &mut Emitter,
@@ -351,7 +377,7 @@ fn reverse(
         .iter()
         .map(|input| {
             let derivative = match contributions.remove(&Key::Input(input.binding)) {
-                Some(terms) => combine_contributions(emitter, input.reference, terms),
+                Some(terms) => combine_contributions(emitter, input.reference, terms)?,
                 None => emitter.zero_like(input.reference)?,
             };
             Ok((format!("d_{}", input.name), input.reference, derivative))
@@ -384,7 +410,7 @@ fn reverse_values_with_mask(
         contributions
             .entry(root)
             .or_default()
-            .push((seed, seed_masked));
+            .push((record::Cotangent::Whole(seed), seed_masked));
     }
     for step in plan.steps.iter().rev() {
         let terms = contributions.remove(&Key::Node(step.node)).ok_or_else(|| {
@@ -393,9 +419,26 @@ fn reverse_values_with_mask(
                 "missing cotangent for an active expression",
             )
         })?;
-        let masked = terms.iter().any(|&(_, masked)| masked);
-        let terms: Vec<_> = terms.into_iter().map(|(value, _)| value).collect();
-        let bar = emitter.named_adjoint("_ad_bar", step.node, &terms);
+        let masked = terms.iter().any(|(_, masked)| *masked);
+        if let Some(path) = step.record_access(plan.module) {
+            if let Some(target) = step.targets[0].filter(|key| plan.activity[key]) {
+                let terms = terms.into_iter().map(|(value, _)| value).collect();
+                let bar = record::sum(emitter, step.node, terms)?;
+                let bar = match bar {
+                    record::Cotangent::Whole(value) => {
+                        record::Cotangent::Whole(emitter.name_adjoint("_ad_bar", value))
+                    }
+                    _ => bar,
+                };
+                contributions
+                    .entry(target)
+                    .or_default()
+                    .push((bar.through(&path), masked));
+            }
+            continue;
+        }
+        let bar = combine_contributions(emitter, step.node, terms)?;
+        let bar = emitter.name_adjoint("_ad_bar", bar);
         if step.op == fixed_scan::OP {
             let projection =
                 fixed_scan::Projection::read(plan.module, &plan.query.inputs, step.node)
@@ -406,7 +449,7 @@ fn reverse_values_with_mask(
                     contributions
                         .entry(target)
                         .or_default()
-                        .push((term, masked));
+                        .push((record::Cotangent::Whole(term), masked));
                 }
             }
             continue;
@@ -466,10 +509,10 @@ fn reverse_values_with_mask(
             } else {
                 contribution
             };
-            contributions
-                .entry(target)
-                .or_default()
-                .push((contribution, masked || step.op == "ifelse"));
+            contributions.entry(target).or_default().push((
+                record::Cotangent::Whole(contribution),
+                masked || step.op == "ifelse",
+            ));
         }
     }
     Ok(contributions)
@@ -478,10 +521,10 @@ fn reverse_values_with_mask(
 fn combine_contributions(
     emitter: &mut Emitter,
     primal: NodeId,
-    terms: Vec<(NodeId, bool)>,
-) -> NodeId {
-    let terms: Vec<_> = terms.into_iter().map(|(value, _)| value).collect();
-    tensor::add_terms(emitter, primal, &terms)
+    terms: Vec<(record::Cotangent, bool)>,
+) -> Result<NodeId, Error> {
+    let terms = terms.into_iter().map(|(value, _)| value).collect();
+    record::sum(emitter, primal, terms)?.materialize(emitter, primal)
 }
 
 fn forward(
@@ -547,6 +590,17 @@ fn forward_values(
             continue;
         }
         step.check_types(plan.module)?;
+        if matches!(step.op, "record" | "table") {
+            let fields = step
+                .targets
+                .iter()
+                .map(|target| target.and_then(|key| tangents.get(&key)).copied());
+            let tangent =
+                record::construct_tangent(emitter, step.node, &step.args, fields, step.op)?;
+            let tangent = emitter.name_adjoint("_ad_tangent", tangent);
+            tangents.insert(Key::Node(step.node), tangent);
+            continue;
+        }
         let terms: Vec<_> = step
             .targets
             .iter()
@@ -589,6 +643,7 @@ struct Query<'a> {
     inputs: HashSet<BindingId>,
     input: Option<BindingId>,
     output: BindingId,
+    output_items: Vec<NodeId>,
     results: Vec<NodeId>,
     wrt: Vec<Input<'a>>,
 }
@@ -600,7 +655,7 @@ struct Input<'a> {
 }
 
 impl<'a> Query<'a> {
-    fn read(module: &Module, wrt: &[&'a str], mode: Mode) -> Result<Self, Error> {
+    fn read(module: &mut Cow<'_, Module>, wrt: &[&'a str], mode: Mode) -> Result<Self, Error> {
         let abi = |name| {
             module
                 .bindings()
@@ -613,25 +668,22 @@ impl<'a> Query<'a> {
                 "declare `inputs` for the derivative query",
             ));
         }
-        let (output, result) = abi("outputs")
+        let (output, output_rhs) = abi("outputs")
+            .map(|(binding, result)| (binding, result.rhs))
             .ok_or_else(|| Error::new(None, "declare `outputs` for the derivative query"))?;
-        let results = abi_terms(module, output).to_vec();
+        let output_items = abi_terms(module, output).to_vec();
         if mode == Mode::Gradient
-            && (results.len() != 1 || module.type_of(results[0]) != Some(&REAL))
+            && (output_items.len() != 1 || module.type_of(output_items[0]) != Some(&REAL))
         {
             return Err(Error::new(
-                Some(result.rhs),
+                Some(output_rhs),
                 "`outputs` must be one real scalar",
             ));
         }
-        if results.is_empty()
-            || results
-                .iter()
-                .any(|&node| !module.type_of(node).is_some_and(record::is_differentiable))
-        {
+        if output_items.is_empty() {
             return Err(Error::new(
-                Some(result.rhs),
-                "`outputs` must contain real scalars, fixed-shape real arrays, or nonempty records of those",
+                Some(output_rhs),
+                "`outputs` must contribute at least one result",
             ));
         }
         let items = input.map_or(&[][..], |binding| abi_terms(module, binding));
@@ -649,6 +701,15 @@ impl<'a> Query<'a> {
                 ));
             };
             let target = binding_target(module, item, *name)?;
+            let rhs = module.binding(target).rhs;
+            if matches!(module.type_of(item), Some(Type::Tuple(_)))
+                && module.phase_of(rhs) != Some(Phase::Fixed)
+            {
+                return Err(Error::new(
+                    Some(item),
+                    "a tuple input must be a fixed binding",
+                ));
+            }
             if !targets.insert(target) {
                 return Err(Error::new(Some(item), "duplicate binding in `inputs`"));
             }
@@ -670,7 +731,7 @@ impl<'a> Query<'a> {
                 return Err(Error::new(
                     Some(item),
                     format!(
-                        "`{name}` must be a real scalar, fixed-shape flat real array, or fixed nonempty vector of real vectors"
+                        "`{name}` must be a differentiable real scalar, array, record, fixed-row table, or fixed tuple"
                     ),
                 ));
             }
@@ -680,13 +741,66 @@ impl<'a> Query<'a> {
                 reference: item,
             });
         }
-        Ok(Self {
+        let mut query = Self {
             inputs: targets,
             input,
             output,
-            results,
+            output_items,
+            results: Vec::new(),
             wrt: requested,
-        })
+        };
+        let mut results = Vec::new();
+        for &node in &query.output_items {
+            query.split_output(module, node, 0, &mut results)?;
+        }
+        if results.is_empty() {
+            return Err(Error::new(
+                Some(output_rhs),
+                "`outputs` must contain a supported real derivative component",
+            ));
+        }
+        query.results = results;
+        Ok(query)
+    }
+
+    fn split_output(
+        &self,
+        module: &mut Cow<'_, Module>,
+        node: NodeId,
+        depth: usize,
+        results: &mut Vec<NodeId>,
+    ) -> Result<(), Error> {
+        match module.type_of(node) {
+            Some(Type::Tuple(items)) => {
+                if items.is_empty() || depth >= DEFAULT_MAX_DEPTH {
+                    return Err(Error::new(Some(node), "invalid tuple output structure"));
+                }
+                let count = items.len();
+                let constructor = match self.key(module, node)? {
+                    Key::Node(key) => expect_builtin_call(module, key, "tuple"),
+                    Key::Input(_) => None,
+                };
+                let items = if let Some(call) = constructor {
+                    call.args.clone()
+                } else {
+                    (0..count)
+                        .map(|i| tuple::project(module.to_mut(), node, i))
+                        .collect()
+                };
+                for item in items {
+                    self.split_output(module, item, depth + 1, results)?;
+                }
+            }
+            Some(ty) if record::is_differentiable(ty) => results.push(node),
+            Some(ty) if record::is_passive(ty) => {}
+            _ => {
+                return Err(Error::new(
+                    Some(node),
+                    "`outputs` must contain differentiable real scalars, arrays, records, fixed-row tables, or tuples",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn key(&self, module: &Module, id: NodeId) -> Result<Key, Error> {
@@ -743,7 +857,7 @@ impl<'a> Query<'a> {
         }
         if !matches!(
             module.type_of(container),
-            Some(Type::Record(_) | Type::Tuple(_))
+            Some(Type::Record(_) | Type::Table { .. } | Type::Tuple(_))
         ) {
             return Ok(None);
         }
@@ -754,6 +868,7 @@ impl<'a> Query<'a> {
             };
             let replacement = match module.node(selector) {
                 Node::Lit(Scalar::Str(name)) => expect_builtin_call(module, container, "record")
+                    .or_else(|| expect_builtin_call(module, container, "table"))
                     .and_then(|record| {
                         record
                             .named
@@ -788,6 +903,24 @@ fn build_abi(module: &mut Module, values: &[NodeId]) -> NodeId {
     match values {
         [value] => *value,
         _ => build_call(module, "tuple", values),
+    }
+}
+
+fn group_tangents(
+    module: &mut Module,
+    ty: &Type,
+    tangents: &mut impl Iterator<Item = NodeId>,
+) -> NodeId {
+    if let Type::Tuple(items) = ty {
+        let values: Vec<_> = items
+            .iter()
+            .map(|ty| group_tangents(module, ty, tangents))
+            .collect();
+        build_call(module, "tuple", &values)
+    } else {
+        tangents
+            .next()
+            .expect("one tangent per differentiable output component")
     }
 }
 
@@ -847,6 +980,11 @@ impl<'a> Plan<'a> {
             }
             if let Some(scope) = self.aggregates.get(&step.node) {
                 scope.plan.collect_rules(Mode::Jvp, requests);
+                continue;
+            }
+            if (mode == Mode::Jvp && matches!(step.op, "record" | "table"))
+                || (mode != Mode::Jvp && step.record_access(self.module).is_some())
+            {
                 continue;
             }
             requests.extend(
@@ -940,6 +1078,17 @@ impl<'a> Plan<'a> {
             CallHead::Builtin(symbol) => self.module.resolve(symbol),
             CallHead::User(callee) => special_op(self.module, callee).unwrap_or("user call"),
         };
+        if matches!(op, "get" | "get0")
+            && self.module.type_of(node).is_some_and(record::is_passive)
+            && call.args.first().is_some_and(|&input| {
+                matches!(
+                    self.module.type_of(input),
+                    Some(Type::Record(_) | Type::Table { .. })
+                )
+            })
+        {
+            return Ok(Prepared::Known(false));
+        }
         if matches!(op, flatppl_core::LOG_INTEGRAL | flatppl_core::MASS_INTEGRAL) {
             return integral::visit(self, node, op, &call.args, depth).map(Prepared::Known);
         }
@@ -960,7 +1109,14 @@ impl<'a> Plan<'a> {
         if matches!(op, "lengthof" | "sizeof" | "indicesof" | "indicesof0")
             && let [input] = call.args.as_ref()
             && (tensor::numeric_shape(self.module, *input).is_some()
-                || tensor::nested_vector(self.module, *input).is_some())
+                || tensor::nested_vector(self.module, *input).is_some()
+                || matches!(
+                    self.module.type_of(*input),
+                    Some(Type::Table {
+                        nrows: flatppl_core::Dim::Static(_),
+                        ..
+                    })
+                ))
         {
             return Ok(Prepared::Known(false));
         }
@@ -978,8 +1134,13 @@ impl<'a> Plan<'a> {
         let (op, args, broadcast) = if let Some((rule, args)) =
             density_args(self.module, self.query, node)
                 .or_else(|| transforms::args(self.module, self.query, call, op))
+                .or_else(|| real_bessel_j_args(self.module, self.query, call, op))
         {
             (rule, args, op == "broadcast")
+        } else if let Some((rule, arg)) =
+            self.real_rounding(node, op, call, positional_broadcast)?
+        {
+            (rule, vec![arg], op == "broadcast")
         } else if op == "get"
             && let Some(projection) =
                 fixed_scan::Projection::read(self.module, &self.query.inputs, node)
@@ -1029,6 +1190,10 @@ impl<'a> Plan<'a> {
                 "stack columns"
             };
             (rule, vector.args.to_vec(), false)
+        } else if op == "record" && !call.args.is_empty() && call.named.is_empty() {
+            ("record from table", call.args.to_vec(), false)
+        } else if op == "table" && !call.args.is_empty() && call.named.is_empty() {
+            ("table from record", call.args.to_vec(), false)
         } else if op == "mul" && tensor::matmul(self.module, &call.args) {
             ("matrix product", call.args.to_vec(), false)
         } else {
@@ -1037,7 +1202,10 @@ impl<'a> Plan<'a> {
         let op = math::complex_rule(self.module, node, &args, op).unwrap_or(op);
         let mut targets = Vec::with_capacity(args.len());
         for (slot, &arg) in args.iter().enumerate() {
-            if op == "ifelse" && slot == 0 {
+            if (op == "ifelse" && slot == 0)
+                || (matches!(op, "record" | "table")
+                    && self.module.type_of(arg).is_some_and(record::is_passive))
+            {
                 targets.push(None);
                 continue;
             }
@@ -1051,6 +1219,49 @@ impl<'a> Plan<'a> {
             targets,
             broadcast,
         }))
+    }
+
+    // Bypass the integer intermediate only for the direct conversion back to reals.
+    fn real_rounding(
+        &self,
+        node: NodeId,
+        op: &str,
+        call: &flatppl_core::Call,
+        broadcast: Option<(&str, &[NodeId])>,
+    ) -> Result<Option<(&'static str, NodeId)>, Error> {
+        let rounded = match (op, call.args.as_ref(), broadcast) {
+            ("real", [rounded], _) if call.named.is_empty() => *rounded,
+            (_, _, Some(("real", [rounded]))) => *rounded,
+            _ => return Ok(None),
+        };
+        let Key::Node(rounded) = self.query.key(self.module, rounded)? else {
+            return Ok(None);
+        };
+        let Node::Call(inner) = self.module.node(rounded) else {
+            return Ok(None);
+        };
+        let (CallHead::Builtin(head), true) = (inner.head, inner.named.is_empty()) else {
+            return Ok(None);
+        };
+        let (op, arg) = match (self.module.resolve(head), inner.args.as_ref()) {
+            ("broadcast", [head, arg]) => {
+                let Node::Const(head) = self.module.node(*head) else {
+                    return Ok(None);
+                };
+                (self.module.resolve(*head), *arg)
+            }
+            (op, [arg]) => (op, *arg),
+            _ => return Ok(None),
+        };
+        let rule = match op {
+            "floor" | "ceil" => "real floor or ceil",
+            "round" => "real round",
+            _ => return Ok(None),
+        };
+        let Some(shape) = tensor::real_shape(self.module, arg) else {
+            return Ok(None);
+        };
+        Ok((tensor::real_shape(self.module, node) == Some(shape)).then_some((rule, arg)))
     }
 }
 
@@ -1066,6 +1277,9 @@ enum Prepared<'a> {
 
 fn special_op(module: &Module, callee: NodeId) -> Option<&'static str> {
     let (module, member) = flatppl_determinizer::standard_function(module, callee)?;
+    if module == "ext-linear-algebra" && member == "matexp" {
+        return Some("matrix exponential");
+    }
     if module != "special-functions" {
         return None;
     }
@@ -1088,6 +1302,55 @@ fn special_op(module: &Module, callee: NodeId) -> Option<&'static str> {
         "polygamma" => Some("polygamma"),
         _ => None,
     }
+}
+
+// Keep the principal-branch projection in the derivative. The StableHLO
+// backend consumes Bessel J through its supported complex projections.
+fn real_bessel_j_args(
+    module: &Module,
+    query: &Query<'_>,
+    call: &Call,
+    op: &str,
+) -> Option<(&'static str, Vec<NodeId>)> {
+    let [argument] = call.args.as_ref() else {
+        return None;
+    };
+    if op != "real" {
+        return None;
+    }
+    let Key::Node(value) = query.key(module, *argument).ok()? else {
+        return None;
+    };
+    let Node::Call(Call {
+        head: CallHead::User(callee),
+        args,
+        ..
+    }) = module.node(value)
+    else {
+        return None;
+    };
+    let (namespace, member) = flatppl_determinizer::standard_function(module, *callee)?;
+    if namespace != "special-functions" || member != "bessel_j" {
+        return None;
+    }
+    let &[order, argument] = args.as_ref() else {
+        return None;
+    };
+    let in_range = |node, lower, upper| {
+        use flatppl_core::ValueSet;
+        match module.valueset_of(node) {
+            Some(ValueSet::Interval(lo, hi)) => lower <= *lo && *lo <= *hi && *hi <= upper,
+            Some(ValueSet::UnitInterval) => lower <= 0.0 && 1.0 <= upper,
+            _ => false,
+        }
+    };
+    let bounded = in_range(order, 0.0, 16.0) && in_range(argument, 0.125, 4.0);
+    let op = if bounded {
+        "bounded real Bessel J"
+    } else {
+        "real Bessel J"
+    };
+    Some((op, args.to_vec()))
 }
 
 fn density_args(
@@ -1397,6 +1660,9 @@ fn structural(op: &str) -> bool {
             | "fill"
             | "cat"
             | "record"
+            | "table"
+            | "record from table"
+            | "table from record"
             | "addaxes"
             | "get"
             | "get0"
@@ -1440,6 +1706,12 @@ impl<'a> Step<'a> {
         slot: usize,
     ) -> Result<&'r rules::Template, Error> {
         rules.get(self.rule_key(mode, slot)).ok_or_else(|| {
+            if self.op == "real Bessel J" && slot == 0 {
+                return Error::new(
+                    Some(self.node),
+                    "source AD differentiates bessel_j with respect to its order only when the order is proven in [0, 16] and the argument in [0.125, 4]",
+                );
+            }
             if self.op == "Poisson log density" && slot == 1 {
                 return Error::new(
                     Some(self.node),
@@ -1463,18 +1735,45 @@ impl<'a> Step<'a> {
             && tensor::real_shape(module, self.node).is_some_and(|shape| !shape.is_empty())
     }
 
+    fn record_access(&self, module: &Module) -> Option<Vec<Symbol>> {
+        if matches!(self.op, "get" | "get0") {
+            record::access_path(module, &self.args)
+        } else {
+            None
+        }
+    }
+
     fn check_types(&self, module: &Module) -> Result<(), Error> {
-        if self.op == "record"
-            && !self.broadcast
+        if matches!(
+            self.op,
+            "record" | "table" | "record from table" | "table from record"
+        ) && !self.broadcast
             && module
                 .type_of(self.node)
                 .is_some_and(record::is_differentiable)
+            && self.args.iter().all(|&arg| {
+                module.type_of(arg).is_some_and(|ty| {
+                    record::is_differentiable(ty)
+                        || (matches!(self.op, "record" | "table") && record::is_passive(ty))
+                })
+            })
         {
             return Ok(());
         }
         let nested_vector = |node| tensor::nested_vector(module, node).is_some();
-        let record_access =
-            matches!(self.op, "get" | "get0") && record::is_access(module, &self.args);
+        if matches!(self.op, "get" | "get0")
+            && let [input, selector] = *self.args.as_slice()
+            && module
+                .type_of(input)
+                .is_some_and(|ty| tensor::vector_of_arrays(ty).is_some())
+            && tensor::index_axes(module, selector).is_some_and(|rank| rank <= 1)
+        {
+            return Ok(());
+        }
+        let product_access = self.record_access(module).is_some()
+            || (matches!(self.op, "get" | "get0")
+                && (record::is_access(module, &self.args)
+                    || tuple::access(module, &self.args, i64::from(self.op == "get"))));
         if math::complex_rule_name(self.op) {
             if math::scalar_arithmetic(module, self.node)
                 && self
@@ -1494,12 +1793,12 @@ impl<'a> Step<'a> {
                 self.op,
                 "vector" | "cat" | "get" | "get0" | "pack vector cells" | "pack matrix rows"
             ) && nested_vector(self.node)
-            || record_access
+            || product_access
                 && module
                     .type_of(self.node)
                     .is_some_and(record::is_differentiable))
             && self.args.iter().enumerate().all(|(slot, &arg)| {
-                if record_access {
+                if product_access {
                     return true;
                 }
                 if self.op == "ifelse" && slot == 0 {
@@ -1573,6 +1872,13 @@ impl<'a> Step<'a> {
             return Err(Error::new(
                 Some(self.node),
                 "sample moment pullback requires at least two real cells",
+            ));
+        }
+        if self.op == "matrix exponential" && math::matrix_exp_size(module, self.args[0]).is_none()
+        {
+            return Err(Error::new(
+                Some(self.node),
+                "matrix exponential differentiation requires a fixed real square matrix with supported block dimensions",
             ));
         }
         if self.op == "diag" && math::square_size(module, self.args[0]).is_none() {
@@ -1662,10 +1968,14 @@ impl Emitter {
 
     fn named_adjoint(&mut self, name: &str, primal: NodeId, terms: &[NodeId]) -> NodeId {
         let sum = tensor::add_terms(self, primal, terms);
-        if !self.inline && matches!(self.module.node(sum), Node::Call(_)) {
-            self.define(name, sum)
+        self.name_adjoint(name, sum)
+    }
+
+    fn name_adjoint(&mut self, name: &str, value: NodeId) -> NodeId {
+        if !self.inline && matches!(self.module.node(value), Node::Call(_)) {
+            self.define(name, value)
         } else {
-            sum
+            value
         }
     }
 

@@ -85,6 +85,13 @@ impl Emitter<'_> {
         if let Some(value) = self.bound_field(container, name) {
             return Ok(value);
         }
+        if let Some(BoundTuple::Value(Lowered::Record(fields))) = self.tuple_input(container) {
+            return fields
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| unknown_field(container, name));
+        }
         let resolved = self.resolve_tuple_projections(container);
         if let Some(value) = self.bound_field(resolved, name) {
             return Ok(value);

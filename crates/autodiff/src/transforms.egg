@@ -129,7 +129,11 @@
       (Unary "expm1" (LogCdfSafeDelta))) (Real 0.0)) :ruleset pullbacks)
 
 ; Differentiate regularized tails with respect to their integration limit.
-; Shape derivatives do not follow from the density at the integration limit.
+; Shape derivatives use opt-in numerical integration of the gamma score.
+(rewrite (Pullback "gammainc" 2 0) (GammaShape) :ruleset pullbacks)
+(rewrite (Pullback "gammaincc" 2 0) (GammaShape) :ruleset pullbacks)
+(rewrite (Pullback "log_gammainc" 2 0) (GammaShape) :ruleset pullbacks)
+(rewrite (Pullback "log_gammaincc" 2 0) (GammaShape) :ruleset pullbacks)
 (constructor LogKernelPower (Expr Expr) Expr :unextractable)
 (rewrite (LogKernelPower exponent log_x)
   (Ternary "ifelse" (Unary "iszero" exponent) (Real 0.0) (Binary "mul" exponent log_x))

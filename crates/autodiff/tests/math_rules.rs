@@ -13,6 +13,25 @@ fn lower(source: &str) -> Module {
 }
 
 #[test]
+fn real_rounding_and_conjugation_emit_differentiable_real_queries() {
+    for (input, output) in [
+        ("reals", "conj(x)"),
+        ("reals", "real(floor(x))"),
+        ("reals", "real(ceil(x))"),
+        ("reals", "real(round(x))"),
+        ("cartpow(reals, 2)", "sum(real.(round.(x)))"),
+    ] {
+        let module = lower(&format!(
+            "x = elementof({input})\ninputs = x\noutputs = {output}\n"
+        ));
+        for differentiate in [gradient, jvp, vjp] {
+            let differentiated = differentiate(&module, &["x"]).unwrap();
+            lower(&flatppl_syntax::print(&differentiated));
+        }
+    }
+}
+
+#[test]
 fn determinant_derivatives_use_cofactors() {
     let module = lower(
         "
@@ -26,6 +45,24 @@ outputs = det(A)
         let text = flatppl_syntax::print(&differentiated);
         assert!(text.contains("rowstack("), "{text}");
         assert!(!text.contains("inv("), "{text}");
+    }
+}
+
+#[test]
+fn matrix_exponential_derivatives_roundtrip_standard_module_calls() {
+    for (mode, output) in
+        [gradient, jvp, vjp]
+            .into_iter()
+            .zip(["sum(e.matexp(A))", "e.matexp(A = A)", "e.matexp(A)"])
+    {
+        let module = lower(&format!(
+            "e = standard_module(\"ext-linear-algebra\", \"0.1\")\n\
+             A = elementof(cartpow(reals, [2, 2]))\n\
+             inputs = A\noutputs = {output}"
+        ));
+        let mut derivative = mode(&module, &["A"]).unwrap();
+        flatppl_autodiff::prepare_source(&mut derivative);
+        lower(&flatppl_syntax::print(&derivative));
     }
 }
 

@@ -26,6 +26,7 @@ pub(super) fn structural(op: &str) -> bool {
             | "inv"
             | "linsolve"
             | "lower_cholesky"
+            | "matrix exponential"
     )
 }
 
@@ -48,6 +49,76 @@ pub(super) fn square_size(module: &Module, primal: NodeId) -> Option<i64> {
         }
         _ => None,
     }
+}
+
+pub(super) fn matrix_exp_size(module: &Module, primal: NodeId) -> Option<i64> {
+    match tensor::real_shape(module, primal)? {
+        [Dim::Static(rows), Dim::Static(cols)] if rows == cols && *rows <= i32::MAX as u32 / 2 => {
+            Some(i64::from(*rows))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn matrix_exp_frechet(
+    emitter: &mut Emitter,
+    node: NodeId,
+    primal: NodeId,
+    base: NodeId,
+    direction: NodeId,
+) -> Option<NodeId> {
+    let n = matrix_exp_size(&emitter.module, primal)?;
+    if n == 0 {
+        return Some(direction);
+    }
+    let Node::Call(Call {
+        head: CallHead::User(callee),
+        ..
+    }) = emitter.module.node(node)
+    else {
+        return None;
+    };
+    let callee = *callee;
+    let base = emitter.primal(base);
+    let direction = emitter.primal(direction);
+    let m = &mut emitter.module;
+
+    // Bound the direction before building the block. A large direction would
+    // otherwise force excess squarings and lose small diagonal perturbations.
+    let magnitude = tensor::broadcast(m, "abs", &[direction]);
+    let magnitude = build_call(m, "maximum", &[magnitude]);
+    let one = real(m, 1.0);
+    let scale = build_call(m, "max", &[one, magnitude]);
+    let direction = tensor::broadcast(m, "divide", &[direction, scale]);
+
+    // The upper-right block of exp([[A, H], [0, A]]) is D exp(A)[H].
+    let all = m.intern("all");
+    let all = m.alloc(Node::Const(all));
+    let zero = real(m, 0.0);
+    let size = tensor::int(m, n);
+    let zeros = build_call(m, "fill", &[zero, size]);
+    let mut top = Vec::new();
+    let mut bottom = Vec::new();
+    for index in 1..=n {
+        let index = tensor::int(m, index);
+        let a_row = build_call(m, "get", &[base, index, all]);
+        let h_row = build_call(m, "get", &[direction, index, all]);
+        top.push(build_call(m, "cat", &[a_row, h_row]));
+        bottom.push(build_call(m, "cat", &[zeros, a_row]));
+    }
+    top.extend(bottom);
+    let block = stack_rows(m, &top);
+    let exponential = m.alloc(Node::Call(Call {
+        head: CallHead::User(callee),
+        args: Box::new([block]),
+        named: Box::new([]),
+        inputs: None,
+    }));
+    let rows = index_vector(m, 1..=n);
+    let cols = index_vector(m, n + 1..=2 * n);
+    let top = build_call(m, "get", &[exponential, rows, all]);
+    let derivative = build_call(m, "get", &[top, all, cols]);
+    Some(build_call(m, "mul", &[scale, derivative]))
 }
 
 pub(super) fn identity(emitter: &mut Emitter, primal: NodeId) -> Option<NodeId> {
@@ -223,7 +294,10 @@ pub(super) fn zero_when_masked_complex(
 }
 
 pub(super) fn requires_unmasked(op: &str) -> bool {
-    matches!(op, "inv" | "logabsdet" | "linsolve" | "lower_cholesky")
+    matches!(
+        op,
+        "inv" | "logabsdet" | "linsolve" | "lower_cholesky" | "matrix exponential"
+    )
 }
 
 pub(super) fn scalar_reduction(op: &str) -> bool {

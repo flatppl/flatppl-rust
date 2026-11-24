@@ -1,4 +1,22 @@
 ; Real elementary maps reuse the same local partial for JVP and VJP.
+(rewrite (Pullback "conj" 1 0) (Bar) :ruleset pullbacks)
+
+; The real-valued conversions are constant between jumps. A jump has no
+; derivative, and nonfinite input is outside the real rounding domain.
+(constructor RoundingDistance () Expr :unextractable)
+(rewrite (RoundingDistance) (Unary "abs" (Binary "sub" (Arg 0) (Out))) :ruleset pullbacks)
+(constructor RoundingDerivative (Expr) Expr :unextractable)
+(rewrite (RoundingDerivative jump)
+  (Ternary "ifelse"
+    (Binary "land" (Unary "isfinite" (Arg 0)) (Unary "lnot" jump))
+    (Real 0.0)
+    (Binary "divide" (Real 0.0) (Real 0.0))) :ruleset pullbacks)
+(rewrite (Pullback "real floor or ceil" 1 0)
+  (RoundingDerivative (Unary "iszero" (RoundingDistance))) :ruleset pullbacks)
+(rewrite (Pullback "real round" 1 0)
+  (RoundingDerivative (Unary "iszero" (Binary "sub" (RoundingDistance) (Real 0.5))))
+  :ruleset pullbacks)
+
 (rewrite (Pullback "imag" 1 0) (ZeroOut) :ruleset pullbacks)
 (rewrite (Pullback "sinh" 1 0) (Binary "mul" (Bar) (Unary "cosh" (Arg 0))) :ruleset pullbacks)
 (rewrite (Pullback "cosh" 1 0) (Binary "mul" (Bar) (Unary "sinh" (Arg 0))) :ruleset pullbacks)
@@ -43,6 +61,12 @@
 (rewrite (Pushforward "diagmat" 1 0) (ForwardCall "diagmat" 0) :ruleset pullbacks)
 
 ; Cofactors are polynomial derivatives, including at singular matrices.
+; Under the real Frobenius pairing the adjoint replaces A with A^T.
+(rewrite (Pullback "matrix exponential" 1 0)
+  (MatrixExpFrechet (Unary "transpose" (Arg 0)) (Bar)) :ruleset pullbacks)
+(rewrite (Pushforward "matrix exponential" 1 0)
+  (MatrixExpFrechet (Arg 0) (Bar)) :ruleset pullbacks)
+
 (rewrite (Pullback "det" 1 0) (Binary "mul" (Bar) (DetCofactors)) :ruleset pullbacks)
 (rewrite (Pushforward "det" 1 0) (MathDot (Bar) (DetCofactors)) :ruleset pullbacks)
 (constructor InverseTranspose () Expr :unextractable)

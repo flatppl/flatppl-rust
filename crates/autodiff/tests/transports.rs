@@ -132,6 +132,9 @@ fn differentiates_incomplete_tails_in_the_integration_limit() {
             let deterministic = determinize_query(&module, &ModuleBundle::new()).unwrap();
             gradient(&deterministic, &["x"]).unwrap_or_else(|error| panic!("{function}: {error}"));
             assert!(gradient(&deterministic, &["a"]).is_err(), "{function}");
+            if family == "gamma" {
+                check_numerical_gamma_shape(&deterministic, &function);
+            }
         }
     }
 }
@@ -151,5 +154,39 @@ fn differentiates_beta_and_gamma_normalizing_constants() {
         assert!(diagnostics.iter().all(|d| d.severity != Severity::Error));
         let deterministic = determinize_query(&module, &ModuleBundle::new()).unwrap();
         gradient(&deterministic, &["a", "b"]).unwrap_or_else(|error| panic!("{call}: {error}"));
+    }
+}
+
+#[test]
+fn gamma_shape_quadrature_round_trips_over_a_fixed_shape_broadcast() {
+    let source = "
+sp = standard_module(\"special-functions\", \"0.1\")
+a = elementof(cartpow(reals, [1, 3]))
+x = elementof(cartpow(reals, [2, 3]))
+inputs = (a, x)
+outputs = sum(sp.log_gammaincc.(a, x))
+";
+    let mut module = flatppl_syntax::parse(source).unwrap();
+    let diagnostics = flatppl_infer::infer(&mut module);
+    assert!(diagnostics.iter().all(|d| d.severity != Severity::Error));
+    let deterministic = determinize_query(&module, &ModuleBundle::new()).unwrap();
+    check_numerical_gamma_shape(&deterministic, "broadcast log_gammaincc");
+}
+
+fn check_numerical_gamma_shape(module: &flatppl_core::Module, function: &str) {
+    use flatppl_autodiff::{
+        NUMERICAL_SOURCE_OPTIONS, determinize_query_with_options, gradient_with_options,
+        jvp_with_options, prepare_source_with_options, vjp_with_options,
+    };
+
+    for differentiate in [gradient_with_options, jvp_with_options, vjp_with_options] {
+        let mut result = differentiate(module, &["a"], &NUMERICAL_SOURCE_OPTIONS)
+            .unwrap_or_else(|error| panic!("{function}: {error}"));
+        prepare_source_with_options(&mut result, &NUMERICAL_SOURCE_OPTIONS).unwrap();
+        let printed = flatppl_syntax::print(&result);
+        let mut reparsed = flatppl_syntax::parse(&printed).unwrap();
+        flatppl_infer::infer(&mut reparsed);
+        determinize_query_with_options(&reparsed, &ModuleBundle::new(), &NUMERICAL_SOURCE_OPTIONS)
+            .unwrap_or_else(|error| panic!("{function}: {error:?}"));
     }
 }

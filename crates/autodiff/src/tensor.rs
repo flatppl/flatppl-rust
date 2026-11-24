@@ -36,12 +36,26 @@ pub(super) fn nested_vector_type(ty: &Type) -> Option<(u32, u32)> {
     }
 }
 
+// Larger cells keep their own array axes inside the outer vector axis.
+pub(super) fn vector_of_arrays(ty: &Type) -> Option<(Dim, &Type)> {
+    let Type::Array { shape, elem } = ty else {
+        return None;
+    };
+    let [rows @ Dim::Static(_)] = **shape else {
+        return None;
+    };
+    let cell_shape = real_shape_of(elem)?;
+    (cell_shape.len() > 1).then_some((rows, elem))
+}
+
 pub(super) fn add_terms(emitter: &mut Emitter, primal: NodeId, terms: &[NodeId]) -> NodeId {
     if terms.len() == 1 {
         return terms[0];
     }
     if let Some(ty) = emitter.module.type_of(primal)
-        && (matches!(ty, Type::Record(_)) || nested_vector_type(ty).is_some())
+        && (matches!(ty, Type::Record(_) | Type::Table { .. } | Type::Tuple(_))
+            || nested_vector_type(ty).is_some()
+            || vector_of_arrays(ty).is_some())
     {
         return add_typed(emitter, &ty.clone(), terms);
     }
@@ -53,7 +67,11 @@ pub(super) fn add_typed(emitter: &mut Emitter, ty: &Type, terms: &[NodeId]) -> N
         return terms[0];
     }
     if let Type::Record(fields) = ty {
-        crate::record::add(emitter, fields, terms)
+        crate::record::add(emitter, fields, terms, "record")
+    } else if let Some(columns) = crate::table::columns(ty) {
+        crate::record::add(emitter, &columns, terms, "table")
+    } else if let Type::Tuple(items) = ty {
+        crate::tuple::add(emitter, items, terms)
     } else if let Some((count, _)) = nested_vector_type(ty) {
         let m = &mut emitter.module;
         let matrices: Vec<_> = terms
@@ -61,7 +79,19 @@ pub(super) fn add_typed(emitter: &mut Emitter, ty: &Type, terms: &[NodeId]) -> N
             .map(|&term| build_call(m, "rowstack", &[term]))
             .collect();
         let matrix = fold_add(m, &matrices);
-        crate::callbacks::pack_rows(m, matrix, count)
+        callbacks::pack_rows(m, matrix, count)
+    } else if vector_of_arrays(ty).is_some() {
+        let m = &mut emitter.module;
+        let mut entries = Vec::with_capacity(terms.len());
+        let cells: Vec<_> = (0..terms.len())
+            .map(|index| callbacks::callback_input(m, &format!("term_{index}"), &mut entries))
+            .collect();
+        let sum = fold_add(m, &cells);
+        let function = callbacks::reify(m, sum, entries);
+        let args: Vec<_> = std::iter::once(function)
+            .chain(terms.iter().copied())
+            .collect();
+        build_call(m, "broadcast", &args)
     } else {
         fold_add(&mut emitter.module, terms)
     }
@@ -198,7 +228,13 @@ pub(super) fn fill_typed(
     ty: &Type,
 ) -> Option<NodeId> {
     if let Type::Record(fields) = ty {
-        return crate::record::fill(emitter, value, primal, fields);
+        return crate::record::fill(emitter, value, primal, fields, "record");
+    }
+    if let Some(columns) = crate::table::columns(ty) {
+        return crate::record::fill(emitter, value, primal, &columns, "table");
+    }
+    if let Type::Tuple(items) = ty {
+        return crate::tuple::fill(emitter, value, primal, items, None);
     }
     if let Some((rows, cols)) = nested_vector_type(ty) {
         let m = &mut emitter.module;
@@ -206,6 +242,13 @@ pub(super) fn fill_typed(
         let row = build_call(m, "fill", &[value, cols]);
         let rows = int(m, i64::from(rows));
         return Some(build_call(m, "fill", &[row, rows]));
+    }
+    if let Some((rows, cell_type)) = vector_of_arrays(ty) {
+        let size = shape_arg(emitter, primal, &[rows])?;
+        let index = int(&mut emitter.module, 1);
+        let cell = build_call(&mut emitter.module, "get", &[primal, index]);
+        let value = fill_typed(emitter, value, cell, cell_type)?;
+        return Some(build_call(&mut emitter.module, "fill", &[value, size]));
     }
     let shape = real_shape_of(ty)?;
     if shape.is_empty() {
@@ -223,6 +266,12 @@ pub(super) fn seed(emitter: &mut Emitter, name: &str, primal: NodeId) -> Result<
         )
     };
     let ty = emitter.module.type_of(primal).ok_or_else(fail)?.clone();
+    if let Type::Tuple(items) = &ty {
+        // A tuple has no valueset. The query ABI promotes this fixed binding.
+        let zero = real(&mut emitter.module, 0.0);
+        let input = crate::tuple::fill(emitter, zero, primal, items, None).ok_or_else(fail)?;
+        return Ok(emitter.define(name, input));
+    }
     let set = seed_set(emitter, primal, &ty).ok_or_else(fail)?;
     let input = build_call(&mut emitter.module, "elementof", &[set]);
     Ok(emitter.define(name, input))
@@ -232,6 +281,9 @@ pub(super) fn seed_set(emitter: &mut Emitter, primal: NodeId, ty: &Type) -> Opti
     if let Type::Record(fields) = ty {
         return crate::record::seed_set(emitter, primal, fields);
     }
+    if matches!(ty, Type::Table { .. }) {
+        return crate::table::seed_set(emitter, primal, ty);
+    }
     let reals = constant(&mut emitter.module, "reals");
     if let Some((rows, cols)) = nested_vector_type(ty) {
         let m = &mut emitter.module;
@@ -239,6 +291,16 @@ pub(super) fn seed_set(emitter: &mut Emitter, primal: NodeId, ty: &Type) -> Opti
         let row_set = build_call(m, "cartpow", &[reals, cols]);
         let rows = int(m, i64::from(rows));
         Some(build_call(m, "cartpow", &[row_set, rows]))
+    } else if let Some((rows, cell_type)) = vector_of_arrays(ty) {
+        let rows = shape_arg(emitter, primal, &[rows])?;
+        let index = int(&mut emitter.module, 1);
+        let cell = build_call(&mut emitter.module, "get", &[primal, index]);
+        let cell_set = seed_set(emitter, cell, cell_type)?;
+        Some(build_call(
+            &mut emitter.module,
+            "cartpow",
+            &[cell_set, rows],
+        ))
     } else {
         let shape = real_shape_of(ty)?;
         if shape.is_empty() {
@@ -511,10 +573,28 @@ pub(super) fn scatter(
     selectors: &[NodeId],
     base: i64,
 ) -> Option<NodeId> {
-    if let Some(Type::Record(fields)) = emitter.module.type_of(primal).cloned() {
-        return crate::record::scatter(emitter, bar, primal, &fields, selectors);
+    let ty = emitter.module.type_of(primal)?.clone();
+    scatter_typed(emitter, bar, primal, selectors, base, &ty)
+}
+
+pub(super) fn scatter_typed(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    primal: NodeId,
+    selectors: &[NodeId],
+    base: i64,
+    ty: &Type,
+) -> Option<NodeId> {
+    if let Type::Record(fields) = ty {
+        return crate::record::scatter(emitter, bar, primal, fields, selectors, base, "record");
     }
-    if let Some((count, _)) = nested_vector(&emitter.module, primal) {
+    if let Type::Tuple(items) = ty {
+        return crate::tuple::scatter(emitter, bar, primal, items, selectors, base);
+    }
+    if matches!(ty, Type::Table { .. }) {
+        return crate::table::scatter(emitter, bar, primal, ty, selectors, base);
+    }
+    if let Some((count, _)) = nested_vector_type(ty) {
         let [selector] = *selectors else {
             return None;
         };
@@ -540,8 +620,72 @@ pub(super) fn scatter(
         let matrix = scatter_axes(emitter, bar, matrix, selectors, base, 2)?;
         return Some(unstack(emitter, matrix, count, false));
     }
-    let rank = real_shape(&emitter.module, primal)?.len();
+    if let Some((_, cell_type)) = vector_of_arrays(ty) {
+        let [selector] = *selectors else {
+            return None;
+        };
+        return scatter_array_cells(emitter, bar, primal, selector, base, cell_type);
+    }
+    let rank = real_shape_of(ty)?.len();
     scatter_axes(emitter, bar, primal, selectors, base, rank)
+}
+
+fn scatter_array_cells(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    primal: NodeId,
+    selector: NodeId,
+    base: i64,
+    cell_type: &Type,
+) -> Option<NodeId> {
+    if matches!(emitter.module.node(selector), Node::Const(name) if emitter.module.resolve(*name) == "all")
+    {
+        return Some(bar);
+    }
+    let gather_rank = index_axes(&emitter.module, selector)?;
+    if gather_rank > 1 {
+        return None;
+    }
+    let zero = real(&mut emitter.module, 0.0);
+    let zero_cell = if gather_rank == 0 {
+        Some(fill_typed(emitter, zero, bar, cell_type)?)
+    } else {
+        None
+    };
+    let m = &mut emitter.module;
+    let mut entries = Vec::new();
+    let row = callbacks::callback_input(m, "row", &mut entries);
+    let selected = callbacks::callback_input(m, "selected", &mut entries);
+    let seed = callbacks::callback_input(m, "seed", &mut entries);
+    let body = if gather_rank == 0 {
+        let same = build_call(m, "equal", &[row, selected]);
+        let empty = callbacks::callback_input(m, "empty", &mut entries);
+        build_call(m, "ifelse", &[same, seed, empty])
+    } else {
+        let axis_nodes = axes(m, real_shape_of(cell_type)?.len() + 1);
+        let (&gather, cell_axes) = axis_nodes.split_first()?;
+        let selected = indexed(m, selected, &[gather]);
+        let value = indexed(m, seed, &axis_nodes);
+        let same = build_call(m, "equal", &[row, selected]);
+        let contribution = build_call(m, "ifelse", &[same, value, zero]);
+        aggregate(m, cell_axes, contribution)
+    };
+    let m = &mut emitter.module;
+    let function = callbacks::reify(m, body, entries);
+    let indices = if base == 0 { "indicesof0" } else { "indicesof" };
+    let rows = build_call(m, indices, &[primal]);
+    let selector = if matches!(m.node(selector), Node::Const(name) if m.resolve(*name) == "only") {
+        int(m, base)
+    } else {
+        selector
+    };
+    let selector = build_call(m, "vector", &[selector]);
+    let bar = build_call(m, "vector", &[bar]);
+    let mut args = vec![function, rows, selector, bar];
+    if let Some(zero) = zero_cell {
+        args.push(build_call(m, "vector", &[zero]));
+    }
+    Some(build_call(m, "broadcast", &args))
 }
 
 fn scatter_axes(
