@@ -393,6 +393,8 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
         compact_log_cdf_difference: false,
         disable_optimizations: false,
         disable_sufficient_statistics: false,
+        // The emitter reads the laws, and the StableHLO rules run on them.
+        disable_lowered_stage: true,
         share_normal_scale: false,
         preserve_rand_tuple: false,
         numerical_integrals: false,

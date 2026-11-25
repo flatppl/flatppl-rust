@@ -154,6 +154,8 @@ fn rule_names_are_discoverable_and_invalid_names_are_rejected() {
         "ruleset:portable",
         "ruleset:glm",
         "pass:demand-prune",
+        "stage:lowered",
+        "stage:source",
     ] {
         assert!(
             catalogue.split_whitespace().any(|word| word == selector),
@@ -181,6 +183,7 @@ fn rule_names_are_discoverable_and_invalid_names_are_rejected() {
             "rule:not-a-flatppl-rule",
             "ruleset:not-a-flatppl-ruleset",
             "pass:not-a-flatppl-pass",
+            "stage:not-a-flatppl-stage",
         ] {
             let output = run(&[verb, "--disable-egglog", selector], &[&input]);
             let stderr = String::from_utf8_lossy(&output.stderr);

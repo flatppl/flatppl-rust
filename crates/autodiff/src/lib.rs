@@ -120,6 +120,7 @@ pub fn prepare_source(module: &mut Module) {
 pub const NUMERICAL_SOURCE_OPTIONS: LoweringOptions<'static> = LoweringOptions {
     disable_optimizations: false,
     disable_sufficient_statistics: false,
+    disable_lowered_stage: false,
     share_normal_scale: false,
     retain_standard_functions: &[("special-functions", "log_ndtr")],
     compact_log_cdf_difference: false,

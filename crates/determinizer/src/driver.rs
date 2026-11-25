@@ -375,6 +375,15 @@ fn determinize_inner(
                 } else if let Some(report) = report.as_deref_mut() {
                     report.record_disabled(&work);
                 }
+                // After the reductions, which read the laws the lowered rules
+                // rewrite, and before conformance, which the rewrite must pass.
+                if !options.disable_optimizations
+                    && !options.disable_lowered_stage
+                    && let Some(lowered) = flatppl_optimise::optimise_lowered(&work, None, rules)
+                {
+                    work = lowered;
+                    let _ = flatppl_infer::infer(&mut work);
+                }
                 match crate::is_flatpdl_with_options(&work, options) {
                     Ok(()) => return Ok(work),
                     Err(violations) => {
