@@ -4,7 +4,7 @@ use crate::engine::{self, Fact, FactArg, Term};
 use crate::fixed_poisson::Partition;
 use crate::selectors::{self, Selectors};
 use crate::types::{TypeFacts, dimensions, fact};
-use crate::{Dtype, Profile, RulePolicy, Target, concat, conjugacy, gaussian};
+use crate::{Dtype, Profile, RulePolicy, Stage, Target, concat, conjugacy, gaussian};
 use flatppl_core::graph::{build_call, resolve_ref_one};
 use flatppl_core::query::{Component, component};
 use flatppl_core::{
@@ -361,6 +361,7 @@ struct Project<'a> {
     m: &'a Module,
     cuts: Cuts,
     profile: Profile,
+    stage: Stage,
     terms: Vec<Term>,
     indices: HashMap<Term, usize>,
     by_node: HashMap<NodeId, usize>,
@@ -377,11 +378,12 @@ struct Project<'a> {
 }
 
 impl<'a> Project<'a> {
-    fn new(m: &'a Module, profile: Profile, sufficient_statistics: bool) -> Self {
+    fn new(m: &'a Module, profile: Profile, stage: Stage, sufficient_statistics: bool) -> Self {
         Self {
             m,
             cuts: Cuts::new(m, profile),
             profile,
+            stage,
             terms: vec![],
             indices: HashMap::new(),
             by_node: HashMap::new(),
@@ -411,6 +413,11 @@ impl<'a> Project<'a> {
 
     fn hlo(&self) -> bool {
         matches!(self.profile, Profile::StableHlo { .. })
+    }
+
+    /// The portable rules of the lowered stage, on a determinized module.
+    fn lowered(&self) -> bool {
+        self.profile == Profile::Portable && self.stage == Stage::Lowered
     }
 
     /// A read of a named data value or of one of its record fields by name.
@@ -723,6 +730,17 @@ impl<'a> Project<'a> {
             Node::Const(s) if allowed && m.resolve(*s) == "inf" => {
                 Term::Real(f64::INFINITY.to_bits() as i64)
             }
+            Node::Call(c)
+                if allowed
+                    && self.lowered()
+                    && let Some((head, operands)) = crate::lowered::head(m, c) =>
+            {
+                let args = operands
+                    .iter()
+                    .map(|&a| self.project(a, depth + 1))
+                    .collect::<Option<_>>()?;
+                Term::Call(head, args)
+            }
             Node::Call(c) if allowed && let Some(head) = self.call_name(c) => {
                 let named_operation = usize::from(head.starts_with("broadcast."));
                 let args = c.args[named_operation..]
@@ -942,6 +960,10 @@ impl<'a> Project<'a> {
                         .iter()
                         .map(|&n| resolve(n, &created))
                         .collect::<Option<_>>()?;
+                    if let Some(id) = crate::lowered::rebuild(m, head, &args) {
+                        created.insert(i, id);
+                        continue;
+                    }
                     match head.as_str() {
                         "special-functions.log_ndtr" => {
                             let module = flatppl_core::graph::special_functions_alias(m);
@@ -1026,18 +1048,24 @@ impl<'a> Project<'a> {
     }
 }
 
-pub(super) fn optimise(
-    m: &Module,
+/// The projection of the observable bindings of a module.
+struct Prepared<'a> {
+    project: Project<'a>,
+    /// The bindings it covers, with their original right-hand sides.
+    bindings: Vec<(flatppl_core::BindingId, NodeId)>,
+    outputs: crate::outputs::Outputs,
+    /// The projected root of each output slot.
+    roots: Vec<usize>,
+}
+
+fn prepare<'a>(
+    m: &'a Module,
     names: Option<&[Symbol]>,
     profile: Profile,
-    bundle: &flatppl_infer::ModuleBundle,
+    stage: Stage,
     sufficient_statistics: bool,
-    rules: &RulePolicy,
-) -> Option<Module> {
-    if rules.is_all_disabled() || !trigger(m, profile) {
-        return None;
-    }
-    let mut project = Project::new(m, profile, sufficient_statistics);
+) -> Option<Prepared<'a>> {
+    let mut project = Project::new(m, profile, stage, sufficient_statistics);
     let mut selected: HashSet<_> = names.into_iter().flatten().copied().collect();
     if names.is_some() && !project.hlo() {
         let mut work: Vec<_> = selected.iter().copied().collect();
@@ -1078,6 +1106,87 @@ pub(super) fn optimise(
             project.facts.push(fact("data-boundary", i, []));
         }
     }
+    Some(Prepared {
+        project,
+        bindings,
+        outputs,
+        roots,
+    })
+}
+
+/// See [`crate::lowered_roundtrip`].
+pub(super) fn roundtrip(m: &Module, names: Option<&[Symbol]>) -> Option<(Module, usize)> {
+    let Prepared {
+        project,
+        outputs,
+        roots,
+        ..
+    } = prepare(m, names, Profile::Portable, Stage::Lowered, false)?;
+    let mut out = m.clone();
+    let mut created: HashMap<usize, NodeId> = HashMap::new();
+    let mut rebuilt = 0;
+    // Terms are numbered after their operands, so one pass in order sees
+    // every operand rebuilt first.
+    for (i, term) in project.terms.iter().enumerate() {
+        let Term::Call(head, args) = term else {
+            continue;
+        };
+        let args: Vec<_> = args
+            .iter()
+            .map(|&n| created.get(&n).copied().unwrap_or(project.origins[n]))
+            .collect();
+        let id = match crate::lowered::rebuild(&mut out, head, &args) {
+            Some(id) => id,
+            None => {
+                let Node::Call(original) = m.node(project.origins[i]) else {
+                    continue;
+                };
+                // Other heads keep their written call, with rebuilt operands.
+                let mut call = original.clone();
+                let skip = usize::from(head.starts_with("broadcast."));
+                if call.args.len() != args.len() + skip || !call.named.is_empty() {
+                    continue;
+                }
+                let mut written = call.args.to_vec();
+                written[skip..].copy_from_slice(&args);
+                call.args = written.into();
+                out.alloc(Node::Call(call))
+            }
+        };
+        if let Some(span) = m.span_of(project.origins[i]) {
+            out.set_span(id, span);
+        }
+        created.insert(i, id);
+        rebuilt += 1;
+    }
+    let chosen: Vec<_> = roots
+        .iter()
+        .map(|root| created.get(root).copied())
+        .collect();
+    outputs.write(&mut out, &chosen);
+    Some((out, rebuilt))
+}
+
+pub(super) fn optimise(
+    m: &Module,
+    names: Option<&[Symbol]>,
+    profile: Profile,
+    stage: Stage,
+    bundle: &flatppl_infer::ModuleBundle,
+    sufficient_statistics: bool,
+    rules: &RulePolicy,
+) -> Option<Module> {
+    // The caller of the lowered stage checks its own trigger.
+    let lowered = profile == Profile::Portable && stage == Stage::Lowered;
+    if rules.is_all_disabled() || !(lowered || trigger(m, profile)) {
+        return None;
+    }
+    let Prepared {
+        mut project,
+        bindings,
+        outputs,
+        roots,
+    } = prepare(m, names, profile, stage, sufficient_statistics)?;
     let transposed_cells = project.transposed_cells();
     let affine_transports = gaussian::partial_transports(&project.facts);
     let vector_selectors = match profile {
@@ -1167,7 +1276,14 @@ pub(super) fn optimise(
             }
         }
     }
-    let winners = engine::optimise(&mut project.terms, &roots, &project.facts, profile, rules)?;
+    let winners = engine::optimise(
+        &mut project.terms,
+        &roots,
+        &project.facts,
+        profile,
+        stage,
+        rules,
+    )?;
     let mut out = m.clone();
     let chosen = project.rebuild(&mut out, &roots, &winners)?;
     outputs.write(&mut out, &chosen);

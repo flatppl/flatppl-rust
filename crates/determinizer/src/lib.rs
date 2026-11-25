@@ -65,6 +65,9 @@ pub struct LoweringOptions<'a> {
     pub disable_optimizations: bool,
     /// Leave independent likelihood factors unreduced.
     pub disable_sufficient_statistics: bool,
+    /// Skip the portable rules of the lowered stage. A backend that reads the
+    /// laws of the lowered module, such as StableHLO, runs its own.
+    pub disable_lowered_stage: bool,
     /// Share regular grouped Normal scale reciprocals across residual terms.
     pub share_normal_scale: bool,
     pub retain_standard_functions: &'a [(&'a str, &'a str)],

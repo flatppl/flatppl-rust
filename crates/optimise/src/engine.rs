@@ -9,7 +9,7 @@ use egglog::{Core, EGraph, Error, FullState, RawValues, Read, Value, Write};
 
 use crate::boundary::Choice;
 use crate::policy::load_program;
-use crate::{Dtype, Profile, RulePolicy, Target};
+use crate::{Dtype, Profile, RulePolicy, Stage, Target};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum Term {
@@ -41,6 +41,17 @@ pub(super) struct Extraction {
 }
 
 const CONSTRUCTORS: [&str; 8] = ["Leaf", "Boolean", "Integer", "Real", "U", "B", "T", "Q"];
+/// The relations of `schema.egg`, the only facts the lowered catalogue declares.
+const SCHEMA_FACTS: [&str; 8] = [
+    "type-id",
+    "bool-value",
+    "int-value",
+    "real-value",
+    "real-vector",
+    "real-matrix",
+    "erasable",
+    "data-boundary",
+];
 const MAX_INPUT_ROWS: usize = 32_768;
 const MAX_NEW_ROWS: usize = 16_384;
 const MAX_MATCHES: usize = 131_072;
@@ -50,21 +61,25 @@ const MAX_TRIAL_VISITS: usize = 1_000_000;
 #[derive(Clone, Copy)]
 struct Catalogue {
     profile: Profile,
+    /// The portable rules of the lowered stage, on a determinized module.
+    lowered: bool,
     measures: bool,
     predicates_and_reductions: bool,
     fixed_poisson: bool,
 }
 
 impl Catalogue {
-    fn for_query(profile: Profile, terms: &[Term], facts: &[Fact]) -> Self {
+    fn for_query(profile: Profile, stage: Stage, terms: &[Term], facts: &[Fact]) -> Self {
+        let lowered = profile == Profile::Portable && stage == Stage::Lowered;
         // Measure rules require original constructor fields or scoped scoring
         // witnesses. The predicate/reduction rules introduce no new heads
         // reachable from the remaining catalogues.
-        let measures = facts.iter().any(|fact| {
-            fact.name.starts_with("gaussian-")
-                || fact.name.starts_with("conjugate-")
-                || fact.name.starts_with("measure-")
-        });
+        let measures = !lowered
+            && facts.iter().any(|fact| {
+                fact.name.starts_with("gaussian-")
+                    || fact.name.starts_with("conjugate-")
+                    || fact.name.starts_with("measure-")
+            });
         let predicates_and_reductions = matches!(profile, Profile::StableHlo { .. })
             && terms.iter().any(|term| {
                 matches!(term, Term::Call(name, _) if matches!(name.as_str(),
@@ -73,6 +88,7 @@ impl Catalogue {
             });
         Self {
             profile,
+            lowered,
             measures,
             predicates_and_reductions,
             fixed_poisson: facts
@@ -82,6 +98,9 @@ impl Catalogue {
     }
 
     fn index(self) -> usize {
+        if self.lowered {
+            return 16;
+        }
         let first = match self.profile {
             Profile::Portable => 0,
             Profile::Stan => 2,
@@ -97,8 +116,8 @@ impl Catalogue {
 thread_local! {
     // Egglog snapshots share their intern pools, so retire the template after
     // a bounded amount of input and derived data have passed through it.
-    static CATALOGUES: RefCell<[Option<(EGraph, usize)>; 16]> = const {
-        RefCell::new([const { None }; 16])
+    static CATALOGUES: RefCell<[Option<(EGraph, usize)>; 17]> = const {
+        RefCell::new([const { None }; 17])
     };
 }
 
@@ -127,6 +146,15 @@ fn build_catalogue(config: Catalogue, rules: &RulePolicy) -> EGraph {
             .unwrap_or_else(|error| panic!("invalid embedded egglog catalogue {name}: {error}"));
     };
     load("schema", include_str!("rules/schema.egg"));
+    if config.lowered {
+        // The lowered stage reads lowered heads only. Source-stage rules
+        // would match them too, so they stay out of its catalogue.
+        load(
+            "lowered-schedule",
+            "(unstable-combined-ruleset query-portable-lowered analysis)",
+        );
+        return graph;
+    }
     load("portable", include_str!("rules/portable.egg"));
     load("concat", include_str!("rules/concat.egg"));
     load("glm", include_str!("rules/glm.egg"));
@@ -178,16 +206,19 @@ pub(super) fn optimise(
     roots: &[usize],
     facts: &[Fact],
     profile: Profile,
+    stage: Stage,
     rules: &RulePolicy,
 ) -> Option<Extraction> {
+    let lowered = profile == Profile::Portable && stage == Stage::Lowered;
     if rules.is_all_disabled()
         || roots.is_empty()
         || terms.len() + facts.len() > MAX_INPUT_ROWS
-        || !has_candidates(terms, facts, profile)
+        // The lowered stage starts only when one of its rulesets has a term.
+        || !(lowered || has_candidates(terms, facts, profile))
     {
         return None;
     }
-    optimise_query(terms, roots, facts, profile, rules)
+    optimise_query(terms, roots, facts, profile, stage, rules)
         .ok()
         .flatten()
 }
@@ -265,9 +296,10 @@ fn optimise_query(
     roots: &[usize],
     facts: &[Fact],
     profile: Profile,
+    stage: Stage,
     policy: &RulePolicy,
 ) -> Result<Option<Extraction>, Error> {
-    let config = Catalogue::for_query(profile, terms, facts);
+    let config = Catalogue::for_query(profile, stage, terms, facts);
     let mut graph = catalogue(config, terms.len() + facts.len(), policy);
     graph.update(|mut state| {
         let mut values = Vec::with_capacity(terms.len());
@@ -276,6 +308,9 @@ fn optimise_query(
             values.push(state.add(name, RawValues(args))?);
         }
         for fact in facts {
+            if config.lowered && !SCHEMA_FACTS.contains(&fact.name) {
+                continue;
+            }
             let args = encode_args(&mut state, &fact.args, &values)?;
             state.add(fact.name, RawValues(args))?;
         }
@@ -285,6 +320,7 @@ fn optimise_query(
     // The emitter's GPU fusion can make a full negation and gather cheaper
     // than an independently materialized narrow map. Keep that schedule on GPU.
     let rules = match profile {
+        Profile::Portable if config.lowered => "query-portable-lowered",
         Profile::Portable => "query-portable",
         Profile::Stan => "query-stan",
         Profile::StableHlo {
@@ -847,6 +883,8 @@ fn children(term: &Term) -> &[usize] {
 }
 
 struct CostModel {
+    /// A named broadcast moves every lane of its result.
+    lanes: bool,
     data_boundary: Vec<bool>,
     elements: Vec<u64>,
     selectors: Vec<u64>,
@@ -895,19 +933,36 @@ impl CostModel {
                 })?;
             }
         }
-        let Profile::StableHlo { dtype, .. } = config.profile else {
-            return Ok(Self {
-                data_boundary,
-                elements,
-                selectors,
-                measure_work,
-                folded_native,
-                removed_transports,
-                poisson_rows,
-                element_bytes: 0,
-            });
+        // The emitter uses the integer width corresponding to the real dtype
+        // for selector constants and indexing. The lowered stage counts lanes.
+        let element_bytes = match config.profile {
+            Profile::StableHlo {
+                dtype: Dtype::F32, ..
+            } => 4,
+            Profile::StableHlo {
+                dtype: Dtype::F64, ..
+            } => 8,
+            Profile::Portable if config.lowered => 1,
+            Profile::Portable | Profile::Stan => {
+                return Ok(Self {
+                    lanes: false,
+                    data_boundary,
+                    elements,
+                    selectors,
+                    measure_work,
+                    folded_native,
+                    removed_transports,
+                    poisson_rows,
+                    element_bytes: 0,
+                });
+            }
         };
-        for name in ["real-vector", "math-real-row", "real-matrix"] {
+        let shapes: &[&str] = if config.lowered {
+            &["real-vector", "real-matrix"]
+        } else {
+            &["real-vector", "math-real-row", "real-matrix"]
+        };
+        for &name in shapes {
             state.constructor_enodes(name, |row| {
                 if let Some(&class) = classes.get(&row.children[0]) {
                     let size = row.children[1..].iter().fold(1u64, |size, &dim| {
@@ -916,6 +971,19 @@ impl CostModel {
                     elements[class] = elements[class].max(size);
                 }
             })?;
+        }
+        if config.lowered {
+            return Ok(Self {
+                lanes: true,
+                data_boundary,
+                elements,
+                selectors,
+                measure_work,
+                folded_native,
+                removed_transports,
+                poisson_rows,
+                element_bytes,
+            });
         }
         state.constructor_enodes("fixed-selector", |row| {
             if let Some(&class) = classes.get(&row.children[1]) {
@@ -934,13 +1002,8 @@ impl CostModel {
                 }
             })?;
         }
-        // The emitter uses the integer width corresponding to the real dtype
-        // for selector constants and indexing.
-        let element_bytes = match dtype {
-            Dtype::F32 => 4,
-            Dtype::F64 => 8,
-        };
         Ok(Self {
+            lanes: false,
             data_boundary,
             elements,
             selectors,
@@ -976,6 +1039,9 @@ impl CostModel {
                 ("logdensityof" | "densityof" | "totalmass", [measure, ..]) => {
                     self.measure_work[*measure]
                 }
+                (op, _) if self.lanes && op.starts_with("broadcast.") => {
+                    moving(self.elements[class], 1)
+                }
                 _ => 0,
             }
             .saturating_add(1),
@@ -1006,8 +1072,15 @@ mod tests {
             args: vec![FactArg::Expr(id), FactArg::Int(1)],
         };
         let rules = RulePolicy::default();
-        let extraction = optimise(&mut terms, &[5], &[ty(4), ty(5)], Profile::Portable, &rules)
-            .expect("identity removed");
+        let extraction = optimise(
+            &mut terms,
+            &[5],
+            &[ty(4), ty(5)],
+            Profile::Portable,
+            Stage::Source,
+            &rules,
+        )
+        .expect("identity removed");
         assert_eq!(extraction.roots, [4]);
         assert_eq!(terms[4], Term::Call("four".into(), vec![0, 1, 2, 3]));
     }
@@ -1021,7 +1094,17 @@ mod tests {
             args: vec![FactArg::Expr(0)],
         };
         let rules = RulePolicy::default();
-        assert!(optimise(&mut terms, &[1], &[invalid], Profile::Portable, &rules).is_none());
+        assert!(
+            optimise(
+                &mut terms,
+                &[1],
+                &[invalid],
+                Profile::Portable,
+                Stage::Source,
+                &rules
+            )
+            .is_none()
+        );
         assert_eq!(terms, original);
     }
 

@@ -44,6 +44,16 @@ const PROGRAMS: &[(&str, &str)] = &[
 /// Host passes outside the Egglog catalogues that a policy can disable.
 const PASSES: &[&str] = &["demand-prune"];
 
+/// Pipeline stages a policy can disable as a whole, in sorted order.
+const STAGES: &[&str] = &["lowered", "source"];
+
+fn stage_name(stage: crate::Stage) -> &'static str {
+    match stage {
+        crate::Stage::Lowered => "lowered",
+        crate::Stage::Source => "source",
+    }
+}
+
 /// An authored catalogue rule and its ruleset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuleInfo {
@@ -131,6 +141,11 @@ pub fn available_passes() -> &'static [&'static str] {
     PASSES
 }
 
+/// The stages a `stage:<id>` selector names, in sorted order.
+pub fn available_stages() -> &'static [&'static str] {
+    STAGES
+}
+
 fn find_rule(name: &str) -> Option<&'static RuleInfo> {
     let rules = available_rules();
     let index = rules.binary_search_by_key(&name, |rule| rule.name).ok()?;
@@ -147,6 +162,7 @@ enum Selector {
     Rule(&'static str),
     Ruleset(&'static str),
     Pass(&'static str),
+    Stage(&'static str),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,6 +196,13 @@ impl RuleSelector {
             .map(|index| Self(Selector::Pass(PASSES[index])))
             .map_err(|_| UnknownRuleSelector(format!("unknown optimiser pass {name:?}")))
     }
+
+    pub fn stage(name: &str) -> Result<Self, UnknownRuleSelector> {
+        STAGES
+            .binary_search(&name)
+            .map(|index| Self(Selector::Stage(STAGES[index])))
+            .map_err(|_| UnknownRuleSelector(format!("unknown optimiser stage {name:?}")))
+    }
 }
 
 impl FromStr for RuleSelector {
@@ -191,8 +214,9 @@ impl FromStr for RuleSelector {
             Some(("rule", name)) => Self::rule(name),
             Some(("ruleset", name)) => Self::ruleset(name),
             Some(("pass", name)) => Self::pass(name),
+            Some(("stage", name)) => Self::stage(name),
             _ => Err(UnknownRuleSelector(format!(
-                "invalid Egglog selector {selector:?} (expected all, rule:<id>, ruleset:<id>, or pass:<id>)"
+                "invalid Egglog selector {selector:?} (expected all, rule:<id>, ruleset:<id>, pass:<id>, or stage:<id>)"
             ))),
         }
     }
@@ -205,6 +229,7 @@ impl fmt::Display for RuleSelector {
             Selector::Rule(name) => write!(fmt, "rule:{name}"),
             Selector::Ruleset(name) => write!(fmt, "ruleset:{name}"),
             Selector::Pass(name) => write!(fmt, "pass:{name}"),
+            Selector::Stage(name) => write!(fmt, "stage:{name}"),
         }
     }
 }
@@ -226,6 +251,7 @@ struct Disabled {
     rules: BTreeSet<&'static str>,
     rulesets: BTreeSet<&'static str>,
     passes: BTreeSet<&'static str>,
+    stages: BTreeSet<&'static str>,
 }
 
 impl RulePolicy {
@@ -261,9 +287,16 @@ impl RulePolicy {
                 Selector::Pass(name) => {
                     disabled.passes.insert(name);
                 }
+                Selector::Stage(name) => {
+                    disabled.stages.insert(name);
+                }
             }
         }
-        if disabled.rules.is_empty() && disabled.rulesets.is_empty() && disabled.passes.is_empty() {
+        if disabled.rules.is_empty()
+            && disabled.rulesets.is_empty()
+            && disabled.passes.is_empty()
+            && disabled.stages.is_empty()
+        {
             Self::default()
         } else {
             Self(Policy::Filtered(Arc::new(disabled)))
@@ -325,6 +358,14 @@ impl RulePolicy {
             Policy::AllDisabled => true,
         }
     }
+
+    pub fn disables_stage(&self, stage: crate::Stage) -> bool {
+        match &self.0 {
+            Policy::Default => false,
+            Policy::Filtered(disabled) => disabled.stages.contains(stage_name(stage)),
+            Policy::AllDisabled => true,
+        }
+    }
 }
 
 fn rule_identity(command: &Command) -> Option<(&str, &str)> {
@@ -382,6 +423,22 @@ mod tests {
         assert!(!RulePolicy::default().disables_pass("demand-prune"));
         assert!("pass:demand".parse::<RuleSelector>().is_err());
         assert_eq!(RulePolicy::new(&[], &[]).unwrap(), RulePolicy::default());
+    }
+
+    #[test]
+    fn a_stage_selector_disables_that_stage_only() {
+        let lowered = RulePolicy::from_selectors(["stage:lowered".parse().unwrap()]);
+        assert!(lowered.disables_stage(crate::Stage::Lowered));
+        assert!(!lowered.disables_stage(crate::Stage::Source));
+        assert!(!lowered.disables_ruleset("portable"));
+        assert!(!lowered.disables_pass("demand-prune"));
+        assert!(!RulePolicy::default().disables_stage(crate::Stage::Lowered));
+        assert!(RulePolicy::all_disabled().disables_stage(crate::Stage::Source));
+        assert_eq!(
+            "stage:source".parse::<RuleSelector>().unwrap().to_string(),
+            "stage:source"
+        );
+        assert!("stage:emitter".parse::<RuleSelector>().is_err());
     }
 
     #[test]
