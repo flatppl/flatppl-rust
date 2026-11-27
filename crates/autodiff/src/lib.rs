@@ -227,11 +227,63 @@ pub fn jvp_with_options(
     transform(module, wrt, Mode::Jvp, options)
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Mode {
+/// A derivative transform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mode {
+    /// [`gradient`]
     Gradient,
+    /// [`vjp`]
     Vjp,
+    /// [`jvp`]
     Jvp,
+}
+
+/// One derivative rule key: the catalog (`Pullback` or `Pushforward`), the
+/// operation, its operand count and the operand slot, counted from 0.
+///
+/// `None` marks a rule variable that matches any value.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RuleKey {
+    pub catalog: &'static str,
+    pub op: Option<String>,
+    pub arity: Option<usize>,
+    pub slot: Option<usize>,
+}
+
+/// Tab-separated fields, with `*` for a rule variable.
+impl fmt::Display for RuleKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn field(f: &mut fmt::Formatter<'_>, value: Option<impl fmt::Display>) -> fmt::Result {
+            match value {
+                Some(value) => write!(f, "\t{value}"),
+                None => f.write_str("\t*"),
+            }
+        }
+        f.write_str(self.catalog)?;
+        field(f, self.op.as_deref())?;
+        field(f, self.arity)?;
+        field(f, self.slot)
+    }
+}
+
+/// Every rule key the derivative rule program defines, sorted.
+pub fn rule_catalog() -> Result<Vec<RuleKey>, Error> {
+    rules::catalog()
+}
+
+/// The rule keys that a derivative of `module` with respect to `wrt` loads, sorted.
+///
+/// This plans the derivative as [`gradient`], [`vjp`] or [`jvp`] would and
+/// stops before rule lookup, so a key without a rule is still listed.
+pub fn requested_rules(
+    module: &Module,
+    wrt: &[&str],
+    mode: Mode,
+    options: &LoweringOptions<'_>,
+) -> Result<Vec<RuleKey>, Error> {
+    let mut keys = Vec::new();
+    run(module, wrt, mode, options, Some(&mut keys))?;
+    Ok(keys)
 }
 
 fn transform(
@@ -240,6 +292,18 @@ fn transform(
     mode: Mode,
     options: &LoweringOptions<'_>,
 ) -> Result<Module, Error> {
+    run(module, wrt, mode, options, None)?
+        .ok_or_else(|| Error::new(None, "the derivative transform stopped before emission"))
+}
+
+/// With `report`, record the requested rule keys and stop before rule lookup.
+fn run(
+    module: &Module,
+    wrt: &[&str],
+    mode: Mode,
+    options: &LoweringOptions<'_>,
+    report: Option<&mut Vec<RuleKey>>,
+) -> Result<Option<Module>, Error> {
     check_flatpdl(module, options)?;
     let specialized = flatppl_infer::specialize_empty_axes(module);
     let concrete_empty_axes = specialized.is_some();
@@ -276,6 +340,15 @@ fn transform(
     }
     let mut requests = BTreeSet::new();
     plan.collect_rules(mode, &mut requests);
+    if let Some(report) = report {
+        report.extend(requests.iter().map(|&(catalog, op, arity, slot)| RuleKey {
+            catalog,
+            op: Some(op.to_owned()),
+            arity: Some(arity),
+            slot: Some(slot),
+        }));
+        return Ok(None);
+    }
     let rules = rules::Rules::load(requests)?;
 
     let mut emitter = Emitter::new(module, &query);
@@ -377,7 +450,7 @@ fn transform(
         ));
     }
     check_flatpdl(&emitter.module, options)?;
-    Ok(emitter.module)
+    Ok(Some(emitter.module))
 }
 
 type Derived = Vec<(String, NodeId, NodeId)>;

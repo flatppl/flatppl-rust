@@ -16,29 +16,121 @@ pub(super) struct Template {
     root: TermId,
 }
 
+const PROGRAM: &str = concat!(
+    include_str!("pullbacks.egg"),
+    "\n",
+    include_str!("transforms.egg"),
+    "\n",
+    include_str!("math.egg"),
+    "\n",
+    include_str!("array_math.egg"),
+    "\n",
+    include_str!("complex.egg"),
+    "\n",
+    include_str!("glm.egg"),
+    "\n",
+    include_str!("vector_scan.egg"),
+    "\n",
+    include_str!("spectral.egg")
+);
+
+/// Every key that a rewrite in the rule program defines, sorted.
+///
+/// A guard `:when ((R op arity))` over left-hand variables expands to one key
+/// per ground fact of `R` in the program. Any other variable stays `None`.
+pub(super) fn catalog() -> Result<Vec<crate::RuleKey>, Error> {
+    use egglog::ast::{GenericAction, GenericCommand, GenericExpr, GenericFact, Parser};
+
+    let commands = Parser::default()
+        .get_program_from_string(Some("pullbacks.egg".into()), PROGRAM)
+        .map_err(|e| Error::new(None, format!("egglog pullbacks: {e}")))?;
+    let mut facts: HashMap<&str, Vec<&[GenericExpr<String, String>]>> = HashMap::new();
+    for command in &commands {
+        if let GenericCommand::Action(GenericAction::Expr(_, GenericExpr::Call(_, head, args))) =
+            command
+        {
+            facts.entry(head.as_str()).or_default().push(args);
+        }
+    }
+    let literal = |expr: &GenericExpr<String, String>| match expr {
+        GenericExpr::Lit(_, Literal::String(value)) => Some(value.clone()),
+        GenericExpr::Lit(_, Literal::Int(value)) => Some(value.to_string()),
+        _ => None,
+    };
+    let mut keys = BTreeSet::new();
+    for command in &commands {
+        let GenericCommand::Rewrite(_, rewrite, _) = command else {
+            continue;
+        };
+        let GenericExpr::Call(_, head, args) = &rewrite.lhs else {
+            continue;
+        };
+        if matches!(&rewrite.rhs, GenericExpr::Call(_, rhs, _) if rhs == "Missing") {
+            continue;
+        }
+        let (catalog, [op, arity, slot]) = (head.as_str(), args.as_slice()) else {
+            continue;
+        };
+        let catalog = match catalog {
+            "Pullback" => "Pullback",
+            "Pushforward" => "Pushforward",
+            _ => continue,
+        };
+        // Bind each guarded variable to the literals of one matching fact.
+        let mut bindings = vec![HashMap::new()];
+        for condition in &rewrite.conditions {
+            let GenericFact::Fact(GenericExpr::Call(_, relation, pattern)) = condition else {
+                continue;
+            };
+            let ground = facts.get(relation.as_str()).map_or(&[][..], Vec::as_slice);
+            bindings = bindings
+                .iter()
+                .flat_map(|binding: &HashMap<&str, String>| {
+                    ground.iter().filter_map(move |fact| {
+                        let mut binding = binding.clone();
+                        for (pattern, value) in pattern.iter().zip(fact.iter()) {
+                            let value = literal(value)?;
+                            match pattern {
+                                GenericExpr::Var(_, name) => {
+                                    if binding.get(name.as_str()).is_some_and(|v| *v != value) {
+                                        return None;
+                                    }
+                                    binding.insert(name.as_str(), value);
+                                }
+                                _ if literal(pattern) == Some(value) => {}
+                                _ => return None,
+                            }
+                        }
+                        Some(binding)
+                    })
+                })
+                .collect();
+        }
+        let resolve = |binding: &HashMap<&str, String>, expr| {
+            literal(expr).or_else(|| match expr {
+                GenericExpr::Var(_, name) => binding.get(name.as_str()).cloned(),
+                _ => None,
+            })
+        };
+        for binding in &bindings {
+            let number = |expr| resolve(binding, expr).and_then(|value| value.parse().ok());
+            keys.insert(crate::RuleKey {
+                catalog,
+                op: resolve(binding, op),
+                arity: number(arity),
+                slot: number(slot),
+            });
+        }
+    }
+    Ok(keys.into_iter().collect())
+}
+
 impl<'a> Rules<'a> {
     pub(super) fn load(keys: BTreeSet<RuleKey<'a>>) -> Result<Self, Error> {
         if keys.is_empty() {
             return Ok(Self(HashMap::new()));
         }
-        let mut program = concat!(
-            include_str!("pullbacks.egg"),
-            "\n",
-            include_str!("transforms.egg"),
-            "\n",
-            include_str!("math.egg"),
-            "\n",
-            include_str!("array_math.egg"),
-            "\n",
-            include_str!("complex.egg"),
-            "\n",
-            include_str!("glm.egg"),
-            "\n",
-            include_str!("vector_scan.egg"),
-            "\n",
-            include_str!("spectral.egg")
-        )
-        .to_owned();
+        let mut program = PROGRAM.to_owned();
         for (catalog, op, arity, slot) in &keys {
             program.push_str(&format!("({catalog} {op:?} {arity} {slot})\n"));
         }

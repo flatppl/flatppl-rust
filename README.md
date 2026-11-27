@@ -91,6 +91,12 @@ updates, and fixed-grid solver steps with active initial states and parameters.
 Active operations without a rule produce an error. Derivatives apply on the
 smooth, finite domain of the query.
 
+Each rule has a key: the catalog (`Pullback` or `Pushforward`), the operation,
+its operand count and the operand slot from 0. `flatppl autodiff --list-rules`
+prints every key, with `*` for a value that the rule leaves open.
+`--explain-rules` prints the keys one derivative loads to stderr, as `rule`
+lines, before the transform runs.
+
 Rust callers can use `flatppl_autodiff::determinize_query` followed by
 `gradient`, `jvp`, or `vjp`. The result is one FlatPDL module with the primal
 and derivative outputs. To print standalone FlatPPL, call

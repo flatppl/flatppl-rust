@@ -271,9 +271,17 @@ enum Command {
     #[cfg(feature = "autodiff")]
     Autodiff {
         /// FlatPPL model with declared inputs and outputs.
-        input: PathBuf,
+        #[arg(required_unless_present = "list_rules")]
+        input: Option<PathBuf>,
+        /// Print every derivative rule key, one tab-separated line each
+        /// (catalog, operation, arity, slot; `*` matches any value), and exit.
+        #[arg(long, conflicts_with_all = ["input", "wrt", "empty_wrt", "explain_rules"])]
+        list_rules: bool,
+        /// Print the rule keys this derivative loads to stderr, one `rule` line each.
+        #[arg(long)]
+        explain_rules: bool,
         /// Query input to differentiate (repeatable). Supports reals, fixed-shape arrays, records, fixed-row tables, and fixed tuples.
-        #[arg(long, required_unless_present = "empty_wrt")]
+        #[arg(long, required_unless_present_any = ["empty_wrt", "list_rules"])]
         wrt: Vec<String>,
         /// Differentiate with an explicitly empty selection of inputs.
         #[arg(long, conflicts_with = "wrt")]
@@ -656,18 +664,27 @@ fn main() -> ExitCode {
         #[cfg(feature = "autodiff")]
         Command::Autodiff {
             input,
+            list_rules,
+            explain_rules,
             wrt,
             empty_wrt,
             mode,
             numerical_integrals,
             output,
-        } => autodiff_cmd(
-            &input,
-            if empty_wrt { &[] } else { &wrt },
-            mode,
-            numerical_integrals,
-            output.as_deref(),
-        ),
+        } => match input {
+            _ if list_rules => list_rules_cmd(output.as_deref()),
+            Some(input) => autodiff_cmd(
+                &input,
+                if empty_wrt { &[] } else { &wrt },
+                mode,
+                numerical_integrals,
+                explain_rules,
+                output.as_deref(),
+            ),
+            None => Err(Failure::Usage(
+                "autodiff: an input model is required".into(),
+            )),
+        },
         #[cfg(feature = "stablehlo")]
         Command::Stablehlo {
             prepare_data,
@@ -1595,6 +1612,7 @@ fn autodiff_cmd(
     wrt: &[String],
     mode: AdMode,
     numerical_integrals: bool,
+    explain_rules: bool,
     output: Option<&Path>,
 ) -> Result<(), Failure> {
     let resolver = CliResolver::cache_only();
@@ -1607,6 +1625,20 @@ fn autodiff_cmd(
     let mut lowered = flatppl_autodiff::determinize_query_with_options(&surface, &bundle, &options)
         .map_err(|e| Failure::Refuse(refuse_message(input, &source, &surface, &e)))?;
     load_fixed_data(&mut lowered, &resolver, input, &source, &surface)?;
+    if explain_rules {
+        // Report the keys before the transform, so a refusal still names them.
+        let wrt: Vec<_> = wrt.iter().map(String::as_str).collect();
+        let mode = match mode {
+            AdMode::Gradient => flatppl_autodiff::Mode::Gradient,
+            AdMode::Jvp => flatppl_autodiff::Mode::Jvp,
+            AdMode::Vjp => flatppl_autodiff::Mode::Vjp,
+        };
+        if let Ok(keys) = flatppl_autodiff::requested_rules(&lowered, &wrt, mode, &options) {
+            for key in keys {
+                eprintln!("rule\t{key}");
+            }
+        }
+    }
     let mut derivative = differentiate(&lowered, wrt, mode, &options)?;
     flatppl_autodiff::prepare_source_with_options(&mut derivative, &options)
         .map_err(|error| Failure::Refuse(error.reason))?;
@@ -1621,6 +1653,25 @@ fn autodiff_cmd(
         None => print!("{rendered}"),
     }
     Ok(())
+}
+
+#[cfg(feature = "autodiff")]
+fn list_rules_cmd(output: Option<&Path>) -> Result<(), Failure> {
+    let keys = flatppl_autodiff::rule_catalog()
+        .map_err(|error| Failure::Plain(format!("autodiff: {error}")))?;
+    let rendered: String = keys.iter().map(|key| format!("{key}\n")).collect();
+    match output {
+        Some(path) => fs::write(path, rendered).map_err(|e| {
+            Failure::Plain(format!(
+                "writing `{}`: {e}",
+                flatppl_cli::terminal_path(path)
+            ))
+        }),
+        None => {
+            print!("{rendered}");
+            Ok(())
+        }
+    }
 }
 
 #[cfg(feature = "autodiff")]
