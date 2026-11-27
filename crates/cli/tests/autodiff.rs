@@ -212,3 +212,100 @@ fn probability_scan_vjp_emits_a_guarded_reverse_loop_with_the_seed_abi() {
         "{hlo}"
     );
 }
+
+#[test]
+fn list_rules_prints_each_key_once_with_guards_expanded() {
+    let out = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .args(["autodiff", "--list-rules"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    let mut sorted = lines.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(lines.len(), sorted.len(), "duplicate keys:\n{text}");
+    for key in [
+        "Pullback\tsqrt\t1\t0",
+        "Pushforward\tsoftmax\t1\t0",
+        "Pullback\tvector\t*\t*",
+        "Pullback\tkron\t2\t*",
+        // The scalar-predictor guard expands to one key per family.
+        "Pullback\tNormal GLM log density\t5\t0",
+        "Pushforward\tStudentT GLM log density\t6\t2",
+    ] {
+        assert!(lines.contains(&key), "missing {key:?}:\n{text}");
+    }
+    // Neither the unguarded fallback nor an unexpanded guard is a key.
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.split('\t').nth(1) != Some("*")),
+        "{text}"
+    );
+}
+
+#[test]
+fn explain_rules_reports_the_requested_keys_on_stderr() {
+    let dir = common::Scratch::new("autodiff-explain-rules");
+    let model = dir.path("model.flatppl");
+    std::fs::write(
+        &model,
+        "x = elementof(reals)\nv = elementof(cartpow(reals, 3))\ninputs = (x, v)\n\
+         outputs = x * x + sqrt(x) + sum(softmax(v))\n",
+    )
+    .unwrap();
+    let run = |mode: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+            .arg("autodiff")
+            .arg(&model)
+            .args([
+                "--wrt",
+                "x",
+                "--wrt",
+                "v",
+                "--explain-rules",
+                "--mode",
+                mode,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8(out.stdout).unwrap().contains("d_"));
+        String::from_utf8(out.stderr).unwrap()
+    };
+    let reverse = run("gradient");
+    for key in [
+        "rule\tPullback\tmul\t2\t0",
+        "rule\tPullback\tmul\t2\t1",
+        "rule\tPullback\tsqrt\t1\t0",
+        "rule\tPullback\tsoftmax\t1\t0",
+    ] {
+        assert!(
+            reverse.lines().any(|line| line == key),
+            "missing {key:?}:\n{reverse}"
+        );
+    }
+    let forward = run("jvp");
+    assert!(
+        forward
+            .lines()
+            .any(|line| line == "rule\tPushforward\tsoftmax\t1\t0"),
+        "{forward}"
+    );
+    assert!(
+        forward
+            .lines()
+            .any(|line| line == "rule\tPullback\tsqrt\t1\t0"),
+        "{forward}"
+    );
+}
