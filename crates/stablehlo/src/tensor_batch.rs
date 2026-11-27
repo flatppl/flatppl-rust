@@ -231,20 +231,10 @@ impl TensorBatch<'_, '_> {
             .join(", ");
         let left = left + batch;
         let right = right + batch;
-        let axes = Axes {
-            batch,
-            layers: vec![shape(&value.ty).len()],
-        };
-        if let Some(result) =
-            self.out
-                .compensated_dot(&a, &b, [left, right], batch + existing_batch, &ty, &axes)
-        {
-            return result;
-        }
         let ssa = self.out.pure_axes(format!(
             "stablehlo.dot_general {}, {}, batching_dims = [{dimensions}] x [{dimensions}], contracting_dims = [{left}] x [{right}], precision = [HIGHEST, HIGHEST] : ({}, {}) -> {}",
             a.ssa, b.ssa, a.ty.render(self.out.dtype, a.elem), b.ty.render(self.out.dtype, b.elem), ty.render(self.out.dtype, value.elem)
-        ), axes);
+        ), Axes { batch, layers: vec![shape(&value.ty).len()] });
         Value {
             ssa,
             ty,

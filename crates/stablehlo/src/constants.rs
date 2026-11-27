@@ -646,7 +646,7 @@ impl Emitter<'_> {
 
     /// Dense fixed data, or a bounded expansion of a pure fixed view.
     /// Direct constants and splats reuse their shared storage.
-    pub(super) fn fixed_operand(&self, value: &Value) -> Option<Constant> {
+    fn fixed_operand(&self, value: &Value) -> Option<Constant> {
         if let Some(data) = self.constants.get(&value.ssa) {
             return Some(data.clone());
         }
