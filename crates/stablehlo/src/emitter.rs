@@ -41,8 +41,6 @@ mod affine_scan;
 mod batching;
 #[path = "constants.rs"]
 mod constants;
-#[path = "contraction.rs"]
-mod contraction;
 #[path = "enzyme.rs"]
 mod enzyme;
 #[path = "integration.rs"]
@@ -3227,11 +3225,6 @@ impl<'m> Emitter<'m> {
         );
         let la = la + batch;
         let lb = lb + batch;
-        let axes = Axes { batch, layers };
-        if let Some(result) = self.compensated_dot(&a, &b, [la, lb], batch, &result_ty, &axes) {
-            self.remember_pointwise(&result.ssa, &result, Pointwise::Dot(a, b, la, lb, batch));
-            return result;
-        }
         let dimensions = (0..batch)
             .map(|axis| axis.to_string())
             .collect::<Vec<_>>()
@@ -3257,7 +3250,7 @@ impl<'m> Emitter<'m> {
             ty: result_ty,
             elem: kind,
         };
-        self.remember_axes(&result.ssa, axes);
+        self.remember_axes(&result.ssa, Axes { batch, layers });
         self.remember_pointwise(&result.ssa, &result, Pointwise::Dot(a, b, la, lb, batch));
         result
     }
@@ -3293,13 +3286,10 @@ impl<'m> Emitter<'m> {
             );
         }
 
-        let result_ty = MlirTy::Ranked(vec![z_dims[0], l_dims[0]]);
-        if let Some(result) = self.compensated_dot(z, l, [1, 1], 0, &result_ty, &Axes::default()) {
-            return result;
-        }
         let ssa = self.fresh();
         let z_ty = z.ty.render(self.dtype, z.elem);
         let l_ty = l.ty.render(self.dtype, l.elem);
+        let result_ty = MlirTy::Ranked(vec![z_dims[0], l_dims[0]]);
         let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
             "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [1], precision = [HIGHEST, HIGHEST] : ({z_ty}, {l_ty}) -> {result_ty_text}",
